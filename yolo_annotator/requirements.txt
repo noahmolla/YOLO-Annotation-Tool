@@ -1,0 +1,9 @@
+Pillow>=9.0.0
+numpy>=1.21.0
+opencv-python>=4.5.5
+# For TFLite runtime, users can install tflite-runtime or tensorflow. 
+# We'll list tensorflow here for broad compatibility on Windows, 
+# but a comment in README would advise tflite-runtime for lighter weight.
+tensorflow>=2.8.0
+ttkbootstrap>=1.10.0
+PyYAML>=6.0
