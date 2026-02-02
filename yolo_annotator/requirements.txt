@@ -6,7 +6,13 @@ PyYAML>=6.0
 
 # Inference Engine
 # You need either 'tensorflow' or 'tflite-runtime'.
-# TensorFlow is easier to install on standard Windows/Linux but very large.
-# tflite-runtime is smaller but may require specific wheel files on Windows.
-tensorflow>=2.8.0
+# 
+# OPTION 1 (Recommended): Use TensorFlow (easier to install, ~500MB)
+tensorflow>=2.8.0,<2.18.0
+# 
+# OPTION 2: Use tflite-runtime (smaller, ~5MB, but harder to install on Windows)
+# Uncomment the line below and comment out tensorflow above if you want the lighter option:
 # tflite-runtime>=2.5.0
+#
+# Note: On Windows, tflite-runtime may require manual wheel installation.
+# See: https://www.tensorflow.org/lite/guide/python
