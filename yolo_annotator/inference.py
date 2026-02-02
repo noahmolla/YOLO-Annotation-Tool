@@ -1,4 +1,12 @@
-import tensorflow as tf
+try:
+    import tensorflow.lite as tflite
+except ImportError:
+    try:
+        import tflite_runtime.interpreter as tflite
+    except ImportError:
+        print("Error: neither 'tensorflow' nor 'tflite_runtime' found. Please install one of them.")
+        raise
+
 import numpy as np
 import cv2
 
@@ -7,7 +15,7 @@ class TFLiteModel:
         """
         Initialize the TFLite interpreter.
         """
-        self.interpreter = tf.lite.Interpreter(model_path=model_path)
+        self.interpreter = tflite.Interpreter(model_path=model_path)
         self.interpreter.allocate_tensors()
 
         self.input_details = self.interpreter.get_input_details()

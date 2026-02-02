@@ -1,11 +1,24 @@
 {
     "geometry": "3440x1369+-52+127",
     "classes": [
-        "Person",
-        "stack",
-        "gantry"
+        "pallet",
+        "board",
+        "stringer",
+        "stringerProfile",
+        "leadBoard",
+        "boardCluster",
+        "brokenBoard",
+        "majorCrack",
+        "minorCrack",
+        "missingBoard",
+        "missingStringer",
+        "mold",
+        "nail",
+        "protrudeNail",
+        "brokenStringer"
     ],
     "model_version": "v8/v11",
-    "last_workspace": "C:/Users/noahm/Zira/Conner Industries/Station2 custom",
-    "last_dir": "C:/Users/noahm/Zira/Conner Industries/Station2 custom\\images"
+    "last_workspace": "C:/Users/noahm/Zira/MASTER/New master",
+    "last_dir": "C:/Users/noahm/Zira/MASTER/New master\\images",
+    "model_path": "C:/Users/noahm/Downloads/model_- 30 january 2026 15_06.tflite"
 }

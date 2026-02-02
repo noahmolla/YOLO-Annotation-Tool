@@ -43,6 +43,9 @@ class AnnotatorApp:
         self.offset_x = 0              # Canvas image offset X
         self.offset_y = 0              # Canvas image offset Y
         
+        self.current_file_path = None  # EXPLICITLY track the file we are editing
+
+        
         self.workspace_path = None     # Root of the active workspace
         
         # --- Interaction State ---
@@ -59,8 +62,17 @@ class AnnotatorApp:
         # Undo stack for deleted files
         self.deleted_files_stack = []  # List of (image_path, label_path, image_data, label_data)
         
+        # Undo stack for annotation changes (moves, clears, etc.)
+        self.annotation_undo_stack = []  # List of (file_path, annotations_copy)
+        self.annotation_redo_stack = []  # List of (file_path, annotations_copy) for redo
+        self.max_undo_size = 50  # Limit undo memory
+        
+        # Multi-selection for repeat function (Ctrl+Click)
+        self.selected_annotations = set()  # Set of annotation indices currently selected
+        self.SELECTED_COLOR = "#00FFFF"  # Cyan color for selected annotations
+        
         # Clipboard for repeat function
-        self.repeat_clipboard = []  # Annotations to paste on next R press
+        self.repeat_clipboard = []  # Annotations to paste on next R press (from Ctrl+Click selection)
         
         # Rapid navigation
         self.nav_held_key = None
@@ -148,9 +160,17 @@ class AnnotatorApp:
         
         # 1. Top Status/Toolbar area (Optional, maybe put status at bottom)
         # Let's put a simple status bar at the bottom
+        # Status bar at bottom with image size on right
+        status_frame = tb.Frame(self.root)
+        status_frame.pack(side=BOTTOM, fill=X)
+        
         self.status_var = tk.StringVar()
-        self.statusbar = tb.Label(self.root, textvariable=self.status_var, bootstyle="inverse-secondary", padding=5)
-        self.statusbar.pack(side=BOTTOM, fill=X)
+        self.statusbar = tb.Label(status_frame, textvariable=self.status_var, bootstyle="inverse-secondary", padding=5)
+        self.statusbar.pack(side=LEFT, fill=X, expand=True)
+        
+        self.image_size_var = tk.StringVar(value="")
+        self.image_size_label = tb.Label(status_frame, textvariable=self.image_size_var, bootstyle="inverse-info", padding=5, font=("Consolas", 9))
+        self.image_size_label.pack(side=RIGHT)
         
         # 2. Main Split Container
         # Use standard ttk.PanedWindow
@@ -161,48 +181,68 @@ class AnnotatorApp:
         self.left_panel = tb.Frame(self.panes, width=300)
         self.panes.add(self.left_panel, weight=1)
         
-        # Controls Group
-        ctrl_frame = tb.Labelframe(self.left_panel, text="Controls", padding=10)
-        ctrl_frame.pack(fill=X, padx=5, pady=5)
+        # Controls Group - Workspace & Data
+        ctrl_frame = tb.Labelframe(self.left_panel, text="Workspace", padding=8)
+        ctrl_frame.pack(fill=X, padx=5, pady=3)
         
-        tb.Button(ctrl_frame, text="Load Workspace", command=self.load_workspace_btn, bootstyle="primary-outline").pack(fill=X, pady=2)
-        tb.Button(ctrl_frame, text="Load Classes", command=self.load_classes_file, bootstyle="secondary-outline").pack(fill=X, pady=2)
-        tb.Button(ctrl_frame, text="Type Classes", command=self.input_classes_manual, bootstyle="info-outline").pack(fill=X, pady=2)
-        tb.Button(ctrl_frame, text="Export YOLO Zip", command=self.export_zip_dialog, bootstyle="success-outline").pack(fill=X, pady=2)
-        tb.Button(ctrl_frame, text="Import YOLO Zip", command=self.import_zip_dialog, bootstyle="primary-outline").pack(fill=X, pady=2)
-        tb.Button(ctrl_frame, text="Import Images", command=self.import_images, bootstyle="info-outline").pack(fill=X, pady=2)
-        tb.Button(ctrl_frame, text="Reduce Dataset", command=self.reduce_dataset_dialog, bootstyle="danger-outline").pack(fill=X, pady=2)
-        tb.Separator(ctrl_frame).pack(fill=X, pady=5)
-        tb.Button(ctrl_frame, text="Load Model", command=self.load_model, bootstyle="warning-outline").pack(fill=X, pady=2)
+        # Load Workspace and Open Folder row
+        ws_row = tb.Frame(ctrl_frame)
+        ws_row.pack(fill=X, pady=1)
+        tb.Button(ws_row, text="Load Workspace", command=self.load_workspace_btn, bootstyle="primary", width=12).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
+        tb.Button(ws_row, text="📂", command=self.open_workspace_folder, bootstyle="secondary-outline", width=3).pack(side=LEFT, padx=(1,0))
+        
+        # Import/Export row
+        io_frame = tb.Frame(ctrl_frame)
+        io_frame.pack(fill=X, pady=1)
+        tb.Button(io_frame, text="Import", command=self.import_dialog, bootstyle="info-outline", width=8).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
+        tb.Button(io_frame, text="Export", command=self.export_zip_dialog, bootstyle="success-outline", width=8).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+        
+        # Classes row
+
+        cls_btn_frame = tb.Frame(ctrl_frame)
+        cls_btn_frame.pack(fill=X, pady=1)
+        tb.Button(cls_btn_frame, text="Load Classes", command=self.load_classes_file, bootstyle="secondary-outline", width=10).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
+        tb.Button(cls_btn_frame, text="Type Classes", command=self.input_classes_manual, bootstyle="secondary-outline", width=10).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+
+        # Model Group
+        model_frame = tb.Labelframe(self.left_panel, text="Auto Annotate", padding=8)
+        model_frame.pack(fill=X, padx=5, pady=3)
+        
+        tb.Button(model_frame, text="Load Model", command=self.load_model, bootstyle="warning-outline").pack(fill=X, pady=1)
         
         # Model Version
-        ver_frame = tb.Frame(ctrl_frame)
-        ver_frame.pack(fill=X, pady=2)
+        ver_frame = tb.Frame(model_frame)
+        ver_frame.pack(fill=X, pady=1)
         tb.Label(ver_frame, text="YOLO Ver:").pack(side=LEFT)
         self.model_ver_combo = tb.Combobox(ver_frame, values=["Auto", "v5", "v8/v11"], state="readonly", width=8)
         self.model_ver_combo.current(0)
         self.model_ver_combo.pack(side=RIGHT, fill=X, expand=True)
+        
+        # Auto annotate row
+        auto_frame = tb.Frame(model_frame)
+        auto_frame.pack(fill=X, pady=1)
+        self.btn_auto_curr = tb.Button(auto_frame, text="Current", command=self.auto_annotate_current, bootstyle="warning", width=8)
+        self.btn_auto_curr.pack(side=LEFT, expand=True, fill=X, padx=(0,1))
+        self.btn_auto_all = tb.Button(auto_frame, text="All Images", command=self.auto_annotate_all, bootstyle="danger", width=8)
+        self.btn_auto_all.pack(side=LEFT, expand=True, fill=X, padx=(1,0))
 
-        # Actions Group
-        act_frame = tb.Labelframe(self.left_panel, text="Auto Annotate", padding=10)
-        act_frame.pack(fill=X, padx=5, pady=5)
+        # Quick Actions Group
+        quick_frame = tb.Labelframe(self.left_panel, text="Quick Actions", padding=8)
+        quick_frame.pack(fill=X, padx=5, pady=3)
         
-        self.btn_auto_curr = tb.Button(act_frame, text="Current Image", command=self.auto_annotate_current, bootstyle="warning")
-        self.btn_auto_curr.pack(fill=X, pady=2)
+        # Gallery and Distribution row
+        view_row = tb.Frame(quick_frame)
+        view_row.pack(fill=X, pady=1)
+        tb.Button(view_row, text="Gallery (G)", command=self.show_gallery, bootstyle="primary-outline", width=10).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
+        tb.Button(view_row, text="Stats", command=self.show_class_distribution, bootstyle="info-outline", width=6).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
         
-        self.btn_auto_all = tb.Button(act_frame, text="All Images", command=self.auto_annotate_all, bootstyle="danger")
-        self.btn_auto_all.pack(fill=X, pady=2)
-        
-        # Edit Actions Group
-        edit_frame = tb.Labelframe(self.left_panel, text="Edit Actions", padding=10)
-        edit_frame.pack(fill=X, padx=5, pady=5)
-        
-        tb.Button(edit_frame, text="Clear All Annotations", command=self.clear_all_annotations, bootstyle="danger-outline").pack(fill=X, pady=2)
-        tb.Button(edit_frame, text="Clear Selected Class", command=self.clear_class_annotations, bootstyle="warning-outline").pack(fill=X, pady=2)
-        tb.Button(edit_frame, text="Delete Image (Del)", command=self.delete_current_image, bootstyle="danger-outline").pack(fill=X, pady=2)
-        tb.Button(edit_frame, text="Undo Delete (Ctrl+Z)", command=self.undo_delete, bootstyle="secondary-outline").pack(fill=X, pady=2)
-        tb.Button(edit_frame, text="Show Class Distribution", command=self.show_class_distribution, bootstyle="info-outline").pack(fill=X, pady=2)
-        tb.Button(edit_frame, text="Gallery View (G)", command=self.show_gallery, bootstyle="primary-outline").pack(fill=X, pady=2)
+        # Reduce dataset and find duplicates row
+        cleanup_row = tb.Frame(quick_frame)
+        cleanup_row.pack(fill=X, pady=1)
+        tb.Button(cleanup_row, text="Reduce", command=self.reduce_dataset_dialog, bootstyle="danger-outline", width=8).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
+        tb.Button(cleanup_row, text="Duplicates", command=self.find_duplicates_dialog, bootstyle="warning-outline", width=8).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+        tb.Button(cleanup_row, text="Validate", command=self.validate_dataset_dialog, bootstyle="info-outline", width=8).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+
 
         # Classes List
         cls_frame = tb.Labelframe(self.left_panel, text="Classes (0-9)", padding=10)
@@ -234,7 +274,7 @@ class AnnotatorApp:
         self.lbl_idx.pack(side=LEFT, padx=5)
         tb.Button(nav_frame, text="Next >", command=self.next_image, bootstyle="outline").pack(side=LEFT, padx=1)
         
-        tb.Label(c_toolbar, text="  |  Shortcuts: A/D, 1-9, R, G", font=("Arial", 9)).pack(side=LEFT, padx=10)
+        tb.Label(c_toolbar, text="  |  Shortcuts: A/D, 1-9, R, G, Ctrl+Click", font=("Arial", 9)).pack(side=LEFT, padx=10)
         
         # Crosshair Toggle
         tb.Checkbutton(c_toolbar, text="Crosshair", variable=self.show_crosshair, bootstyle="round-toggle").pack(side=LEFT, padx=10)
@@ -244,7 +284,11 @@ class AnnotatorApp:
         self.speed_btn.pack(side=RIGHT, padx=5)
         
         tb.Button(c_toolbar, text="Repeat & Next (R)", command=self.repeat_and_next, bootstyle="info").pack(side=RIGHT, padx=5)
+        tb.Button(c_toolbar, text="?", command=self.show_shortcuts_dialog, bootstyle="secondary-outline", width=3).pack(side=RIGHT, padx=2)
+        tb.Button(c_toolbar, text="Info", command=self.show_image_info, bootstyle="info-outline-sm").pack(side=RIGHT, padx=5)
+        tb.Button(c_toolbar, text="Reload", command=self.reload_current_image, bootstyle="secondary-outline-sm").pack(side=RIGHT, padx=5)
         tb.Button(c_toolbar, text="Manually Save", command=self.save_annotations, bootstyle="success-sm").pack(side=RIGHT)
+
 
         # Canvas
         self.canvas_bg = "#1a1a1a"
@@ -278,7 +322,7 @@ class AnnotatorApp:
         tb.Label(stats_frame, textvariable=self.stats_boxes_var, font=("Consolas", 9)).pack(anchor=W)
         tb.Label(stats_frame, textvariable=self.stats_classes_var, font=("Consolas", 9)).pack(anchor=W)
 
-        self.file_list = tk.Listbox(file_frame, selectmode=tk.SINGLE,
+        self.file_list = tk.Listbox(file_frame, selectmode=tk.EXTENDED,
                                     bg="#222", fg="#eee", bd=0, highlightthickness=0, font=("Consolas", 9))
         self.file_list.pack(side=LEFT, fill=BOTH, expand=True)
         
@@ -287,6 +331,7 @@ class AnnotatorApp:
         self.file_list.config(yscrollcommand=sbar_file.set)
         
         self.file_list.bind("<<ListboxSelect>>", self.on_file_selected)
+        self.file_list.bind("<Button-3>", self.on_file_list_right_click)
 
     def _bind_events(self):
         # Global Keys - use KeyPress/KeyRelease for rapid navigation
@@ -300,9 +345,20 @@ class AnnotatorApp:
         self.root.bind("<KeyRelease-d>", self._on_nav_key_release)
         
         self.root.bind("s", lambda e: self.save_annotations())
-        self.root.bind("<Delete>", self.delete_selected_annotation)
-        self.root.bind("<BackSpace>", self.delete_selected_annotation)
+        
+        # Del = quick delete image (no prompt, undoable)
+        self.root.bind("<Delete>", lambda e: self.delete_current_image_quick())
+        
+        # Backspace = clear annotations of selected class
+        self.root.bind("<BackSpace>", lambda e: self.clear_class_annotations_quick())
+        
+        # Ctrl+Backspace = clear ALL annotations
+        self.root.bind("<Control-BackSpace>", lambda e: self.clear_all_annotations_quick())
+        
         self.root.bind("g", lambda e: self.show_gallery())
+        
+        # H for help/shortcuts
+        self.root.bind("h", lambda e: self.show_shortcuts_dialog())
         
         # Mouse buttons for nav
         # Windows XButtons are often not mapped cleanly in raw Tkinter without extensions
@@ -323,10 +379,22 @@ class AnnotatorApp:
         # R for repeat and next
         self.root.bind("r", self.repeat_and_next)
         
-        # Ctrl+Z for undo delete
-        self.root.bind("<Control-z>", lambda e: self.undo_delete())
+        # Q for quick auto-annotate (all classes, no dialog)
+        self.root.bind("q", lambda e: self.auto_annotate_quick())
+        
+        # Ctrl+Z for undo (use bind_all to work regardless of focus)
+        self.root.bind_all("<Control-z>", lambda e: self.undo_action())
+        self.root.bind_all("<Control-Z>", lambda e: self.undo_action())
+        
+        # Ctrl+Y for redo
+        self.root.bind_all("<Control-y>", lambda e: self.redo_action())
+        self.root.bind_all("<Control-Y>", lambda e: self.redo_action())
+        
+        # Escape to clear selection AND unlock class filter
+        self.root.bind_all("<Escape>", lambda e: self.escape_action())
             
-        # Canvas Mouse
+        # Canvas Mouse - Ctrl+Click for multi-selection
+        self.canvas.bind("<Control-ButtonPress-1>", self.on_ctrl_click)
         self.canvas.bind("<ButtonPress-1>", self.on_mouse_down)
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.canvas.bind("<Motion>", self.on_mouse_move)
@@ -340,9 +408,28 @@ class AnnotatorApp:
     # --- LOADING & SETUP LOGIC ---
 
     def load_workspace_btn(self):
+        if self.current_image:
+            self.save_annotations()
         d = filedialog.askdirectory(title="Select Workspace Folder")
         if not d: return
         self.load_workspace(d)
+
+    def open_workspace_folder(self):
+        """Open the workspace folder in File Explorer."""
+        if not self.workspace_path:
+            messagebox.showinfo("No Workspace", "Please load a workspace first.")
+            return
+        
+        # Open in File Explorer (Windows)
+        try:
+            os.startfile(self.workspace_path)
+        except Exception as e:
+            # Fallback for other platforms
+            import subprocess
+            try:
+                subprocess.run(['explorer', self.workspace_path], check=False)
+            except:
+                messagebox.showerror("Error", f"Could not open folder: {e}")
 
     def load_workspace(self, d):
         try:
@@ -380,6 +467,10 @@ class AnnotatorApp:
         # Allow empty workspace - just show 0 images
         # Index everything for filtering
         self._build_annotation_cache()
+        
+        # Reset filter to "All" when reloading to prevent stale filters
+        self.filter_mode = "All"
+        self.filter_combo.set("All")
         
         self._refresh_file_list()
         if self.image_paths:
@@ -600,6 +691,34 @@ class AnnotatorApp:
         tb.Button(btn_frame, text="Export", command=do_export, bootstyle="success", width=12).pack(side="left", padx=5)
         tb.Button(btn_frame, text="Cancel", command=dialog.destroy, bootstyle="secondary", width=12).pack(side="left", padx=5)
 
+    def import_dialog(self):
+        """Unified import dialog - choose between YOLO zip or images."""
+        dlg = tb.Toplevel(self.root)
+        dlg.title("Import")
+        dlg.geometry("350x200")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        
+        tb.Label(dlg, text="What would you like to import?", font=("Helvetica", 11, "bold")).pack(pady=15)
+        
+        btn_frame = tb.Frame(dlg)
+        btn_frame.pack(fill=X, padx=20, pady=10)
+        
+        def do_zip():
+            dlg.destroy()
+            self.import_zip_dialog()
+        
+        def do_images():
+            dlg.destroy()
+            self.import_images_reduced()  # Use the version with reduce option
+        
+        tb.Button(btn_frame, text="YOLO Zip File", command=do_zip, bootstyle="primary", width=15).pack(fill=X, pady=3)
+        tb.Button(btn_frame, text="Image Files", command=do_images, bootstyle="info", width=15).pack(fill=X, pady=3)
+        
+        tb.Label(dlg, text="(Image import includes option to reduce)", font=("Helvetica", 8), foreground="gray").pack(pady=5)
+        
+        tb.Button(dlg, text="Cancel", command=dlg.destroy, bootstyle="secondary-outline", width=10).pack(pady=10)
+
     def import_zip_dialog(self):
         # First, select a workspace folder to import into
         ws = filedialog.askdirectory(title="Select Workspace Folder to Import Into")
@@ -623,6 +742,9 @@ class AnnotatorApp:
 
     def import_images(self):
         """Import image files into the current workspace."""
+        if self.current_image:
+            self.save_annotations()
+            
         if not self.workspace_path:
             messagebox.showerror("Error", "Please load a workspace first.")
             return
@@ -699,37 +821,255 @@ class AnnotatorApp:
             msg += f" ({renamed} renamed to avoid conflicts)"
         messagebox.showinfo("Import Complete", msg)
 
+    def import_images_reduced(self):
+        """Import image files with reduction/sampling before adding to workspace."""
+        if self.current_image:
+            self.save_annotations()
+            
+        if not self.workspace_path:
+            messagebox.showerror("Error", "Please load a workspace first.")
+            return
+        
+        # Select image files
+        files = filedialog.askopenfilenames(
+            title="Select Images to Import (will be reduced)",
+            filetypes=[
+                ("Image Files", "*.jpg *.jpeg *.png *.bmp *.webp"),
+                ("JPEG", "*.jpg *.jpeg"),
+                ("PNG", "*.png"),
+                ("All Files", "*.*")
+            ]
+        )
+        
+        if not files:
+            return
+        
+        files = list(files)
+        total = len(files)
+        
+        if total < 2:
+            # Too few to reduce, just import normally
+            self._do_import_files(files)
+            return
+        
+        # Show reduction dialog
+        dlg = tb.Toplevel(self.root)
+        dlg.title("Import + Reduce")
+        dlg.geometry("420x380")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        
+        tb.Label(dlg, text=f"Selected Images: {total}", font=("Helvetica", 12, "bold")).pack(pady=10)
+        tb.Label(dlg, text="(Current dataset will remain unchanged)", font=("Helvetica", 9), foreground="gray").pack()
+        
+        tb.Label(dlg, text="Import Count:").pack(pady=(15, 5))
+        target_var = tk.IntVar(value=total // 2)
+        target_entry = tb.Entry(dlg, textvariable=target_var, width=15)
+        target_entry.pack(pady=5)
+        
+        # Quick presets
+        preset_frame = tb.Frame(dlg)
+        preset_frame.pack(pady=5)
+        tb.Label(preset_frame, text="Quick: ").pack(side="left")
+        for pct in [10, 25, 50, 75]:
+            val = max(1, int(total * pct / 100))
+            tb.Button(preset_frame, text=f"{pct}% ({val})", 
+                     command=lambda v=val: target_var.set(v),
+                     bootstyle="secondary-outline", width=10).pack(side="left", padx=2)
+        
+        tb.Label(dlg, text="Method:").pack(pady=(15, 5))
+        method_var = tk.StringVar(value="stratified")
+        cbo = tb.Combobox(dlg, textvariable=method_var, values=["stratified", "uniform"], state="readonly", width=15)
+        cbo.current(0)
+        cbo.pack(pady=5)
+        
+        tb.Label(dlg, text="Stratified: Random sample from each segment.\nUniform: Pick middle of each segment (deterministic).", 
+                font=("Helvetica", 8), foreground="gray", justify="center").pack(pady=2)
+        
+        result = {"files": None}
+        
+        def do_reduce_import():
+            try:
+                target = int(target_var.get())
+            except:
+                messagebox.showerror("Error", "Invalid number format")
+                return
+            
+            if target <= 0:
+                messagebox.showerror("Error", "Target must be at least 1")
+                return
+            if target >= total:
+                # Import all
+                result["files"] = files
+                dlg.destroy()
+                return
+            
+            method = method_var.get()
+            
+            # Sort files for consistent ordering
+            sorted_files = sorted(files)
+            
+            # Sample using same logic as reduce_dataset
+            import random
+            selected = []
+            segment_size = total / target
+            
+            for i in range(target):
+                start_idx = int(i * segment_size)
+                end_idx = int((i + 1) * segment_size)
+                
+                if method == "stratified":
+                    # Random from segment
+                    idx = random.randint(start_idx, min(end_idx - 1, total - 1))
+                else:
+                    # Middle of segment
+                    idx = (start_idx + end_idx) // 2
+                
+                if idx < len(sorted_files):
+                    selected.append(sorted_files[idx])
+            
+            result["files"] = selected
+            dlg.destroy()
+        
+        def cancel():
+            result["files"] = None
+            dlg.destroy()
+        
+        btn_frame = tb.Frame(dlg)
+        btn_frame.pack(pady=20)
+        tb.Button(btn_frame, text="Import Reduced", command=do_reduce_import, bootstyle="success", width=14).pack(side="left", padx=5)
+        tb.Button(btn_frame, text="Import All", command=lambda: [result.__setitem__("files", files), dlg.destroy()], bootstyle="info-outline", width=10).pack(side="left", padx=5)
+        tb.Button(btn_frame, text="Cancel", command=cancel, bootstyle="secondary", width=10).pack(side="left", padx=5)
+        
+        dlg.wait_window()
+        
+        if result["files"]:
+            self._do_import_files(result["files"])
+    
+    def _do_import_files(self, files):
+        """Internal helper to import a list of files into the workspace."""
+        import shutil
+        
+        images_dir = os.path.join(self.workspace_path, "images")
+        if not os.path.exists(images_dir):
+            os.makedirs(images_dir)
+        
+        labels_dir = os.path.join(self.workspace_path, "labels")
+        if not os.path.exists(labels_dir):
+            os.makedirs(labels_dir)
+        
+        copied = 0
+        renamed = 0
+        
+        def get_unique_filename(directory, filename):
+            base, ext = os.path.splitext(filename)
+            dst_path = os.path.join(directory, filename)
+            
+            if not os.path.exists(dst_path):
+                return filename, dst_path, False
+            
+            counter = 1
+            while counter < 1000:
+                new_name = f"{base}_{counter}{ext}"
+                dst_path = os.path.join(directory, new_name)
+                if not os.path.exists(dst_path):
+                    return new_name, dst_path, True
+                counter += 1
+            
+            return None, None, False
+        
+        for src_path in files:
+            filename = os.path.basename(src_path)
+            new_name, dst_path, was_renamed = get_unique_filename(images_dir, filename)
+            
+            if new_name is None:
+                print(f"Could not find unique name for {filename}")
+                continue
+            
+            try:
+                shutil.copy2(src_path, dst_path)
+                copied += 1
+                if was_renamed:
+                    renamed += 1
+            except Exception as e:
+                print(f"Failed to copy {filename}: {e}")
+        
+        self.load_workspace(self.workspace_path)
+        
+        msg = f"Imported {copied} images"
+        if renamed > 0:
+            msg += f" ({renamed} renamed to avoid conflicts)"
+        messagebox.showinfo("Import Complete", msg)
+
     def clear_all_annotations(self):
-        """Clear all annotations for current image."""
+        """Clear all annotations for current image (with prompt)."""
         if not self.current_image:
             return
         if not messagebox.askyesno("Confirm", "Clear ALL annotations for this image?"):
             return
+        self.clear_all_annotations_quick()
+
+    def clear_all_annotations_quick(self):
+        """Clear all annotations for current image (no prompt)."""
+        if not self.current_image:
+            return
+        if not self.annotations:
+            self.status_var.set("No annotations to clear")
+            return
+        
+        # Save for undo
+        self._push_annotation_undo()
+        
+        count = len(self.annotations)
         self.annotations = []
         self.save_annotations()
         self.redraw()
-        self.status_var.set("Cleared all annotations")
+        self._flash_notification(f"Cleared {count} annotations (Ctrl+Z to undo)")
 
     def clear_class_annotations(self):
-        """Clear annotations of selected class for current image."""
+        """Clear annotations of selected class for current image (with prompt)."""
+        if not self.current_image:
+            return
+        self.clear_class_annotations_quick()
+
+    def clear_class_annotations_quick(self):
+        """Clear annotations of selected class for current image (no prompt)."""
         if not self.current_image:
             return
         class_name = self.classes[self.selected_class_id] if self.selected_class_id < len(self.classes) else str(self.selected_class_id)
         count_before = len(self.annotations)
-        self.annotations = [a for a in self.annotations if a[0] != self.selected_class_id]
-        count_removed = count_before - len(self.annotations)
-        self.save_annotations()
-        self.redraw()
-        self.status_var.set(f"Removed {count_removed} '{class_name}' annotations")
+        new_annotations = [a for a in self.annotations if a[0] != self.selected_class_id]
+        count_removed = count_before - len(new_annotations)
+        
+        if count_removed > 0:
+            # Save for undo BEFORE modifying
+            self._push_annotation_undo()
+            
+            self.annotations = new_annotations
+            self.save_annotations()
+            self.redraw()
+            self._flash_notification(f"Removed {count_removed} '{class_name}' annotations (Ctrl+Z to undo)")
+        else:
+            self.status_var.set(f"No '{class_name}' annotations to remove")
 
     def delete_current_image(self, e=None):
-        """Delete current image and label from dataset (with undo)."""
+        """Delete current image and label from dataset (with prompt)."""
         if not self.current_image or not self.filtered_image_paths:
             return
         
         if not messagebox.askyesno("Confirm Delete", "Delete this image and its labels from the dataset?\n\nYou can undo with Ctrl+Z"):
             return
         
+        self._do_delete_current_image()
+
+    def delete_current_image_quick(self, e=None):
+        """Delete current image instantly (no prompt, undoable with Ctrl+Z)."""
+        if not self.current_image or not self.filtered_image_paths:
+            return
+        self._do_delete_current_image()
+
+    def _do_delete_current_image(self):
+        """Internal: performs the actual image deletion."""
         img_path = self.filtered_image_paths[self.current_index]
         lbl_path = self._get_label_path(img_path)
         
@@ -766,10 +1106,17 @@ class AnnotatorApp:
         # Remove from lists
         if img_path in self.image_paths:
             self.image_paths.remove(img_path)
-        if img_path in self.image_to_classes_cache:
-            del self.image_to_classes_cache[img_path]
+        norm_path = os.path.normpath(img_path)
+        if norm_path in self.image_to_classes_cache:
+            del self.image_to_classes_cache[norm_path]
+        
+        # Clear state to prevent 'save_annotations' from resurrecting the labels
+        self.current_image = None
+        self.current_file_path = None
+        self.annotations = []
         
         # Refresh and load next
+
         self._refresh_file_list()
         new_idx = min(self.current_index, len(self.filtered_image_paths) - 1)
         if self.filtered_image_paths:
@@ -780,46 +1127,171 @@ class AnnotatorApp:
             self.lbl_idx.config(text="0 / 0")
         
         self._update_stats()
-        self.status_var.set(f"Deleted image (Ctrl+Z to undo)")
+        self._flash_notification(f"🗑 Deleted {os.path.basename(img_path)} (Ctrl+Z to undo)")
 
-    def undo_delete(self):
-        """Restore last deleted image."""
-        if not self.deleted_files_stack:
-            self.status_var.set("Nothing to undo")
+    def _flash_notification(self, message, duration=2000):
+        """Show a temporary notification in the status bar with highlight."""
+        old_style = self.statusbar.cget('bootstyle')
+        self.statusbar.configure(bootstyle="warning")
+        self.status_var.set(message)
+        
+        def restore():
+            self.statusbar.configure(bootstyle="inverse-secondary")
+        
+        self.root.after(duration, restore)
+
+    def show_shortcuts_dialog(self):
+        """Display keyboard shortcuts help dialog."""
+        shortcuts = """
+📍 NAVIGATION
+  A / ←      Previous image
+  D / →      Next image
+  G           Open gallery view
+
+🎨 ANNOTATION
+  1-9         Select class 1-9 (maps to 0-8)
+  0           Select class 10 (maps to 9)
+  Click+Drag  Draw bounding box
+  Right-click Delete annotation under cursor
+  Ctrl+Click  Multi-select annotations
+  R           Repeat selected annotations & next
+
+🗑 DELETE / CLEAR
+  Del         Delete current image (undoable)
+  Backspace   Clear annotations of selected class
+  Ctrl+Back   Clear ALL annotations on image
+  Ctrl+Z      Undo (moves, clears, deletions)
+  Ctrl+Y      Redo
+
+⚙ OTHER
+  S           Save annotations
+  Q           Quick auto-annotate (all classes)
+  H           Show this help
+  Esc         Clear selection / Unlock class
+"""
+        dlg = tb.Toplevel(self.root)
+        dlg.title("Keyboard Shortcuts")
+        dlg.geometry("420x520")
+        dlg.transient(self.root)
+        
+        text = tk.Text(dlg, wrap="word", font=("Consolas", 10), bg="#1e1e1e", fg="#e0e0e0", 
+                       padx=15, pady=15, relief="flat", highlightthickness=0)
+        text.insert("1.0", shortcuts)
+        text.configure(state="disabled")
+        text.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        tb.Button(dlg, text="Close", command=dlg.destroy, bootstyle="secondary").pack(pady=10)
+
+    def undo_action(self):
+        """Undo last action - annotation changes or file deletions."""
+        # First try annotation undo (more common)
+        if self.annotation_undo_stack:
+            file_path, old_annotations = self.annotation_undo_stack.pop()
+            
+            # Save current state to redo stack BEFORE restoring
+            if self.current_file_path:
+                current_copy = [list(a) for a in self.annotations]
+                self.annotation_redo_stack.append((self.current_file_path, current_copy))
+            
+            # If we're on the same file, restore annotations
+            if file_path == self.current_file_path:
+                self.annotations = old_annotations
+                self.save_annotations()
+                self.redraw()
+                self._flash_notification(f"↶ Undo (Ctrl+Y to redo)")
+                return
+            else:
+                # Different file - reload that file first
+                if file_path in self.filtered_image_paths:
+                    idx = self.filtered_image_paths.index(file_path)
+                    self.load_image(idx)
+                    self.annotations = old_annotations
+                    self.save_annotations()
+                    self.redraw()
+                    self._flash_notification(f"↶ Undo on {os.path.basename(file_path)}")
+                    return
+        
+        # Then try file deletion undo
+        if self.deleted_files_stack:
+            img_path, lbl_path, img_data, lbl_data = self.deleted_files_stack.pop()
+            
+            try:
+                # Restore image
+                if img_data:
+                    os.makedirs(os.path.dirname(img_path), exist_ok=True)
+                    with open(img_path, 'wb') as f:
+                        f.write(img_data)
+                
+                # Restore label
+                if lbl_data:
+                    os.makedirs(os.path.dirname(lbl_path), exist_ok=True)
+                    with open(lbl_path, 'w') as f:
+                        f.write(lbl_data)
+                
+                # Add back to lists
+                if img_path not in self.image_paths:
+                    self.image_paths.append(img_path)
+                    self.image_paths.sort()
+                
+                # Rebuild cache and refresh
+                self._build_annotation_cache()
+                self._refresh_file_list()
+                
+                # Navigate to restored image
+                if img_path in self.filtered_image_paths:
+                    idx = self.filtered_image_paths.index(img_path)
+                    self.load_image(idx)
+                
+                self._flash_notification(f"↶ Restored {os.path.basename(img_path)}")
+            except Exception as ex:
+                messagebox.showerror("Undo Error", str(ex))
             return
         
-        img_path, lbl_path, img_data, lbl_data = self.deleted_files_stack.pop()
+        self.status_var.set("Nothing to undo")
+
+    def redo_action(self):
+        """Redo last undone action."""
+        if not self.annotation_redo_stack:
+            self.status_var.set("Nothing to redo")
+            return
         
-        try:
-            # Restore image
-            if img_data:
-                os.makedirs(os.path.dirname(img_path), exist_ok=True)
-                with open(img_path, 'wb') as f:
-                    f.write(img_data)
-            
-            # Restore label
-            if lbl_data:
-                os.makedirs(os.path.dirname(lbl_path), exist_ok=True)
-                with open(lbl_path, 'w') as f:
-                    f.write(lbl_data)
-            
-            # Add back to lists
-            if img_path not in self.image_paths:
-                self.image_paths.append(img_path)
-                self.image_paths.sort()
-            
-            # Rebuild cache and refresh
-            self._build_annotation_cache()
-            self._refresh_file_list()
-            
-            # Navigate to restored image
-            if img_path in self.filtered_image_paths:
-                idx = self.filtered_image_paths.index(img_path)
+        file_path, redo_annotations = self.annotation_redo_stack.pop()
+        
+        # Save current state to undo stack
+        if self.current_file_path:
+            current_copy = [list(a) for a in self.annotations]
+            self.annotation_undo_stack.append((self.current_file_path, current_copy))
+        
+        # Apply redo
+        if file_path == self.current_file_path:
+            self.annotations = redo_annotations
+            self.save_annotations()
+            self.redraw()
+            self._flash_notification(f"↷ Redo")
+        else:
+            if file_path in self.filtered_image_paths:
+                idx = self.filtered_image_paths.index(file_path)
                 self.load_image(idx)
-            
-            self.status_var.set(f"Restored {os.path.basename(img_path)}")
-        except Exception as ex:
-            messagebox.showerror("Undo Error", str(ex))
+                self.annotations = redo_annotations
+                self.save_annotations()
+                self.redraw()
+                self._flash_notification(f"↷ Redo on {os.path.basename(file_path)}")
+
+    def _push_annotation_undo(self):
+        """Save current annotation state for undo."""
+        if not self.current_file_path:
+            return
+        
+        # Clear redo stack when new action is performed
+        self.annotation_redo_stack.clear()
+        
+        # Deep copy annotations
+        annotations_copy = [list(a) for a in self.annotations]
+        self.annotation_undo_stack.append((self.current_file_path, annotations_copy))
+        
+        # Limit stack size
+        if len(self.annotation_undo_stack) > self.max_undo_size:
+            self.annotation_undo_stack.pop(0)
 
     def show_class_distribution(self):
         """Show a popup with class distribution across all images."""
@@ -983,6 +1455,13 @@ class AnnotatorApp:
         return False
 
     def on_filter_changed(self, event):
+        # Save before list changes/invalidation
+        if self.current_image:
+            self.save_annotations()
+            self.current_image = None # Prevent load_image from saving to wrong index/file
+            self.current_file_path = None
+
+
         # Snapshot current path to try and keep it selected
         current_path = None
         if 0 <= self.current_index < len(self.filtered_image_paths):
@@ -1012,8 +1491,155 @@ class AnnotatorApp:
     def on_file_selected(self, event):
         sel = self.file_list.curselection()
         if sel:
+            # For multi-select, load the first selected item
             # Pass True to avoid recursive selection update
             self.load_image(sel[0], from_list_click=True)
+
+    def on_file_list_right_click(self, event):
+        """Show context menu for selected files in the file list."""
+        sel = self.file_list.curselection()
+        if not sel:
+            return
+        
+        # Create context menu
+        menu = tk.Menu(self.root, tearoff=0)
+        
+        count = len(sel)
+        if count == 1:
+            menu.add_command(label="Delete Image", command=lambda: self.delete_selected_files(sel))
+            menu.add_command(label="Clear Annotations", command=lambda: self.clear_selected_files_annotations(sel))
+        else:
+            menu.add_command(label=f"Delete {count} Images", command=lambda: self.delete_selected_files(sel))
+            menu.add_command(label=f"Clear Annotations ({count} images)", command=lambda: self.clear_selected_files_annotations(sel))
+        
+        menu.add_separator()
+        menu.add_command(label="Cancel", command=menu.destroy)
+        
+        # Show menu at mouse position
+        menu.tk_popup(event.x_root, event.y_root)
+    
+    def delete_selected_files(self, indices):
+        """Delete multiple selected images from the dataset."""
+        if not indices:
+            return
+        
+        count = len(indices)
+        msg = f"Delete {count} image(s) and their labels?\n\nYou can undo with Ctrl+Z"
+        if not messagebox.askyesno("Confirm Delete", msg):
+            return
+        
+        # Save current work first
+        if self.current_image:
+            self.save_annotations()
+        
+        # Get paths for selected indices (reversed to delete from end first)
+        paths_to_delete = []
+        for idx in sorted(indices, reverse=True):
+            if 0 <= idx < len(self.filtered_image_paths):
+                paths_to_delete.append(self.filtered_image_paths[idx])
+        
+        deleted = 0
+        for img_path in paths_to_delete:
+            lbl_path = self._get_label_path(img_path)
+            
+            # Read file contents for undo
+            img_data = None
+            lbl_data = None
+            
+            try:
+                with open(img_path, 'rb') as f:
+                    img_data = f.read()
+            except:
+                pass
+            
+            try:
+                if os.path.exists(lbl_path):
+                    with open(lbl_path, 'r') as f:
+                        lbl_data = f.read()
+            except:
+                pass
+            
+            # Push to undo stack
+            self.deleted_files_stack.append((img_path, lbl_path, img_data, lbl_data))
+            
+            # Delete files
+            try:
+                if os.path.exists(img_path):
+                    os.remove(img_path)
+                if os.path.exists(lbl_path):
+                    os.remove(lbl_path)
+                deleted += 1
+                
+                # Remove from lists
+                if img_path in self.image_paths:
+                    self.image_paths.remove(img_path)
+                norm_path = os.path.normpath(img_path)
+                if norm_path in self.image_to_classes_cache:
+                    del self.image_to_classes_cache[norm_path]
+            except Exception as ex:
+                print(f"Error deleting {img_path}: {ex}")
+        
+        # Clear current state
+        self.current_image = None
+        self.annotations = []
+        
+        # Refresh list
+        self._refresh_file_list()
+        
+        # Load first image if any remain
+        if self.filtered_image_paths:
+            self.load_image(0)
+        else:
+            self.canvas.delete("all")
+            self.current_index = -1
+            self.lbl_idx.config(text="0 / 0")
+        
+        self._update_stats()
+        self.status_var.set(f"Deleted {deleted} image(s) - Ctrl+Z to undo")
+    
+    def clear_selected_files_annotations(self, indices):
+        """Clear annotations for multiple selected images."""
+        if not indices:
+            return
+        
+        count = len(indices)
+        msg = f"Clear ALL annotations for {count} image(s)?\n\nThis cannot be undone!"
+        if not messagebox.askyesno("Confirm Clear", msg):
+            return
+        
+        # Save current work first
+        if self.current_image:
+            self.save_annotations()
+        
+        cleared = 0
+        for idx in indices:
+            if 0 <= idx < len(self.filtered_image_paths):
+                img_path = self.filtered_image_paths[idx]
+                lbl_path = self._get_label_path(img_path)
+                
+                if os.path.exists(lbl_path):
+                    try:
+                        # Clear the file
+                        with open(lbl_path, 'w') as f:
+                            f.write("")
+                        cleared += 1
+                        
+                        # Update cache
+                        norm_path = os.path.normpath(img_path)
+                        self.image_to_classes_cache[norm_path] = set()
+                    except Exception as ex:
+                        print(f"Error clearing {lbl_path}: {ex}")
+        
+        # Rebuild cache and refresh
+        self._build_annotation_cache()
+        self._refresh_file_list()
+        
+        # Reload current image if it was affected
+        if self.current_index >= 0 and self.current_index < len(self.filtered_image_paths):
+            self.load_image(self.current_index)
+        
+        self._update_stats()
+        self.status_var.set(f"Cleared annotations for {cleared} image(s)")
 
     def on_class_selected(self, event):
         sel = self.cls_list.curselection()
@@ -1096,7 +1722,7 @@ class AnnotatorApp:
         paths = self.filtered_image_paths[:max_count]
         
         # Mutable state
-        state = {"size": 150, "cols": 5}
+        state = {"size": 150, "cols": 5, "resize_scheduled": False}
         photo_refs = []  # Keep references to prevent GC
         
         # Create window first
@@ -1114,7 +1740,7 @@ class AnnotatorApp:
         
         # Inner frame
         inner = tk.Frame(canvas, bg="#1a1a1a")
-        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
         
         def generate_thumbnail(img_path, size):
             """Generate a single thumbnail with annotations."""
@@ -1150,7 +1776,11 @@ class AnnotatorApp:
             photo_refs.clear()
             
             size = state["size"]
-            cols = max(1, 800 // (size + 20))
+            # Use actual canvas width for column calculation
+            canvas_width = canvas.winfo_width()
+            if canvas_width < 100:  # Not yet rendered, use default
+                canvas_width = 900
+            cols = max(1, canvas_width // (size + 20))
             state["cols"] = cols
             
             gallery.title(f"Gallery ({max_count} imgs, {size}px) - Ctrl+Scroll to resize")
@@ -1184,6 +1814,19 @@ class AnnotatorApp:
             inner.update_idletasks()
             canvas.configure(scrollregion=canvas.bbox("all"))
             bind_scroll_events()
+        
+        def on_canvas_resize(event):
+            """Handle window/canvas resize - rebuild with new column count."""
+            # Debounce resize events
+            if state["resize_scheduled"]:
+                return
+            state["resize_scheduled"] = True
+            
+            def do_rebuild():
+                state["resize_scheduled"] = False
+                rebuild_gallery()
+            
+            gallery.after(150, do_rebuild)  # 150ms debounce
         
         def bind_scroll_events():
             """Bind scroll to all widgets."""
@@ -1219,6 +1862,9 @@ class AnnotatorApp:
         gallery.bind("<Control-equal>", on_key)
         gallery.bind("<Control-minus>", on_key)
         
+        # Bind resize event to canvas
+        canvas.bind("<Configure>", on_canvas_resize)
+        
         # Build initial gallery
         rebuild_gallery()
 
@@ -1239,20 +1885,37 @@ class AnnotatorApp:
             self.load_image(0)
 
     def repeat_and_next(self, e=None):
-        """Paste clipboard, copy current annotations, go to next image.
+        """Copy selected annotations to clipboard, go to next image, then paste.
         
         Flow: 
-        1. If clipboard has annotations, paste them to current image
-        2. Copy current image's annotations of selected class to clipboard
-        3. Go to next image
+        1. If annotations are SELECTED (Ctrl+Click highlighted), copy to clipboard (replacing old)
+        2. Go to next image
+        3. If clipboard has annotations, paste them
+        
+        Usage:
+        - Ctrl+Click annotations you want to repeat → Press R to copy & move to next & paste
+        - Keep pressing R to paste same annotations on subsequent images
+        - Ctrl+Click new annotations anytime to replace clipboard
         """
         if not self.current_image:
             self.next_image()
             return
         
-        class_name = self.classes[self.selected_class_id] if self.selected_class_id < len(self.classes) else str(self.selected_class_id)
+        # Step 1: Copy selected annotations FIRST (replaces clipboard)
+        copied_count = 0
+        if self.selected_annotations:
+            # Use manually selected annotations (cyan highlighted)
+            self.repeat_clipboard = [list(self.annotations[i]) for i in sorted(self.selected_annotations) 
+                                      if i < len(self.annotations)]
+            copied_count = len(self.repeat_clipboard)
+            # Clear selection after copying (they're now in clipboard)
+            self.selected_annotations.clear()
+            self.redraw()  # Update display to remove selection highlighting
         
-        # Step 1: Paste clipboard if it has content
+        # Step 2: Go to next image
+        self.next_image()
+        
+        # Step 3: Paste clipboard if it has content
         pasted = 0
         removed = 0
         if self.repeat_clipboard:
@@ -1278,22 +1941,23 @@ class AnnotatorApp:
             self.save_annotations()
             self.redraw()
         
-        # Step 2: Copy current annotations of selected class to clipboard
-        self.repeat_clipboard = [list(ann) for ann in self.annotations if ann[0] == self.selected_class_id]
-        
-        # Step 3: Go to next image
-        self.next_image()
-        
         # Status message
-        if pasted > 0:
+        if copied_count > 0 and pasted > 0:
             if removed > 0:
-                self.status_var.set(f"Pasted {pasted} '{class_name}' (replaced {removed}), copied {len(self.repeat_clipboard)} for next")
+                self.status_var.set(f"Copied {copied_count}, pasted {pasted} (replaced {removed})")
             else:
-                self.status_var.set(f"Pasted {pasted} '{class_name}', copied {len(self.repeat_clipboard)} for next")
+                self.status_var.set(f"Copied {copied_count}, pasted {pasted} - R to continue")
+        elif copied_count > 0:
+            self.status_var.set(f"Copied {copied_count} - R to paste on next images")
+        elif pasted > 0:
+            if removed > 0:
+                self.status_var.set(f"Pasted {pasted} (replaced {removed}) - R to repeat")
+            else:
+                self.status_var.set(f"Pasted {pasted} annotations - R to repeat")
         elif self.repeat_clipboard:
-            self.status_var.set(f"Copied {len(self.repeat_clipboard)} '{class_name}' - press R again to paste")
+            self.status_var.set(f"Clipboard has {len(self.repeat_clipboard)} - R to paste")
         else:
-            self.status_var.set(f"No '{class_name}' annotations to copy")
+            self.status_var.set(f"Ctrl+Click to select, then R to copy & repeat")
 
     # --- IMAGE & ANNOTATION LOGIC ---
 
@@ -1322,8 +1986,9 @@ class AnnotatorApp:
             return
         
         # Save previous annotations (only if we have a valid current state)
-        if self.current_image and 0 <= self.current_index < len(self.filtered_image_paths):
+        if self.current_image and self.current_file_path:
             self.save_annotations()
+
             
         self.current_index = index
         path = self.filtered_image_paths[index]
@@ -1339,14 +2004,22 @@ class AnnotatorApp:
         
         try:
             self.current_image = Image.open(path)
+            self.current_file_path = path # Update this ONLY after successful load
         except Exception as e:
             self.status_var.set(f"Error loading {os.path.basename(path)}")
+            # Clear state to avoid mismatch
+            self.current_image = None
+            self.current_file_path = None 
+            self.annotations = []
+            self.redraw()
             return
             
         self.status_var.set(f"Editing {os.path.basename(path)}")
+
         
-        # Load Labels
+        # Load Labels - clear selection since indices change
         self.annotations = []
+        self.selected_annotations.clear()  # Clear selection when changing images
         lbl_path = self._get_label_path(path)
         
         # Fallback for reading: check same directory if labels path doesn't exist
@@ -1376,11 +2049,17 @@ class AnnotatorApp:
     def save_annotations(self):
         if not self.current_image: 
             return
-        # Bounds check to prevent IndexError
-        if not self.filtered_image_paths or self.current_index < 0 or self.current_index >= len(self.filtered_image_paths):
-            return
-        path = self.filtered_image_paths[self.current_index]
+            
+        # Use EXPLICIT file path if available, otherwise fallback to index (unsafe but fallback)
+        path = self.current_file_path
+        if not path:
+             # Bounds check to prevent IndexError
+            if not self.filtered_image_paths or self.current_index < 0 or self.current_index >= len(self.filtered_image_paths):
+                return
+            path = self.filtered_image_paths[self.current_index]
+
         lbl_path = self._get_label_path(path)
+
         
         # Ensure dir
         os.makedirs(os.path.dirname(lbl_path), exist_ok=True)
@@ -1406,11 +2085,22 @@ class AnnotatorApp:
                 
                 # Format: class cx cy w h
                 f.write(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
-                
-        # Update cache
+        
+        # Verify save by re-reading from disk
+        saved_count = 0
+        if os.path.exists(lbl_path):
+            with open(lbl_path, 'r') as f:
+                saved_count = len([l for l in f if l.strip()])
+        
+        # Update cache (use normalized path for consistency)
         cids = set(a[0] for a in self.annotations)
-        self.image_to_classes_cache[path] = cids
-        self.status_var.set(f"Saved {os.path.basename(lbl_path)}")
+        self.image_to_classes_cache[os.path.normpath(path)] = cids
+        
+        # Verify match
+        if saved_count != len(self.annotations):
+            self.status_var.set(f"⚠ Save mismatch! Memory: {len(self.annotations)}, Disk: {saved_count}")
+        else:
+            self.status_var.set(f"✓ Saved {os.path.basename(lbl_path)} ({saved_count} annotations)")
         
         # Update stats
         self._update_stats()
@@ -1421,8 +2111,45 @@ class AnnotatorApp:
         if self.current_image:
             self.redraw()
 
+    def show_image_info(self):
+        """Show debug info about current image and label mapping."""
+        if not self.current_image:
+             messagebox.showinfo("Info", "No image loaded.")
+             return
+
+        path = self.current_file_path or "None"
+        idx = self.current_index
+        list_path = "None"
+        if 0 <= idx < len(self.filtered_image_paths):
+            list_path = self.filtered_image_paths[idx]
+        
+        lbl_path = self._get_label_path(path) if path != "None" else "None"
+        
+        # Check alignment
+        status = "OK"
+        if path != list_path:
+            status = "MISMATCH (Index points to different file!)"
+        
+        msg = (
+            f"Status: {status}\n\n"
+            f"Index: {idx}\n"
+            f"Loaded Image: {path}\n"
+            f"List Image:   {list_path}\n"
+            f"Label File:   {lbl_path}\n"
+            f"Image Size: {self.current_image.size}\n"
+            f"Annotations: {len(self.annotations)}"
+        )
+        
+        if os.path.exists(lbl_path):
+             msg += f"\n\nLabel file exists ({os.path.getsize(lbl_path)} bytes)"
+        else:
+             msg += "\n\nLabel file does not exist (will be created on save)"
+
+        messagebox.showinfo("Image Info", msg)
+
     def redraw(self):
         if not self.current_image: return
+
         self.canvas.delete("all")
         self.crosshair_lines = [] # Reset crosshair IDs since they were deleted
         
@@ -1447,6 +2174,9 @@ class AnnotatorApp:
         self.photo_image = ImageTk.PhotoImage(disp)
         
         self.canvas.create_image(self.offset_x, self.offset_y, anchor=NW, image=self.photo_image)
+        
+        # Update image size display
+        self.image_size_var.set(f"{iw} × {ih}")
         
         # Draw Annotations
         for i, ann in enumerate(self.annotations):
@@ -1479,19 +2209,26 @@ class AnnotatorApp:
         
         color = self.class_colors.get(cid, "#FFFFFF")
         
-        # Determine outline width/style (highlight if moving)
+        # Determine outline width/style (highlight if selected or moving)
         width = 2
         dash = None
+        is_selected = index in self.selected_annotations
+        
         if index == self.active_annotation_index:
              width = 3
-             color = "#FFFF00" # Highlight active
+             color = "#FFFF00"  # Yellow for actively being dragged
+        elif is_selected:
+             width = 3
+             color = self.SELECTED_COLOR  # Cyan for multi-selected
         
         rect = self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline=color, width=width, dash=dash, tags=f"ann_{index}")
         
-        # Label
+        # Label - show checkmark for selected annotations
         label = str(cid)
         if 0 <= cid < len(self.classes):
             label = self.classes[cid]
+        if is_selected:
+            label = "✓ " + label  # Add checkmark to indicate selection
         
         self.canvas.create_text(sx1, sy1-10, text=label, fill=color, anchor=SW, font=("Arial", 11, "bold"))
 
@@ -1511,8 +2248,72 @@ class AnnotatorApp:
         ny = iy / self.current_image.height
         return nx, ny
 
+    def _find_annotation_at_point(self, event_x, event_y):
+        """Find annotation index at the given canvas coordinates. Returns -1 if none."""
+        if not self.current_image:
+            return -1
+        
+        ix, iy = self._get_img_coords(event_x, event_y)
+        iw, ih = self.current_image.width, self.current_image.height
+        
+        # Iterate reverse to pick topmost
+        for i in range(len(self.annotations)-1, -1, -1):
+            ann = self.annotations[i]
+            n_cx, n_cy, n_w, n_h = ann[1:]
+            
+            l = (n_cx - n_w/2) * iw
+            r = (n_cx + n_w/2) * iw
+            t = (n_cy - n_h/2) * ih
+            b = (n_cy + n_h/2) * ih
+            
+            if l <= ix <= r and t <= iy <= b:
+                return i
+        return -1
+
+    def on_ctrl_click(self, event):
+        """Handle Ctrl+Click to toggle annotation selection for repeat function."""
+        if not self.current_image:
+            return
+        
+        hit_index = self._find_annotation_at_point(event.x, event.y)
+        
+        if hit_index != -1:
+            # Toggle selection
+            if hit_index in self.selected_annotations:
+                self.selected_annotations.remove(hit_index)
+                self.status_var.set(f"Deselected annotation {hit_index} ({len(self.selected_annotations)} selected)")
+            else:
+                self.selected_annotations.add(hit_index)
+                self.status_var.set(f"Selected annotation {hit_index} ({len(self.selected_annotations)} total selected - press R to repeat)")
+            self.redraw()
+        else:
+            # Clicked on empty space - could clear selection if desired
+            # For now, just show help
+            self.status_var.set("Ctrl+Click on annotations to select them for repeat (R)")
+
+    def clear_selection(self):
+        """Clear all selected annotations."""
+        if self.selected_annotations:
+            self.selected_annotations.clear()
+            self.redraw()
+            self.status_var.set("Selection cleared")
+
+    def escape_action(self):
+        """Handle Escape key - clear selection and unlock class."""
+        # First press clears selection, second unlocks class
+        if self.selected_annotations:
+            self.clear_selection()
+        else:
+            # Deselect class in listbox (allows interacting with all classes)
+            self.cls_list.selection_clear(0, tk.END)
+            self.status_var.set("Class unlocked - can now move any annotation")
+            self.redraw()
+
     def on_mouse_down(self, event):
         if not self.current_image: return
+        
+        # Check if a class is selected (for class-locked movement)
+        class_locked = len(self.cls_list.curselection()) > 0
         
         # 1. Check collision with existing boxes (to select/move)
         # Iterate reverse to pick top
@@ -1522,7 +2323,12 @@ class AnnotatorApp:
         hit_index = -1
         for i in range(len(self.annotations)-1, -1, -1):
             ann = self.annotations[i]
-            # ann is cx, cy, w, h norm
+            
+            # If class is locked, only consider annotations of that class
+            if class_locked and ann[0] != self.selected_class_id:
+                continue
+                
+            # ann is [class_id, cx, cy, w, h] norm
             n_cx, n_cy, n_w, n_h = ann[1:]
             
             # Convert to pixel bbox
@@ -1536,13 +2342,16 @@ class AnnotatorApp:
                 break
         
         if hit_index != -1:
+            # Save state for undo BEFORE moving
+            self._push_annotation_undo()
+            
             # Entering Move Mode
             self.drag_mode = "move"
             self.active_annotation_index = hit_index
             self.start_x = event.x
             self.start_y = event.y
             # Save original state
-            self.drag_start_norm_bbox = list(self.annotations[hit_index]) # copy
+            self.drag_start_norm_bbox = list(self.annotations[hit_index][1:]) # copy [cx, cy, w, h]
             self.redraw() # To show highlight
             return
             
@@ -1577,8 +2386,8 @@ class AnnotatorApp:
              
              # Update annotation
              ann = self.annotations[self.active_annotation_index]
-             ann[1] = orig[0] + dnx
-             ann[2] = orig[1] + dny
+             ann[1] = self.drag_start_norm_bbox[0] + dnx
+             ann[2] = self.drag_start_norm_bbox[1] + dny
              
              self.redraw()
              
@@ -1587,13 +2396,16 @@ class AnnotatorApp:
     def on_mouse_move(self, event):
         # Handle Crosshair
         if self.show_crosshair.get():
+            # Hide the cursor when crosshair is active
+            self.canvas.config(cursor="none")
+            
             x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
             
             # Create lines if not exist
             if not self.crosshair_lines:
-                # Dotted, semi-transparent-ish (gray)
-                l1 = self.canvas.create_line(0, y, 10000, y, fill="#FFFF00", dash=(4, 4), width=1, tags="crosshair")
-                l2 = self.canvas.create_line(x, 0, x, 10000, fill="#FFFF00", dash=(4, 4), width=1, tags="crosshair")
+                # Yellow crosshair for better visibility
+                l1 = self.canvas.create_line(0, y, 10000, y, fill="#FFFF00", dash=(8, 8), width=1, tags="crosshair")
+                l2 = self.canvas.create_line(x, 0, x, 10000, fill="#FFFF00", dash=(8, 8), width=1, tags="crosshair")
                 self.crosshair_lines = [l1, l2]
             else:
                 # Update coords
@@ -1604,7 +2416,9 @@ class AnnotatorApp:
                 # Bring to front
                 self.canvas.tag_raise("crosshair")
         else:
-             # Remove if exists
+             # Show cursor when crosshair is disabled
+             self.canvas.config(cursor="")
+             # Remove crosshair if exists
              if self.crosshair_lines:
                  self.canvas.delete("crosshair")
                  self.crosshair_lines = []
@@ -1643,18 +2457,31 @@ class AnnotatorApp:
             ncx = nx1 + nw/2
             ncy = ny1 + nh/2
             
+            # Save for undo BEFORE adding
+            self._push_annotation_undo()
+            
             self.annotations.append([self.selected_class_id, ncx, ncy, nw, nh])
             self.save_annotations()
             self.redraw()
 
     def on_right_click(self, event):
         # Delete detection under cursor
-        self.on_mouse_down(event) # Select it first logic
-        if self.active_annotation_index != -1:
-            self.delete_selected_annotation()
+        hit_index = self._find_annotation_at_point(event.x, event.y)
+        if hit_index != -1:
+            # Save for undo BEFORE deleting
+            self._push_annotation_undo()
+            
+            del self.annotations[hit_index]
+            self.active_annotation_index = -1
+            self.save_annotations()
+            self.redraw()
+            self._flash_notification("Deleted annotation (Ctrl+Z to undo)")
             
     def delete_selected_annotation(self, event=None):
         if self.active_annotation_index != -1:
+            # Save for undo BEFORE deleting
+            self._push_annotation_undo()
+            
             del self.annotations[self.active_annotation_index]
             self.active_annotation_index = -1
             self.save_annotations()
@@ -1727,6 +2554,36 @@ class AnnotatorApp:
             self.status_var.set(f"Auto-Annotate: Added {added} boxes.")
         except Exception as e:
             messagebox.showerror("Inference Error", str(e))
+
+    def auto_annotate_quick(self):
+        """Quick auto-annotate current image with ALL classes - no dialog, single keypress."""
+        if not self.model:
+            self.status_var.set("No model loaded - press Load Model first")
+            return
+        if not self.current_image:
+            self.status_var.set("No image loaded")
+            return
+        
+        # Use all defined classes
+        allowed_classes = set(range(len(self.classes))) if self.classes else set(range(100))
+        
+        ver = self.model_ver_combo.get()
+        try:
+            boxes, classes, scores = self.model.predict(np.array(self.current_image), version=ver)
+            
+            added = 0
+            for b, c, s in zip(boxes, classes, scores):
+                if int(c) not in allowed_classes:
+                    continue
+                # b is [cx, cy, w, h] norm
+                self.annotations.append([int(c), b[0], b[1], b[2], b[3]])
+                added += 1
+                
+            self.save_annotations()
+            self.redraw()
+            self.status_var.set(f"Quick Auto-Annotate: Added {added} boxes")
+        except Exception as e:
+            self.status_var.set(f"Auto-annotate error: {e}")
 
     def auto_annotate_all(self):
         if not self.model: return
@@ -1844,8 +2701,278 @@ class AnnotatorApp:
             
         tb.Button(dlg, text="Reduce Dataset", command=run_reduce, bootstyle="danger").pack(pady=20, fill=X, padx=20)
 
+    def find_duplicates_dialog(self):
+        """Find and remove duplicate images with visual preview."""
+        if not self.workspace_path:
+            messagebox.showerror("Error", "No workspace loaded.")
+            return
+        
+        # Find duplicates using utils
+        stats, issues, warnings = utils.validate_dataset(self.workspace_path)
+        
+        duplicate_groups = stats.get('duplicate_hashes', [])
+        
+        if not duplicate_groups:
+            messagebox.showinfo("No Duplicates", "No duplicate images found in the workspace.")
+            return
+        
+        # Create dialog
+        dlg = tb.Toplevel(self.root)
+        dlg.title(f"Duplicate Images Found ({len(duplicate_groups)} groups)")
+        dlg.geometry("900x700")
+        dlg.configure(bg="#1a1a1a")
+        dlg.transient(self.root)
+        
+        # Header
+        header = tb.Frame(dlg)
+        header.pack(fill=X, padx=10, pady=10)
+        tb.Label(header, text=f"Found {len(duplicate_groups)} groups of duplicate images", 
+                 font=("Helvetica", 12, "bold")).pack(side=LEFT)
+        
+        # Scrollable content
+        content_frame = tb.Frame(dlg)
+        content_frame.pack(fill=BOTH, expand=True, padx=10, pady=5)
+        
+        canvas = tk.Canvas(content_frame, bg="#1a1a1a", highlightthickness=0)
+        vsb = ttk.Scrollbar(content_frame, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        
+        inner = tk.Frame(canvas, bg="#1a1a1a")
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        
+        photo_refs = []  # Keep references
+        selected_for_delete = {}  # {filepath: BooleanVar}
+        first_in_group = set()  # Track first image of each group (to keep)
+        
+        images_dir = os.path.join(self.workspace_path, "images")
+        
+        for group_idx, group in enumerate(duplicate_groups):
+            # Group frame
+            group_frame = tb.Labelframe(inner, text=f"Group {group_idx + 1}: {len(group)} identical images", padding=10)
+            group_frame.pack(fill=X, padx=5, pady=5)
+            
+            # Images row
+            imgs_row = tb.Frame(group_frame)
+            imgs_row.pack(fill=X)
+            
+            for file_idx, filename in enumerate(group):
+                img_path = os.path.join(images_dir, filename)
+                
+                # Track first image in group
+                if file_idx == 0:
+                    first_in_group.add(img_path)
+                
+                cell = tb.Frame(imgs_row)
+                cell.pack(side=LEFT, padx=5, pady=5)
+                
+                # Thumbnail
+                try:
+                    img = Image.open(img_path)
+                    img.thumbnail((120, 120))
+                    photo = ImageTk.PhotoImage(img)
+                    photo_refs.append(photo)
+                    
+                    lbl = tk.Label(cell, image=photo, bg="#1a1a1a")
+                    lbl.image = photo  # Keep reference on the label itself!
+                    lbl.pack()
+                except Exception as ex:
+                    tk.Label(cell, text=f"[Error: {ex}]", bg="#1a1a1a", fg="#f00", wraplength=100).pack()
+                
+                # Filename with "KEEP" indicator for first
+                display_name = filename if len(filename) <= 20 else filename[:17] + "..."
+                if file_idx == 0:
+                    display_name = "✓ " + display_name  # Mark as keeper
+                tk.Label(cell, text=display_name, bg="#1a1a1a", fg="#888" if file_idx > 0 else "#0f0", font=("Arial", 8)).pack()
+                
+                # Checkbox to mark for deletion (keep first by default)
+                var = tk.BooleanVar(value=(file_idx > 0))  # Mark all except first for deletion
+                selected_for_delete[img_path] = var
+                
+                cb = tb.Checkbutton(cell, text="Delete", variable=var, bootstyle="danger-round-toggle")
+                cb.pack()
+        
+        inner.update_idletasks()
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        
+        # Scroll bindings
+        def on_scroll(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind("<MouseWheel>", on_scroll)
+        inner.bind("<MouseWheel>", on_scroll)
+        
+        # Button frame
+        btn_frame = tb.Frame(dlg)
+        btn_frame.pack(fill=X, padx=10, pady=10)
+        
+        def count_selected():
+            return sum(1 for v in selected_for_delete.values() if v.get())
+        
+        def delete_selected():
+            to_delete = [path for path, var in selected_for_delete.items() if var.get()]
+            if not to_delete:
+                messagebox.showinfo("Nothing Selected", "No images marked for deletion.")
+                return
+            
+            if not messagebox.askyesno("Confirm Delete", 
+                                       f"Delete {len(to_delete)} duplicate images?\n\nThis cannot be undone!"):
+                return
+            
+            deleted = 0
+            for path in to_delete:
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                        # Also remove label if exists
+                        lbl_path = self._get_label_path(path)
+                        if os.path.exists(lbl_path):
+                            os.remove(lbl_path)
+                        deleted += 1
+                except Exception as e:
+                    print(f"Error deleting {path}: {e}")
+            
+            messagebox.showinfo("Done", f"Deleted {deleted} duplicate images.")
+            dlg.destroy()
+            self.load_workspace(self.workspace_path)
+        
+        def select_all():
+            # Mark all EXCEPT the first of each group for deletion
+            # first_in_group tracks which paths are the first in their group (to keep)
+            for path, var in selected_for_delete.items():
+                if path in first_in_group:
+                    var.set(False)  # Keep the first
+                else:
+                    var.set(True)   # Delete duplicates
+        
+        def select_none():
+            for var in selected_for_delete.values():
+                var.set(False)
+
+        
+        tb.Button(btn_frame, text="Select All", command=select_all, bootstyle="secondary", width=10).pack(side=LEFT, padx=5)
+        tb.Button(btn_frame, text="Select None", command=select_none, bootstyle="secondary", width=10).pack(side=LEFT, padx=5)
+        tb.Button(btn_frame, text="Delete Selected", command=delete_selected, bootstyle="danger", width=15).pack(side=RIGHT, padx=5)
+        tb.Button(btn_frame, text="Cancel", command=dlg.destroy, bootstyle="secondary-outline", width=10).pack(side=RIGHT, padx=5)
+
+
+    def cleanup_empty_labels(self):
+        """Delete label files that have no valid annotations (empty, whitespace, or no valid YOLO lines)."""
+        if not self.workspace_path:
+            return 0
+        
+        lbl_dir = os.path.join(self.workspace_path, "labels")
+        if not os.path.exists(lbl_dir):
+            return 0
+        
+        deleted = 0
+        lbl_files = glob.glob(os.path.join(lbl_dir, "*.txt"))
+        
+        for f in lbl_files:
+            try:
+                # Check file size first
+                if os.path.getsize(f) == 0:
+                    os.remove(f)
+                    deleted += 1
+                    continue
+                
+                # Check for valid YOLO annotation lines
+                has_valid_line = False
+                with open(f, 'r') as h:
+                    for line in h:
+                        parts = line.strip().split()
+                        # Valid YOLO line: class_id cx cy w h (5 values minimum)
+                        if len(parts) >= 5:
+                            try:
+                                int(parts[0])  # class_id must be int
+                                float(parts[1])  # cx
+                                float(parts[2])  # cy
+                                float(parts[3])  # w
+                                float(parts[4])  # h
+                                has_valid_line = True
+                                break  # Found at least one valid line
+                            except ValueError:
+                                continue  # Invalid line, keep checking
+                
+                if not has_valid_line:
+                    os.remove(f)
+                    deleted += 1
+            except Exception as e:
+                print(f"Error checking {f}: {e}")
+        
+        return deleted
+
+    def reload_current_image(self):
+        """Cleanup empty labels and reload current image."""
+        deleted = self.cleanup_empty_labels()
+        if deleted > 0:
+            self.status_var.set(f"Cleaned up {deleted} empty label files")
+            self._build_annotation_cache()  # Rebuild cache after cleanup
+        self.load_image(self.current_index)
+
+    def validate_dataset_dialog(self):
+        """Check for orphaned labels, empty images, or class mismatches."""
+        if not self.workspace_path:
+            messagebox.showerror("Error", "No workspace loaded.")
+            return
+
+        # First, cleanup empty labels
+        deleted = self.cleanup_empty_labels()
+        
+        # Rebuild cache and update stats so counts are accurate
+        if deleted > 0:
+            self._build_annotation_cache()
+            self._update_stats()
+        
+        counts = {"images": 0, "labels": 0, "orphans": 0, "empty_lbl": 0, "bad_class": 0}
+        max_class = len(self.classes) - 1 if self.classes else -1
+        
+        # 1. Scan labels
+        lbl_dir = os.path.join(self.workspace_path, "labels")
+        if os.path.exists(lbl_dir):
+            lbl_files = glob.glob(os.path.join(lbl_dir, "*.txt"))
+            counts["labels"] = len(lbl_files)
+            
+            for f in lbl_files:
+                # Check contents
+                try:
+                    with open(f, 'r') as h:
+                        lines = h.readlines()
+                        if not lines: counts["empty_lbl"] += 1
+                        for l in lines:
+                             parts = l.split()
+                             if parts and max_class >= 0:
+                                 try:
+                                     if int(parts[0]) > max_class:
+                                         counts["bad_class"] += 1
+                                         break
+                                 except: pass
+                except:
+                    pass
+        
+        # 2. Use utils validation for the rest
+        stats, issues, warnings = utils.validate_dataset(self.workspace_path)
+        
+        msg = (
+            f"Quick Validation:\n"
+            f"Images Loaded: {len(self.image_paths)}\n"
+            f"Label Files Found: {counts['labels']}\n"
+            f"Empty Labels Deleted: {deleted}\n"  # Show deleted count instead
+        )
+        
+        if max_class >= 0:
+            msg += f"Files with Out-of-bounds Class IDs: {counts['bad_class']}\n"
+            
+        if issues:
+            msg += "\nIssues:\n" + "\n".join([f"- {i}" for i in issues])
+            
+        if warnings:
+             msg += f"\n\nWarnings: {len(warnings)} found (check Duplicates tool)"
+
+        messagebox.showinfo("Validation", msg)
 
 if __name__ == "__main__":
     app = tb.Window(themename="darkly")
+
     AnnotatorApp(app)
     app.mainloop()
