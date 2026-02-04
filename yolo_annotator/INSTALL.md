@@ -79,7 +79,23 @@ The main dependencies are:
 - **OpenCV** - Computer vision utilities
 - **ttkbootstrap** - Modern UI theme
 - **PyYAML** - Configuration files
-- **TensorFlow** or **tflite-runtime** - Model inference
+- **TensorFlow** or **tflite-runtime** - TFLite model inference
+- **ultralytics** (optional) - PyTorch YOLO model inference
+
+### Using PyTorch YOLO Models (.pt files)
+
+If you want to use native PyTorch YOLO models (`.pt` files), install ultralytics:
+
+```bash
+pip install ultralytics
+```
+
+This allows you to:
+- Use pretrained models from Ultralytics (YOLOv8, YOLOv11, etc.)
+- Load custom trained `.pt` models
+- Get better performance and easier model management
+
+**Note:** You can use both TFLite and PyTorch models in the same installation. The annotator will automatically detect the model type based on the file extension.
 
 ---
 

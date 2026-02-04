@@ -1,24 +1,12 @@
 {
     "geometry": "3440x1369+-52+127",
     "classes": [
-        "pallet",
-        "board",
-        "stringer",
-        "stringerProfile",
-        "leadBoard",
-        "boardCluster",
-        "brokenBoard",
-        "majorCrack",
-        "minorCrack",
-        "missingBoard",
-        "missingStringer",
-        "mold",
-        "nail",
-        "protrudeNail",
-        "brokenStringer"
+        "Edge",
+        "Person",
+        "pallet"
     ],
     "model_version": "v8/v11",
-    "last_workspace": "C:/Users/noahm/Zira/MASTER/New master",
-    "last_dir": "C:/Users/noahm/Zira/MASTER/New master\\images",
-    "model_path": "C:/Users/noahm/Downloads/model_- 30 january 2026 15_06.tflite"
+    "last_workspace": "C:/Users/noahm/Downloads/massiev workspace",
+    "last_dir": "C:/Users/noahm/Downloads/massiev workspace\\images",
+    "model_path": "C:/Users/noahm/Downloads/model_- 30 january 2026 15_06.pt"
 }

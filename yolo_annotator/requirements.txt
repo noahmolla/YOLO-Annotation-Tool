@@ -16,3 +16,9 @@ tensorflow>=2.8.0,<2.18.0
 #
 # Note: On Windows, tflite-runtime may require manual wheel installation.
 # See: https://www.tensorflow.org/lite/guide/python
+
+# OPTION 3: PyTorch YOLO models (.pt files) - RECOMMENDED for most users
+# Provides native YOLO support with pretrained models (YOLOv8, YOLOv11, etc.)
+ultralytics>=8.0.0
+#
+# Note: Comment out the line above if you only want to use TFLite models

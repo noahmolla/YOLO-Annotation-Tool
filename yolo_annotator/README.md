@@ -1,10 +1,10 @@
 # YOLO Annotator
 
-A modern, user-friendly Python application for annotating images using YOLO TFLite models.
+A modern, user-friendly Python application for annotating images using YOLO models (TFLite and PyTorch).
 
 ## Features
 
-- 🎯 **Auto-annotation** using YOLO TFLite models (v5, v8, v11)
+- 🎯 **Auto-annotation** using YOLO models (TFLite .tflite or PyTorch .pt)
 - ✏️ **Manual annotation** with intuitive click-and-drag interface
 - 🎨 **Modern UI** with ttkbootstrap theme
 - ⌨️ **Keyboard shortcuts** for efficient workflow
@@ -33,7 +33,7 @@ If you encounter any installation errors (especially "No module named 'tflite_ru
 ## Usage
 
 1. **Load Images:** Click "Load Images" to select your image directory
-2. **Load Model:** (Optional) Load a YOLO TFLite model for auto-annotation
+2. **Load Model:** (Optional) Load a YOLO model (.tflite or .pt) for auto-annotation
 3. **Select Class:** Choose or enter the class you want to annotate
 4. **Annotate:**
    - Click "Auto-Annotate" to use the model
@@ -58,7 +58,7 @@ Annotations are saved in YOLO format:
 ## Requirements
 
 - Python 3.8+
-- TensorFlow 2.8+ (or tflite-runtime)
+- TensorFlow 2.8+ (for TFLite models) or ultralytics (for PyTorch models)
 - See `requirements.txt` for full list
 
 ## License

@@ -24,12 +24,13 @@ class TFLiteModel:
         self.input_shape = self.input_details[0]['shape']
         self.dtype = self.input_details[0]['dtype']
 
-    def predict(self, image, confidence_threshold=0.5, version="Auto"):
+    def predict(self, image, confidence_threshold=0.5, iou_threshold=0.45, version="Auto"):
         """
         Run inference on an image.
         Args:
             image: PIL Image or numpy array (BGR or RGB).
             confidence_threshold: Float, threshold to filter weak detections.
+            iou_threshold: Float, IOU threshold for NMS (Non-Maximum Suppression).
             version: "Auto", "v5", "v8/v11"
         Returns:
             boxes: List of [x_center, y_center, width, height] (normalized).
@@ -52,7 +53,7 @@ class TFLiteModel:
             return self._parse_ssd_style_output(confidence_threshold)
         else:
             # Raw YOLO
-            return self._parse_yolo_raw_output(confidence_threshold, version=version)
+            return self._parse_yolo_raw_output(confidence_threshold, iou_threshold, version=version)
 
     def _preprocess(self, image):
         """Resize and normalize image."""
@@ -119,7 +120,7 @@ class TFLiteModel:
                 
         return results_boxes, results_classes, results_scores
 
-    def _parse_yolo_raw_output(self, threshold, version="Auto"):
+    def _parse_yolo_raw_output(self, threshold, iou_threshold, version="Auto"):
         """
         Parse raw YOLO output (e.g. 1x25200x85 for YOLOv5 or 1x84x8400 for v8).
         """
@@ -255,7 +256,7 @@ class TFLiteModel:
 
         # Run NMS
         # indices = cv2.dnn.NMSBoxes(bboxes, scores, score_threshold, nms_threshold)
-        indices = cv2.dnn.NMSBoxes(nms_boxes, filtered_scores.tolist(), threshold, 0.45) # 0.45 IoU thresh default
+        indices = cv2.dnn.NMSBoxes(nms_boxes, filtered_scores.tolist(), threshold, iou_threshold)
         
         results_boxes = []
         results_classes = []
@@ -280,3 +281,92 @@ class TFLiteModel:
                 results_scores.append(float(filtered_scores[i]))
                 
         return results_boxes, results_classes, results_scores
+
+
+class PyTorchYOLOModel:
+    """
+    Wrapper for PyTorch YOLO models (.pt files) using ultralytics library.
+    """
+    def __init__(self, model_path):
+        """
+        Initialize the PyTorch YOLO model.
+        Args:
+            model_path: Path to .pt model file
+        """
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            raise ImportError(
+                "ultralytics library not found. Install it with: pip install ultralytics"
+            )
+        
+        self.model = YOLO(model_path)
+        self.model_path = model_path
+        
+    def predict(self, image, confidence_threshold=0.5, iou_threshold=0.5, version="Auto"):
+        """
+        Run inference on an image using PyTorch YOLO model.
+        Args:
+            image: PIL Image or numpy array (BGR or RGB).
+            confidence_threshold: Float, threshold to filter weak detections.
+            iou_threshold: Float, IOU threshold for NMS (Non-Maximum Suppression).
+            version: Ignored for PyTorch models (kept for API compatibility)
+        Returns:
+            boxes: List of [x_center, y_center, width, height] (normalized).
+            classes: List of class IDs.
+            scores: List of confidence scores.
+        """
+        # Convert PIL to numpy if needed
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)
+        
+        # Handle RGBA (4 channels) -> RGB (3 channels)
+        if len(image.shape) == 3 and image.shape[2] == 4:
+            image = image[:, :, :3]  # Drop alpha channel
+        
+        # Handle grayscale (2 dims) -> RGB
+        if len(image.shape) == 2:
+            image = np.stack([image, image, image], axis=-1)
+        
+        # Run inference with ultralytics
+        # verbose=False to suppress output
+        results = self.model.predict(image, conf=confidence_threshold, iou=iou_threshold, verbose=False)
+        
+        # Extract results
+        boxes_list = []
+        classes_list = []
+        scores_list = []
+        
+        if len(results) > 0:
+            result = results[0]  # Get first result (single image)
+            
+            # Get image dimensions for normalization
+            img_height, img_width = image.shape[:2]
+            
+            # Extract boxes (in xyxy format), classes, and confidences
+            if result.boxes is not None and len(result.boxes) > 0:
+                boxes = result.boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
+                classes = result.boxes.cls.cpu().numpy()  # class IDs
+                confidences = result.boxes.conf.cpu().numpy()  # confidence scores
+                
+                # Convert to normalized [cx, cy, w, h] format
+                for i in range(len(boxes)):
+                    x1, y1, x2, y2 = boxes[i]
+                    
+                    # Convert to center format
+                    w = x2 - x1
+                    h = y2 - y1
+                    cx = x1 + w / 2
+                    cy = y1 + h / 2
+                    
+                    # Normalize
+                    cx_norm = cx / img_width
+                    cy_norm = cy / img_height
+                    w_norm = w / img_width
+                    h_norm = h / img_height
+                    
+                    boxes_list.append([cx_norm, cy_norm, w_norm, h_norm])
+                    classes_list.append(int(classes[i]))
+                    scores_list.append(float(confidences[i]))
+        
+        return boxes_list, classes_list, scores_list

@@ -83,6 +83,14 @@ class AnnotatorApp:
         # Crosshair
         self.show_crosshair = tk.BooleanVar(value=True)
         self.crosshair_lines = [] # [h_line_id, v_line_id]
+        
+        # Show only selected class annotations
+        self.show_only_selected_class = tk.BooleanVar(value=False)
+        
+        # Auto-annotation settings
+        self.default_confidence_threshold = 0.50  # Default confidence for all classes
+        self.class_confidence_thresholds = {}  # Per-class confidence thresholds
+        self.iou_threshold = 0.50  # IOU threshold for NMS
 
         # --- UI Setup ---
         self._setup_ui()
@@ -225,6 +233,9 @@ class AnnotatorApp:
         self.btn_auto_curr.pack(side=LEFT, expand=True, fill=X, padx=(0,1))
         self.btn_auto_all = tb.Button(auto_frame, text="All Images", command=self.auto_annotate_all, bootstyle="danger", width=8)
         self.btn_auto_all.pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+        
+        # Settings button
+        tb.Button(model_frame, text="⚙ Confidence & IOU Settings", command=self.show_annotation_settings, bootstyle="info-outline").pack(fill=X, pady=1)
 
         # Quick Actions Group
         quick_frame = tb.Labelframe(self.left_panel, text="Quick Actions", padding=8)
@@ -242,6 +253,11 @@ class AnnotatorApp:
         tb.Button(cleanup_row, text="Reduce", command=self.reduce_dataset_dialog, bootstyle="danger-outline", width=8).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
         tb.Button(cleanup_row, text="Duplicates", command=self.find_duplicates_dialog, bootstyle="warning-outline", width=8).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
         tb.Button(cleanup_row, text="Validate", command=self.validate_dataset_dialog, bootstyle="info-outline", width=8).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+        
+        # Extract filtered images row
+        extract_row = tb.Frame(quick_frame)
+        extract_row.pack(fill=X, pady=1)
+        tb.Button(extract_row, text="Extract Filtered", command=self.extract_filtered_images, bootstyle="success-outline").pack(fill=X)
 
 
         # Classes List
@@ -278,6 +294,10 @@ class AnnotatorApp:
         
         # Crosshair Toggle
         tb.Checkbutton(c_toolbar, text="Crosshair", variable=self.show_crosshair, bootstyle="round-toggle").pack(side=LEFT, padx=10)
+        
+        # Show only selected class toggle
+        tb.Checkbutton(c_toolbar, text="Show Only Selected Class (F)", variable=self.show_only_selected_class, 
+                      command=self.redraw, bootstyle="round-toggle").pack(side=LEFT, padx=10)
         
         # Speed toggle
         self.speed_btn = tb.Button(c_toolbar, text="Speed: Single", command=self.toggle_nav_speed, bootstyle="secondary-outline", width=12)
@@ -392,6 +412,9 @@ class AnnotatorApp:
         
         # Escape to clear selection AND unlock class filter
         self.root.bind_all("<Escape>", lambda e: self.escape_action())
+        
+        # F to toggle show only selected class
+        self.root.bind("f", lambda e: self._toggle_show_only_selected_class())
             
         # Canvas Mouse - Ctrl+Click for multi-selection
         self.canvas.bind("<Control-ButtonPress-1>", self.on_ctrl_click)
@@ -464,9 +487,14 @@ class AnnotatorApp:
             
         self.image_paths = sorted(list(set(raw))) # De-dupe and sort
         
-        # Allow empty workspace - just show 0 images
-        # Index everything for filtering
-        self._build_annotation_cache()
+        # Show loading progress for large datasets
+        total = len(self.image_paths)
+        if total > 500:
+            self.status_var.set(f"Loading {total} images... Building cache...")
+            self.root.update()
+        
+        # Build cache and stats in a single pass for performance
+        self._build_annotation_cache_and_stats()
         
         # Reset filter to "All" when reloading to prevent stale filters
         self.filter_mode = "All"
@@ -481,46 +509,91 @@ class AnnotatorApp:
             self.lbl_idx.config(text="0 / 0")
         self.status_var.set(f"Loaded {len(self.image_paths)} images.")
 
-    def _build_annotation_cache(self):
-        """Build cache of which classes each image has annotations for."""
+    def _build_annotation_cache_and_stats(self):
+        """Build cache of which classes each image has AND compute stats in a single pass.
+        
+        This is a major performance optimization - we read each label file only once
+        instead of twice (once for cache, once for stats).
+        """
         self.image_to_classes_cache = {}
-        for p in self.image_paths:
-            # Normalize path for consistent matching
-            norm_path = os.path.normpath(p)
-            self.image_to_classes_cache[norm_path] = set()
-            lbl_path = self._get_label_path(p)
-            if os.path.exists(lbl_path):
-                with open(lbl_path, 'r') as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if parts:
-                            try: self.image_to_classes_cache[norm_path].add(int(parts[0]))
-                            except: pass
-        self._update_stats()
-
-    def _update_stats(self):
-        # Count annotated images (images with at least one annotation)
+        
+        # Stats accumulators
         annotated = 0
         total_boxes = 0
         all_classes = set()
         
-        for p in self.image_paths:
+        total = len(self.image_paths)
+        show_progress = total > 1000
+        
+        for idx, p in enumerate(self.image_paths):
+            # Progress feedback for large datasets
+            if show_progress and idx % 500 == 0:
+                self.status_var.set(f"Indexing... {idx}/{total}")
+                self.root.update_idletasks()  # Lighter than update()
+            
+            # Normalize path for consistent matching
+            norm_path = os.path.normpath(p)
+            self.image_to_classes_cache[norm_path] = set()
             lbl_path = self._get_label_path(p)
+            
             if os.path.exists(lbl_path):
-                with open(lbl_path, 'r') as f:
-                    lines = [l.strip() for l in f if l.strip()]
+                try:
+                    with open(lbl_path, 'r') as f:
+                        content = f.read()
+                    
+                    lines = [l.strip() for l in content.splitlines() if l.strip()]
                     if lines:
                         annotated += 1
                         total_boxes += len(lines)
                         for line in lines:
                             parts = line.split()
                             if parts:
-                                try: all_classes.add(int(parts[0]))
-                                except: pass
+                                try:
+                                    cid = int(parts[0])
+                                    self.image_to_classes_cache[norm_path].add(cid)
+                                    all_classes.add(cid)
+                                except:
+                                    pass
+                except:
+                    pass  # Skip unreadable files
         
+        # Update stats display
         total_images = len(self.image_paths)
         self.stats_annotated_var.set(f"Annotated: {annotated} / {total_images}")
         self.stats_boxes_var.set(f"Total Boxes: {total_boxes}")
+        self.stats_classes_var.set(f"Classes Used: {len(all_classes)}")
+        
+        # Store stats for quick access
+        self._cached_stats = {
+            'annotated': annotated,
+            'total_boxes': total_boxes,
+            'all_classes': all_classes
+        }
+
+    def _build_annotation_cache(self):
+        """Wrapper for backward compatibility - calls combined function."""
+        self._build_annotation_cache_and_stats()
+
+    def _update_stats(self):
+        """Update stats display from cache if available, otherwise recompute."""
+        # If we have cached stats, use them (fast path)
+        if hasattr(self, '_cached_stats') and self._cached_stats:
+            stats = self._cached_stats
+            total_images = len(self.image_paths)
+            self.stats_annotated_var.set(f"Annotated: {stats['annotated']} / {total_images}")
+            self.stats_boxes_var.set(f"Total Boxes: {stats['total_boxes']}")
+            self.stats_classes_var.set(f"Classes Used: {len(stats['all_classes'])}")
+            return
+        
+        # Fallback: Quick estimation from cache (doesn't count boxes accurately but is fast)
+        annotated = sum(1 for classes in self.image_to_classes_cache.values() if classes)
+        all_classes = set()
+        for classes in self.image_to_classes_cache.values():
+            all_classes.update(classes)
+        
+        total_images = len(self.image_paths)
+        self.stats_annotated_var.set(f"Annotated: {annotated} / {total_images}")
+        self.stats_boxes_var.set(f"Total Boxes: ~")
         self.stats_classes_var.set(f"Classes Used: {len(all_classes)}")
 
     def load_classes_file(self):
@@ -578,14 +651,46 @@ class AnnotatorApp:
             self.cls_list.selection_set(0)
 
     def load_model(self):
-        f = filedialog.askopenfilename(filetypes=[("TFLite", "*.tflite")])
-        if not f: return
+        f = filedialog.askopenfilename(
+            filetypes=[
+                ("YOLO Models", "*.tflite *.pt"),
+                ("TFLite", "*.tflite"),
+                ("PyTorch", "*.pt"),
+                ("All Files", "*.*")
+            ]
+        )
+        if not f: 
+            return
+        
+        # Show loading status
+        self.status_var.set(f"Loading model: {os.path.basename(f)}...")
+        self.root.update()  # Force UI update
+        
         try:
-            self.model = TFLiteModel(f)
+            # Detect model type based on extension
+            if f.lower().endswith('.pt'):
+                self.status_var.set("Loading PyTorch model (this may take a moment)...")
+                self.root.update()
+                
+                from inference import PyTorchYOLOModel
+                self.model = PyTorchYOLOModel(f)
+                model_type = "PyTorch"
+            elif f.lower().endswith('.tflite'):
+                self.status_var.set("Loading TFLite model...")
+                self.root.update()
+                
+                from inference import TFLiteModel
+                self.model = TFLiteModel(f)
+                model_type = "TFLite"
+            else:
+                raise ValueError("Unsupported model format. Use .pt or .tflite")
+            
             self.model_path_str = f
-            messagebox.showinfo("Loaded", "Model loaded!")
+            messagebox.showinfo("Loaded", f"{model_type} model loaded successfully!\n\n{os.path.basename(f)}")
+            self.status_var.set(f"Loaded {model_type} model: {os.path.basename(f)}")
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            messagebox.showerror("Error", f"Failed to load model:\n{str(e)}")
+            self.status_var.set("Model loading failed")
 
     def export_zip_dialog(self):
         if not self.workspace_path:
@@ -1166,6 +1271,7 @@ class AnnotatorApp:
 ⚙ OTHER
   S           Save annotations
   Q           Quick auto-annotate (all classes)
+  F           Toggle show only selected class
   H           Show this help
   Esc         Clear selection / Unlock class
 """
@@ -1341,9 +1447,10 @@ class AnnotatorApp:
     # --- NAVIGATION ---
 
     def _refresh_file_list(self):
+        """Refresh the file list with current filter. Optimized for large datasets."""
         self.filtered_image_paths = []
-        self.file_list.delete(0, tk.END)
         
+        # First pass: filter images (fast, no UI updates)
         for p in self.image_paths:
             # Use normalized path for cache lookup
             cache = self.image_to_classes_cache.get(os.path.normpath(p), set())
@@ -1367,12 +1474,12 @@ class AnnotatorApp:
                 except:
                     continue
             elif self.filter_mode.startswith("Missing: "):
-                # Missing specific class (but has other annotations)
+                # Missing specific class (shows ALL images without this class, including unannotated)
                 class_name = self.filter_mode[9:]
                 try:
                     class_id = self.classes.index(class_name)
-                    # Must have some annotations but NOT this class
-                    if not cache or class_id in cache:
+                    # Skip if this class is present
+                    if class_id in cache:
                         continue
                 except:
                     continue
@@ -1388,7 +1495,22 @@ class AnnotatorApp:
                     continue
             
             self.filtered_image_paths.append(p)
-            self.file_list.insert(tk.END, os.path.basename(p))
+        
+        # Second pass: batch update listbox (MUCH faster than individual inserts)
+        self.file_list.delete(0, tk.END)
+        
+        # Build list of names
+        names = [os.path.basename(p) for p in self.filtered_image_paths]
+        
+        # Batch insert - use listvariable for instant population
+        # This is dramatically faster than calling insert() 7000 times
+        if len(names) > 100:
+            # For large lists, temporarily set a StringVar
+            self.file_list.insert(tk.END, *names)
+        else:
+            # For small lists, regular insert is fine
+            for name in names:
+                self.file_list.insert(tk.END, name)
 
     def _image_has_overlaps(self, img_path):
         """Check if an image has overlapping annotations."""
@@ -1662,6 +1784,16 @@ class AnnotatorApp:
         else:
             self.speed_btn.config(text="Speed: Single", bootstyle="secondary-outline")
             self.status_var.set("Navigation: Single step mode")
+    
+    def _toggle_show_only_selected_class(self):
+        """Toggle show only selected class filter."""
+        self.show_only_selected_class.set(not self.show_only_selected_class.get())
+        if self.show_only_selected_class.get():
+            class_name = self.classes[self.selected_class_id] if 0 <= self.selected_class_id < len(self.classes) else "Unknown"
+            self.status_var.set(f"Showing only class: {class_name}")
+        else:
+            self.status_var.set("Showing all classes")
+        self.redraw()
 
     def _on_nav_key_press(self, event):
         """Handle navigation key press - start rapid navigation timer if in rapid mode."""
@@ -2044,6 +2176,12 @@ class AnnotatorApp:
                             self.annotations.append([cid, cx, cy, w, h])
                         except: pass
         
+        # Maintain class selection when switching images
+        if self.classes and 0 <= self.selected_class_id < len(self.classes):
+            self.cls_list.selection_clear(0, tk.END)
+            self.cls_list.selection_set(self.selected_class_id)
+            self.cls_list.see(self.selected_class_id)
+        
         self.redraw()
 
     def save_annotations(self):
@@ -2180,6 +2318,10 @@ class AnnotatorApp:
         
         # Draw Annotations
         for i, ann in enumerate(self.annotations):
+            # Filter by selected class if toggle is enabled
+            if self.show_only_selected_class.get():
+                if ann[0] != self.selected_class_id:
+                    continue  # Skip annotations that don't match selected class
             self.draw_box(i, ann)
             
         # Ensure Crosshair stays on top if it exists
@@ -2526,6 +2668,153 @@ class AnnotatorApp:
         
         self.root.wait_window(dlg)
         return result['selected']
+    
+    def show_annotation_settings(self):
+        """Show dialog to configure confidence and IOU thresholds for auto-annotation."""
+        dlg = tb.Toplevel(self.root)
+        dlg.title("Auto-Annotation Settings")
+        dlg.geometry("500x600")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        
+        # Main container with scrollbar
+        main_frame = tb.Frame(dlg)
+        main_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        
+        # Title
+        tb.Label(main_frame, text="Confidence & IOU Thresholds", font=("Arial", 14, "bold")).pack(pady=(0, 10))
+        
+        # Global settings frame
+        global_frame = tb.Labelframe(main_frame, text="Global Settings", padding=10)
+        global_frame.pack(fill=X, pady=5)
+        
+        # Default confidence threshold
+        default_conf_frame = tb.Frame(global_frame)
+        default_conf_frame.pack(fill=X, pady=5)
+        tb.Label(default_conf_frame, text="Default Confidence:", width=20, anchor=W).pack(side=LEFT)
+        default_conf_var = tk.DoubleVar(value=self.default_confidence_threshold)
+        default_conf_scale = tb.Scale(default_conf_frame, from_=0.0, to=1.0, variable=default_conf_var, 
+                                      orient=HORIZONTAL, length=200)
+        default_conf_scale.pack(side=LEFT, fill=X, expand=True, padx=5)
+        default_conf_label = tb.Label(default_conf_frame, text=f"{self.default_confidence_threshold:.2f}", width=5)
+        default_conf_label.pack(side=LEFT)
+        
+        def update_default_label(val):
+            default_conf_label.config(text=f"{float(val):.2f}")
+        default_conf_scale.config(command=update_default_label)
+        
+        # IOU threshold
+        iou_frame = tb.Frame(global_frame)
+        iou_frame.pack(fill=X, pady=5)
+        tb.Label(iou_frame, text="IOU Threshold (NMS):", width=20, anchor=W).pack(side=LEFT)
+        iou_var = tk.DoubleVar(value=self.iou_threshold)
+        iou_scale = tb.Scale(iou_frame, from_=0.0, to=1.0, variable=iou_var, 
+                            orient=HORIZONTAL, length=200)
+        iou_scale.pack(side=LEFT, fill=X, expand=True, padx=5)
+        iou_label = tb.Label(iou_frame, text=f"{self.iou_threshold:.2f}", width=5)
+        iou_label.pack(side=LEFT)
+        
+        def update_iou_label(val):
+            iou_label.config(text=f"{float(val):.2f}")
+        iou_scale.config(command=update_iou_label)
+        
+        # Per-class settings frame
+        if self.classes:
+            class_frame = tb.Labelframe(main_frame, text="Per-Class Confidence Thresholds", padding=10)
+            class_frame.pack(fill=BOTH, expand=True, pady=5)
+            
+            # Add scrollbar
+            canvas = tk.Canvas(class_frame, height=300)
+            scrollbar = tb.Scrollbar(class_frame, orient=VERTICAL, command=canvas.yview)
+            scrollable_frame = tb.Frame(canvas)
+            
+            scrollable_frame.bind(
+                "<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+            )
+            
+            canvas.create_window((0, 0), window=scrollable_frame, anchor=NW)
+            canvas.configure(yscrollcommand=scrollbar.set)
+            
+            canvas.pack(side=LEFT, fill=BOTH, expand=True)
+            scrollbar.pack(side=RIGHT, fill=Y)
+            
+            # Class threshold controls
+            class_vars = {}
+            class_labels = {}
+            
+            for i, class_name in enumerate(self.classes):
+                class_row = tb.Frame(scrollable_frame)
+                class_row.pack(fill=X, pady=3)
+                
+                # Class name
+                tb.Label(class_row, text=f"{i}: {class_name}", width=15, anchor=W).pack(side=LEFT)
+                
+                # Get current threshold for this class
+                current_threshold = self.class_confidence_thresholds.get(i, self.default_confidence_threshold)
+                class_var = tk.DoubleVar(value=current_threshold)
+                class_vars[i] = class_var
+                
+                # Scale
+                class_scale = tb.Scale(class_row, from_=0.0, to=1.0, variable=class_var,
+                                      orient=HORIZONTAL, length=150)
+                class_scale.pack(side=LEFT, fill=X, expand=True, padx=5)
+                
+                # Value label
+                class_label = tb.Label(class_row, text=f"{current_threshold:.2f}", width=5)
+                class_label.pack(side=LEFT)
+                class_labels[i] = class_label
+                
+                # Update function
+                def make_update_func(idx, lbl):
+                    def update(val):
+                        lbl.config(text=f"{float(val):.2f}")
+                    return update
+                
+                class_scale.config(command=make_update_func(i, class_label))
+        else:
+            tb.Label(main_frame, text="Load classes to set per-class thresholds", 
+                    font=("Arial", 10, "italic"), foreground="gray").pack(pady=20)
+            class_vars = {}
+        
+        # Info text
+        info_frame = tb.Frame(main_frame)
+        info_frame.pack(fill=X, pady=10)
+        info_text = (
+            "💡 Tip:\n"
+            "• Higher confidence = fewer false positives\n"
+            "• Lower confidence = more detections\n"
+            "• IOU threshold controls overlap removal"
+        )
+        tb.Label(info_frame, text=info_text, font=("Arial", 9), justify=LEFT, 
+                foreground="#888").pack(anchor=W)
+        
+        # Buttons
+        btn_frame = tb.Frame(main_frame)
+        btn_frame.pack(fill=X, pady=10)
+        
+        def on_save():
+            # Save settings
+            self.default_confidence_threshold = default_conf_var.get()
+            self.iou_threshold = iou_var.get()
+            
+            # Save per-class thresholds
+            for class_id, var in class_vars.items():
+                self.class_confidence_thresholds[class_id] = var.get()
+            
+            self.status_var.set(f"Settings saved: Default conf={self.default_confidence_threshold:.2f}, IOU={self.iou_threshold:.2f}")
+            dlg.destroy()
+        
+        def on_reset():
+            # Reset to defaults
+            default_conf_var.set(0.50)
+            iou_var.set(0.50)
+            for var in class_vars.values():
+                var.set(0.50)
+        
+        tb.Button(btn_frame, text="Save", command=on_save, bootstyle="success", width=12).pack(side=LEFT, padx=5)
+        tb.Button(btn_frame, text="Reset to 0.50", command=on_reset, bootstyle="warning-outline", width=12).pack(side=LEFT, padx=5)
+        tb.Button(btn_frame, text="Cancel", command=dlg.destroy, bootstyle="secondary", width=12).pack(side=RIGHT, padx=5)
 
     def auto_annotate_current(self):
         if not self.model or not self.current_image:
@@ -2537,16 +2826,32 @@ class AnnotatorApp:
         if allowed_classes is None: return # Cancelled
         
         ver = self.model_ver_combo.get()
-        # Run inference
+        # Run inference with default confidence (we'll filter per-class later)
         try:
-            boxes, classes, scores = self.model.predict(np.array(self.current_image), version=ver)
+            boxes, classes, scores = self.model.predict(
+                np.array(self.current_image), 
+                confidence_threshold=0.01,  # Use low threshold, filter later
+                iou_threshold=self.iou_threshold,
+                version=ver
+            )
             
             added = 0
             for b, c, s in zip(boxes, classes, scores):
-                if int(c) not in allowed_classes: continue
+                class_id = int(c)
+                
+                # Check if class is allowed
+                if class_id not in allowed_classes: 
+                    continue
+                
+                # Get confidence threshold for this class
+                threshold = self.class_confidence_thresholds.get(class_id, self.default_confidence_threshold)
+                
+                # Filter by per-class confidence
+                if s < threshold:
+                    continue
                 
                 # b is [cx, cy, w, h] norm
-                self.annotations.append([int(c), b[0], b[1], b[2], b[3]])
+                self.annotations.append([class_id, b[0], b[1], b[2], b[3]])
                 added += 1
                 
             self.save_annotations()
@@ -2569,14 +2874,29 @@ class AnnotatorApp:
         
         ver = self.model_ver_combo.get()
         try:
-            boxes, classes, scores = self.model.predict(np.array(self.current_image), version=ver)
+            boxes, classes, scores = self.model.predict(
+                np.array(self.current_image), 
+                confidence_threshold=0.01,  # Use low threshold, filter later
+                iou_threshold=self.iou_threshold,
+                version=ver
+            )
             
             added = 0
             for b, c, s in zip(boxes, classes, scores):
-                if int(c) not in allowed_classes:
+                class_id = int(c)
+                
+                if class_id not in allowed_classes:
                     continue
+                
+                # Get confidence threshold for this class
+                threshold = self.class_confidence_thresholds.get(class_id, self.default_confidence_threshold)
+                
+                # Filter by per-class confidence
+                if s < threshold:
+                    continue
+                
                 # b is [cx, cy, w, h] norm
-                self.annotations.append([int(c), b[0], b[1], b[2], b[3]])
+                self.annotations.append([class_id, b[0], b[1], b[2], b[3]])
                 added += 1
                 
             self.save_annotations()
@@ -2970,6 +3290,106 @@ class AnnotatorApp:
              msg += f"\n\nWarnings: {len(warnings)} found (check Duplicates tool)"
 
         messagebox.showinfo("Validation", msg)
+    
+    def extract_filtered_images(self):
+        """Extract currently filtered images and labels to a new directory."""
+        if not self.filtered_image_paths:
+            messagebox.showwarning("No Images", "No images to extract. Current filter shows 0 images.")
+            return
+        
+        # Show info about what will be extracted
+        filter_desc = self.filter_mode if self.filter_mode else "All"
+        count = len(self.filtered_image_paths)
+        
+        result = messagebox.askyesno(
+            "Extract Filtered Images",
+            f"Extract {count} images matching filter: '{filter_desc}'?\n\n"
+            f"This will copy the images and their label files to a new directory."
+        )
+        
+        if not result:
+            return
+        
+        # Ask for destination directory
+        dest_dir = filedialog.askdirectory(title="Select Destination Directory for Extracted Images")
+        if not dest_dir:
+            return
+        
+        # Create subdirectories
+        import shutil
+        images_dest = os.path.join(dest_dir, "images")
+        labels_dest = os.path.join(dest_dir, "labels")
+        
+        try:
+            os.makedirs(images_dest, exist_ok=True)
+            os.makedirs(labels_dest, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create directories: {e}")
+            return
+        
+        # Copy files
+        copied_images = 0
+        copied_labels = 0
+        skipped = 0
+        errors = []
+        
+        self.status_var.set(f"Extracting {count} images...")
+        self.root.update()
+        
+        for img_path in self.filtered_image_paths:
+            try:
+                # Copy image
+                img_name = os.path.basename(img_path)
+                img_dest_path = os.path.join(images_dest, img_name)
+                
+                # Check if file already exists
+                if os.path.exists(img_dest_path):
+                    skipped += 1
+                    continue
+                
+                shutil.copy2(img_path, img_dest_path)
+                copied_images += 1
+                
+                # Copy label if it exists
+                lbl_path = self._get_label_path(img_path)
+                if os.path.exists(lbl_path):
+                    lbl_name = os.path.basename(lbl_path)
+                    lbl_dest_path = os.path.join(labels_dest, lbl_name)
+                    shutil.copy2(lbl_path, lbl_dest_path)
+                    copied_labels += 1
+                
+            except Exception as e:
+                errors.append(f"{os.path.basename(img_path)}: {str(e)}")
+        
+        # Copy classes file if in workspace
+        if self.workspace_path and self.classes:
+            yaml_src = os.path.join(self.workspace_path, "data.yaml")
+            if os.path.exists(yaml_src):
+                try:
+                    yaml_dest = os.path.join(dest_dir, "data.yaml")
+                    shutil.copy2(yaml_src, yaml_dest)
+                except:
+                    pass  # Not critical
+        
+        # Show results
+        msg = f"Extraction Complete!\n\n"
+        msg += f"Images copied: {copied_images}\n"
+        msg += f"Labels copied: {copied_labels}\n"
+        
+        if skipped > 0:
+            msg += f"Skipped (already exist): {skipped}\n"
+        
+        if errors:
+            msg += f"\nErrors: {len(errors)}\n"
+            if len(errors) <= 5:
+                msg += "\n".join(errors)
+            else:
+                msg += "\n".join(errors[:5]) + f"\n... and {len(errors)-5} more"
+        
+        msg += f"\n\nDestination: {dest_dir}"
+        
+        self.status_var.set(f"Extracted {copied_images} images to {os.path.basename(dest_dir)}")
+        messagebox.showinfo("Extraction Complete", msg)
 
 if __name__ == "__main__":
     app = tb.Window(themename="darkly")
