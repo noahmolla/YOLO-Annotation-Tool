@@ -1,7 +1,23 @@
 {
-    "geometry": "3440x1369+338+338",
-    "classes": [],
+    "geometry": "3440x1369+-203+13",
+    "classes": [
+        "pallet",
+        "board",
+        "stringer",
+        "stringerProfile",
+        "leadBoard",
+        "boardCluster",
+        "brokenBoard",
+        "majorCrack",
+        "minorCrack",
+        "missingBoard",
+        "missingStringer",
+        "mold",
+        "nail",
+        "protrudeNail",
+        "brokenStringer"
+    ],
     "model_version": "Auto",
-    "last_workspace": null,
+    "last_workspace": "C:/Users/noahm/Downloads/tempmcv/labels",
     "last_dir": ""
 }

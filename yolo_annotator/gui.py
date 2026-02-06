@@ -34,6 +34,7 @@ class AnnotatorApp:
         self.copy_buffer = []          # For copy/paste functionality (future proofing)
         
         self.image_to_classes_cache = {} # Cache: image_path -> set(class_ids)
+        self.image_id_map = {}           # Cache: image_path -> persistent ID (1-based)
 
         self.model = None              # TFLiteModel instance
         
@@ -44,6 +45,7 @@ class AnnotatorApp:
         self.offset_y = 0              # Canvas image offset Y
         
         self.current_file_path = None  # EXPLICITLY track the file we are editing
+        self.annotations_dirty = False # Track if annotations need saving
 
         
         self.workspace_path = None     # Root of the active workspace
@@ -72,7 +74,8 @@ class AnnotatorApp:
         self.SELECTED_COLOR = "#00FFFF"  # Cyan color for selected annotations
         
         # Clipboard for repeat function
-        self.repeat_clipboard = []  # Annotations to paste on next R press (from Ctrl+Click selection)
+        self.repeat_clipboard = []  # Annotations to paste on next Y press (from Ctrl+Click selection)
+        self.last_drawn_box = None  # Last box drawn: [class_id, cx, cy, w, h] for R to repeat
         
         # Rapid navigation
         self.nav_held_key = None
@@ -157,9 +160,10 @@ class AnnotatorApp:
             print(f"Failed to save config: {e}")
 
     def on_close(self):
-        # Save current annotations before closing
-        if self.current_image:
-            self.save_annotations()
+        """Handle window close - ALWAYS save to prevent data loss."""
+        # Force save current annotations before closing (ignore dirty flag)
+        if self.current_image and self.current_file_path:
+            self.save_annotations(force=True)
         self.save_config()
         self.root.destroy()
 
@@ -197,6 +201,7 @@ class AnnotatorApp:
         ws_row = tb.Frame(ctrl_frame)
         ws_row.pack(fill=X, pady=1)
         tb.Button(ws_row, text="Load Workspace", command=self.load_workspace_btn, bootstyle="primary", width=12).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
+        tb.Button(ws_row, text="🔄", command=self.refresh_workspace, bootstyle="warning-outline", width=3).pack(side=LEFT, padx=(1,1))
         tb.Button(ws_row, text="📂", command=self.open_workspace_folder, bootstyle="secondary-outline", width=3).pack(side=LEFT, padx=(1,0))
         
         # Import/Export row
@@ -257,7 +262,13 @@ class AnnotatorApp:
         # Extract filtered images row
         extract_row = tb.Frame(quick_frame)
         extract_row.pack(fill=X, pady=1)
-        tb.Button(extract_row, text="Extract Filtered", command=self.extract_filtered_images, bootstyle="success-outline").pack(fill=X)
+        tb.Button(extract_row, text="Extract Filtered", command=self.extract_filtered_images, bootstyle="success-outline", width=12).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
+        tb.Button(extract_row, text="🔍 Query", command=self.show_query_dialog, bootstyle="primary-outline", width=8).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+        
+        # 320 Export row
+        export_row = tb.Frame(quick_frame)
+        export_row.pack(fill=X, pady=1)
+        tb.Button(export_row, text="📦 320px Export", command=self.show_320_export_dialog, bootstyle="warning-outline").pack(fill=X)
 
 
         # Classes List
@@ -343,7 +354,9 @@ class AnnotatorApp:
         tb.Label(stats_frame, textvariable=self.stats_classes_var, font=("Consolas", 9)).pack(anchor=W)
 
         self.file_list = tk.Listbox(file_frame, selectmode=tk.EXTENDED,
-                                    bg="#222", fg="#eee", bd=0, highlightthickness=0, font=("Consolas", 9))
+                                    bg="#222", fg="#eee", bd=0, highlightthickness=0, font=("Consolas", 9),
+                                    selectbackground="#0078D7", selectforeground="#FFFFFF",
+                                    activestyle="none")
         self.file_list.pack(side=LEFT, fill=BOTH, expand=True)
         
         sbar_file = tb.Scrollbar(file_frame, orient=VERTICAL, command=self.file_list.yview)
@@ -375,7 +388,7 @@ class AnnotatorApp:
         # Ctrl+Backspace = clear ALL annotations
         self.root.bind("<Control-BackSpace>", lambda e: self.clear_all_annotations_quick())
         
-        self.root.bind("g", lambda e: self.show_gallery())
+        self.root.bind("g", self._on_g_key)
         
         # H for help/shortcuts
         self.root.bind("h", lambda e: self.show_shortcuts_dialog())
@@ -396,8 +409,11 @@ class AnnotatorApp:
         # Also keep 0 for class 9 if needed
         self.root.bind("0", lambda e: self.set_class_by_index(9))
         
-        # R for repeat and next
-        self.root.bind("r", self.repeat_and_next)
+        # R for repeat last drawn box
+        self.root.bind("r", self.repeat_last_box)
+        
+        # Y for repeat selected annotations and go to next
+        self.root.bind("y", self.repeat_and_next)
         
         # Q for quick auto-annotate (all classes, no dialog)
         self.root.bind("q", lambda e: self.auto_annotate_quick())
@@ -410,11 +426,18 @@ class AnnotatorApp:
         self.root.bind_all("<Control-y>", lambda e: self.redo_action())
         self.root.bind_all("<Control-Y>", lambda e: self.redo_action())
         
+        # Ctrl+G for go to image number
+        self.root.bind_all("<Control-g>", lambda e: self.go_to_image_dialog())
+        self.root.bind_all("<Control-G>", lambda e: self.go_to_image_dialog())
+        
         # Escape to clear selection AND unlock class filter
         self.root.bind_all("<Escape>", lambda e: self.escape_action())
         
         # F to toggle show only selected class
         self.root.bind("f", lambda e: self._toggle_show_only_selected_class())
+        
+        # F5 to refresh workspace
+        self.root.bind("<F5>", lambda e: self.refresh_workspace())
             
         # Canvas Mouse - Ctrl+Click for multi-selection
         self.canvas.bind("<Control-ButtonPress-1>", self.on_ctrl_click)
@@ -454,6 +477,47 @@ class AnnotatorApp:
             except:
                 messagebox.showerror("Error", f"Could not open folder: {e}")
 
+    def refresh_workspace(self):
+        """Refresh the workspace - rescan for new/deleted images and labels."""
+        if not self.workspace_path:
+            messagebox.showinfo("No Workspace", "Please load a workspace first.")
+            return
+        
+        # Save current annotations before refresh
+        if self.current_image and self.current_file_path:
+            self.save_annotations(force=True)
+        
+        # Remember current image path to try to restore position
+        current_path = None
+        if self.filtered_image_paths and 0 <= self.current_index < len(self.filtered_image_paths):
+            current_path = self.filtered_image_paths[self.current_index]
+        
+        # Get images directory from workspace
+        img_dir = os.path.join(self.workspace_path, "images")
+        if not os.path.exists(img_dir):
+            img_dir = self.workspace_path  # Fallback to workspace root
+        
+        # Rescan images
+        old_count = len(self.image_paths)
+        self._load_images_from_dir(img_dir)
+        new_count = len(self.image_paths)
+        
+        # Try to restore position
+        if current_path and current_path in self.filtered_image_paths:
+            new_index = self.filtered_image_paths.index(current_path)
+            self.load_image(new_index)
+        elif self.filtered_image_paths:
+            self.load_image(0)
+        
+        # Report changes
+        added = max(0, new_count - old_count)
+        removed = max(0, old_count - new_count)
+        
+        if added > 0 or removed > 0:
+            self.status_var.set(f"🔄 Refreshed: {added} added, {removed} removed ({new_count} total)")
+        else:
+            self.status_var.set(f"🔄 Refreshed: No changes detected ({new_count} images)")
+
     def load_workspace(self, d):
         try:
             # 1. Ensure Structure
@@ -486,6 +550,9 @@ class AnnotatorApp:
             raw.extend(glob.glob(os.path.join(d, e.upper())))
             
         self.image_paths = sorted(list(set(raw))) # De-dupe and sort
+        
+        # Build persistent image IDs based on sorted order (never changes with filtering)
+        self.image_id_map = {path: i+1 for i, path in enumerate(self.image_paths)}
         
         # Show loading progress for large datasets
         total = len(self.image_paths)
@@ -597,11 +664,35 @@ class AnnotatorApp:
         self.stats_classes_var.set(f"Classes Used: {len(all_classes)}")
 
     def load_classes_file(self):
-        f = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])
+        f = filedialog.askopenfilename(filetypes=[
+            ("Class Files", "*.txt *.yaml *.yml"),
+            ("Text", "*.txt"),
+            ("YAML", "*.yaml *.yml"),
+            ("All Files", "*.*")
+        ])
         if not f: return
-        with open(f, 'r') as h:
-            lines = [l.strip() for l in h if l.strip()]
+        
+        # Check file extension to determine parsing method
+        ext = os.path.splitext(f)[1].lower()
+        if ext in ['.yaml', '.yml']:
+            # Load classes from YAML file (uses 'names' key)
+            lines = utils.load_classes_from_yaml(f)
+            if not lines:
+                messagebox.showwarning("No Classes Found", 
+                    "No 'names' key found in YAML file.\n\n"
+                    "Expected format:\n"
+                    "names:\n"
+                    "  - class1\n"
+                    "  - class2\n"
+                    "  ...")
+                return
+        else:
+            # Load classes from text file (one class per line)
+            with open(f, 'r') as h:
+                lines = [l.strip() for l in h if l.strip()]
+        
         self.set_classes(lines)
+        self.status_var.set(f"Loaded {len(lines)} classes from {os.path.basename(f)}")
 
     def input_classes_manual(self):
         s = simpledialog.askstring("Input Classes", "Enter comma separated classes:\n(e.g. dog, cat, car)")
@@ -1245,6 +1336,13 @@ class AnnotatorApp:
         
         self.root.after(duration, restore)
 
+    def _on_g_key(self, event):
+        """Handle G key - only open gallery if Ctrl is NOT pressed."""
+        # Check if Ctrl modifier is active (state bit 0x4 on Windows/Linux)
+        if event.state & 0x4:  # Ctrl is pressed
+            return  # Let Ctrl+G handler take over
+        self.show_gallery()
+
     def show_shortcuts_dialog(self):
         """Display keyboard shortcuts help dialog."""
         shortcuts = """
@@ -1252,14 +1350,16 @@ class AnnotatorApp:
   A / ←      Previous image
   D / →      Next image
   G           Open gallery view
+  Ctrl+G      Go to image by number
 
 🎨 ANNOTATION
   1-9         Select class 1-9 (maps to 0-8)
   0           Select class 10 (maps to 9)
   Click+Drag  Draw bounding box
   Right-click Delete annotation under cursor
+  R           Repeat last drawn box
   Ctrl+Click  Multi-select annotations
-  R           Repeat selected annotations & next
+  Y           Repeat selected annotations & next
 
 🗑 DELETE / CLEAR
   Del         Delete current image (undoable)
@@ -1465,7 +1565,6 @@ class AnnotatorApp:
                 if not self._image_has_overlaps(p):
                     continue
             elif self.filter_mode.startswith("Has: "):
-                # Has specific class
                 class_name = self.filter_mode[5:]
                 try:
                     class_id = self.classes.index(class_name)
@@ -1474,21 +1573,17 @@ class AnnotatorApp:
                 except:
                     continue
             elif self.filter_mode.startswith("Missing: "):
-                # Missing specific class (shows ALL images without this class, including unannotated)
                 class_name = self.filter_mode[9:]
                 try:
                     class_id = self.classes.index(class_name)
-                    # Skip if this class is present
                     if class_id in cache:
                         continue
                 except:
                     continue
             elif self.filter_mode.startswith("Only: "):
-                # Only has this specific class (no other classes)
                 class_name = self.filter_mode[6:]
                 try:
                     class_id = self.classes.index(class_name)
-                    # Must have annotations, all must be this class
                     if not cache or cache != {class_id}:
                         continue
                 except:
@@ -1496,21 +1591,19 @@ class AnnotatorApp:
             
             self.filtered_image_paths.append(p)
         
-        # Second pass: batch update listbox (MUCH faster than individual inserts)
+        # Second pass: batch update listbox with persistent IDs
         self.file_list.delete(0, tk.END)
         
-        # Build list of names
-        names = [os.path.basename(p) for p in self.filtered_image_paths]
+        # Build list of names with persistent IDs (e.g., "#0001 - image.jpg")
+        names = []
+        for p in self.filtered_image_paths:
+            img_id = self.image_id_map.get(p, 0)
+            basename = os.path.basename(p)
+            names.append(f"#{img_id:04d} - {basename}")
         
-        # Batch insert - use listvariable for instant population
-        # This is dramatically faster than calling insert() 7000 times
-        if len(names) > 100:
-            # For large lists, temporarily set a StringVar
+        # Batch insert for speed
+        if names:
             self.file_list.insert(tk.END, *names)
-        else:
-            # For small lists, regular insert is fine
-            for name in names:
-                self.file_list.insert(tk.END, name)
 
     def _image_has_overlaps(self, img_path):
         """Check if an image has overlapping annotations."""
@@ -1591,6 +1684,10 @@ class AnnotatorApp:
 
         val = self.filter_combo.get()
         self.filter_mode = val
+        
+        # Rebuild cache to ensure filter uses fresh annotation data
+        # This is crucial for filters like "Unannotated" and "Missing: X" to work correctly
+        self._build_annotation_cache_and_stats()
         
         self._refresh_file_list()
         
@@ -1767,6 +1864,9 @@ class AnnotatorApp:
         sel = self.cls_list.curselection()
         if sel:
             self.selected_class_id = sel[0]
+            # Auto-redraw if "Show only selected class" is active
+            if self.show_only_selected_class.get():
+                self.redraw()
 
     def set_class_by_index(self, idx):
         if 0 <= idx < len(self.classes):
@@ -1774,6 +1874,9 @@ class AnnotatorApp:
             self.cls_list.selection_clear(0, tk.END)
             self.cls_list.selection_set(idx)
             self.status_var.set(f"Selected Class: {self.classes[idx]}")
+            # Auto-redraw if "Show only selected class" is active
+            if self.show_only_selected_class.get():
+                self.redraw()
 
     def toggle_nav_speed(self):
         """Toggle between single-step and rapid navigation modes."""
@@ -2016,8 +2119,87 @@ class AnnotatorApp:
             # Loop to start
             self.load_image(0)
 
+    def go_to_image_dialog(self):
+        """Show dialog to jump to a specific image by its persistent ID number (Ctrl+G)."""
+        if not self.image_paths:
+            self.status_var.set("No images loaded")
+            return
+        
+        # Get current image ID for reference
+        current_id = 0
+        if self.current_file_path:
+            current_id = self.image_id_map.get(self.current_file_path, 0)
+        
+        # Create dialog
+        result = simpledialog.askinteger(
+            "Go to Image",
+            f"Enter image number (1-{len(self.image_paths)}):\n\nCurrent: #{current_id}",
+            parent=self.root,
+            minvalue=1,
+            maxvalue=len(self.image_paths)
+        )
+        
+        if result is None:
+            return  # Cancelled
+        
+        # Find the image path with this ID
+        target_path = None
+        for path, img_id in self.image_id_map.items():
+            if img_id == result:
+                target_path = path
+                break
+        
+        if not target_path:
+            self.status_var.set(f"Image #{result} not found")
+            return
+        
+        # Check if it's in the current filtered list
+        if target_path in self.filtered_image_paths:
+            idx = self.filtered_image_paths.index(target_path)
+            self.load_image(idx)
+            self.status_var.set(f"Jumped to image #{result}")
+        else:
+            # Image exists but is filtered out - offer to clear filter
+            if messagebox.askyesno("Image Filtered", 
+                f"Image #{result} exists but is hidden by the current filter.\n\nClear filter to show all images?"):
+                self.filter_mode = "All"
+                self.filter_combo.set("All")
+                self._refresh_file_list()
+                if target_path in self.filtered_image_paths:
+                    idx = self.filtered_image_paths.index(target_path)
+                    self.load_image(idx)
+                    self.status_var.set(f"Jumped to image #{result}")
+
+    def repeat_last_box(self, e=None):
+        """Repeat the last drawn box on the current image (R key).
+        
+        This is useful for quickly annotating multiple instances of the same object
+        with similar size/position across frames.
+        """
+        if not self.current_image:
+            return
+        
+        if not self.last_drawn_box:
+            self.status_var.set("No box drawn yet - draw a box first, then press R to repeat")
+            return
+        
+        # Undo support
+        self._push_annotation_undo()
+        
+        # Add a copy of the last box (using current selected class)
+        new_ann = [self.selected_class_id, 
+                   self.last_drawn_box[1], 
+                   self.last_drawn_box[2], 
+                   self.last_drawn_box[3], 
+                   self.last_drawn_box[4]]
+        self.annotations.append(new_ann)
+        self.annotations_dirty = True
+        self.save_annotations()  # IMMEDIATELY save after repeating
+        self.redraw()
+        self.status_var.set(f"Repeated box (class {self.selected_class_id}) - R again or move box")
+    
     def repeat_and_next(self, e=None):
-        """Copy selected annotations to clipboard, go to next image, then paste.
+        """Copy selected annotations to clipboard, go to next image, then paste (Y key).
         
         Flow: 
         1. If annotations are SELECTED (Ctrl+Click highlighted), copy to clipboard (replacing old)
@@ -2025,8 +2207,8 @@ class AnnotatorApp:
         3. If clipboard has annotations, paste them
         
         Usage:
-        - Ctrl+Click annotations you want to repeat → Press R to copy & move to next & paste
-        - Keep pressing R to paste same annotations on subsequent images
+        - Ctrl+Click annotations you want to repeat → Press Y to copy & move to next & paste
+        - Keep pressing Y to paste same annotations on subsequent images
         - Ctrl+Click new annotations anytime to replace clipboard
         """
         if not self.current_image:
@@ -2078,18 +2260,18 @@ class AnnotatorApp:
             if removed > 0:
                 self.status_var.set(f"Copied {copied_count}, pasted {pasted} (replaced {removed})")
             else:
-                self.status_var.set(f"Copied {copied_count}, pasted {pasted} - R to continue")
+                self.status_var.set(f"Copied {copied_count}, pasted {pasted} - Y to continue")
         elif copied_count > 0:
-            self.status_var.set(f"Copied {copied_count} - R to paste on next images")
+            self.status_var.set(f"Copied {copied_count} - Y to paste on next images")
         elif pasted > 0:
             if removed > 0:
-                self.status_var.set(f"Pasted {pasted} (replaced {removed}) - R to repeat")
+                self.status_var.set(f"Pasted {pasted} (replaced {removed}) - Y to repeat")
             else:
-                self.status_var.set(f"Pasted {pasted} annotations - R to repeat")
+                self.status_var.set(f"Pasted {pasted} annotations - Y to repeat")
         elif self.repeat_clipboard:
-            self.status_var.set(f"Clipboard has {len(self.repeat_clipboard)} - R to paste")
+            self.status_var.set(f"Clipboard has {len(self.repeat_clipboard)} - Y to paste")
         else:
-            self.status_var.set(f"Ctrl+Click to select, then R to copy & repeat")
+            self.status_var.set(f"Ctrl+Click to select, then Y to copy & repeat")
 
     # --- IMAGE & ANNOTATION LOGIC ---
 
@@ -2112,25 +2294,33 @@ class AnnotatorApp:
         return os.path.join(subdir, rootname + ".txt")
 
     def load_image(self, index, from_list_click=False):
+        """Load image at index. Optimized for fast transitions."""
         if not self.filtered_image_paths:
             return
         if not 0 <= index < len(self.filtered_image_paths): 
             return
         
-        # Save previous annotations (only if we have a valid current state)
+        # ALWAYS save annotations before navigating away - never lose data
         if self.current_image and self.current_file_path:
-            self.save_annotations()
+            self.save_annotations(force=True)
 
-            
         self.current_index = index
         path = self.filtered_image_paths[index]
         
-        # UI Sync
-        self.lbl_idx.config(text=f"{index+1} / {len(self.filtered_image_paths)}")
+        # Get persistent image ID for display
+        img_id = self.image_id_map.get(path, index + 1)
         
-        # Only update listbox if we didn't come from clicking it (avoids recursion/flicker)
+        # UI Sync - show both position in filter and persistent ID
+        self.lbl_idx.config(text=f"#{img_id} ({index+1}/{len(self.filtered_image_paths)})")
+        
+        # Optimized listbox update
         if not from_list_click:
-            self.file_list.selection_clear(0, tk.END)
+            try:
+                sel = self.file_list.curselection()
+                if sel:
+                    self.file_list.selection_clear(sel[0])
+            except:
+                pass
             self.file_list.selection_set(index)
             self.file_list.see(index)
         
@@ -2184,64 +2374,49 @@ class AnnotatorApp:
         
         self.redraw()
 
-    def save_annotations(self):
+    def save_annotations(self, force=False):
+        """Save annotations to disk. Optimized for speed.
+        
+        Args:
+            force: If True, save even if annotations_dirty is False (for critical saves like closing)
+        """
         if not self.current_image: 
             return
             
-        # Use EXPLICIT file path if available, otherwise fallback to index (unsafe but fallback)
         path = self.current_file_path
         if not path:
-             # Bounds check to prevent IndexError
             if not self.filtered_image_paths or self.current_index < 0 or self.current_index >= len(self.filtered_image_paths):
                 return
             path = self.filtered_image_paths[self.current_index]
 
         lbl_path = self._get_label_path(path)
-
         
         # Ensure dir
         os.makedirs(os.path.dirname(lbl_path), exist_ok=True)
         
         with open(lbl_path, 'w') as f:
             for ann in self.annotations:
-                # Clamp all values to [0, 1] bounds
                 cid = ann[0]
                 cx = max(0.0, min(1.0, ann[1]))
                 cy = max(0.0, min(1.0, ann[2]))
                 w = ann[3]
                 h = ann[4]
                 
-                # Also clamp so box doesn't exceed image bounds
-                # Left edge: cx - w/2 >= 0  =>  w <= 2*cx
-                # Right edge: cx + w/2 <= 1  =>  w <= 2*(1-cx)
-                # Top edge: cy - h/2 >= 0  =>  h <= 2*cy
-                # Bottom edge: cy + h/2 <= 1  =>  h <= 2*(1-cy)
+                # Clamp dimensions
                 w = min(w, 2*cx, 2*(1-cx))
                 h = min(h, 2*cy, 2*(1-cy))
-                w = max(0.001, w)  # Ensure positive
+                w = max(0.001, w)
                 h = max(0.001, h)
                 
-                # Format: class cx cy w h
                 f.write(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
         
-        # Verify save by re-reading from disk
-        saved_count = 0
-        if os.path.exists(lbl_path):
-            with open(lbl_path, 'r') as f:
-                saved_count = len([l for l in f if l.strip()])
-        
-        # Update cache (use normalized path for consistency)
+        # Update cache
         cids = set(a[0] for a in self.annotations)
         self.image_to_classes_cache[os.path.normpath(path)] = cids
         
-        # Verify match
-        if saved_count != len(self.annotations):
-            self.status_var.set(f"⚠ Save mismatch! Memory: {len(self.annotations)}, Disk: {saved_count}")
-        else:
-            self.status_var.set(f"✓ Saved {os.path.basename(lbl_path)} ({saved_count} annotations)")
-        
-        # Update stats
-        self._update_stats()
+        # Mark as saved
+        self.annotations_dirty = False
+        self.status_var.set(f"✓ Saved {os.path.basename(lbl_path)} ({len(self.annotations)} annotations)")
 
     # --- CANVAS & DRAWING ---
 
@@ -2401,6 +2576,12 @@ class AnnotatorApp:
         # Iterate reverse to pick topmost
         for i in range(len(self.annotations)-1, -1, -1):
             ann = self.annotations[i]
+            
+            # Respect "show only selected class" filter - don't return hidden annotations
+            if self.show_only_selected_class.get():
+                if ann[0] != self.selected_class_id:
+                    continue  # Skip annotations that are currently hidden
+            
             n_cx, n_cy, n_w, n_h = ann[1:]
             
             l = (n_cx - n_w/2) * iw
@@ -2536,39 +2717,38 @@ class AnnotatorApp:
              # Only save on mouse up to avoid disk spam
              
     def on_mouse_move(self, event):
-        # Handle Crosshair
+        """Ultra-responsive crosshair update - optimized for 240fps+."""
         if self.show_crosshair.get():
-            # Hide the cursor when crosshair is active
-            self.canvas.config(cursor="none")
+            # Hide cursor when crosshair is active (cache check to avoid repeated calls)
+            if self.canvas.cget('cursor') != 'none':
+                self.canvas.config(cursor="none")
             
-            x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+            x, y = event.x, event.y
             
             # Create lines if not exist
             if not self.crosshair_lines:
-                # Yellow crosshair for better visibility
-                l1 = self.canvas.create_line(0, y, 10000, y, fill="#FFFF00", dash=(8, 8), width=1, tags="crosshair")
-                l2 = self.canvas.create_line(x, 0, x, 10000, fill="#FFFF00", dash=(8, 8), width=1, tags="crosshair")
+                # Solid lines are MUCH faster than dashed (no pattern calculation)
+                l1 = self.canvas.create_line(0, y, 10000, y, fill="#FFFF00", width=1, tags="crosshair")
+                l2 = self.canvas.create_line(x, 0, x, 10000, fill="#FFFF00", width=1, tags="crosshair")
                 self.crosshair_lines = [l1, l2]
             else:
-                # Update coords
-                # Spans infinity effectively
+                # Just update coords - fastest possible operation
                 self.canvas.coords(self.crosshair_lines[0], 0, y, 10000, y)
                 self.canvas.coords(self.crosshair_lines[1], x, 0, x, 10000)
-                
-                # Bring to front
-                self.canvas.tag_raise("crosshair")
         else:
-             # Show cursor when crosshair is disabled
-             self.canvas.config(cursor="")
-             # Remove crosshair if exists
-             if self.crosshair_lines:
-                 self.canvas.delete("crosshair")
-                 self.crosshair_lines = []
+            # Show cursor when crosshair is disabled
+            if self.canvas.cget('cursor') == 'none':
+                self.canvas.config(cursor="")
+            # Remove crosshair if exists
+            if self.crosshair_lines:
+                self.canvas.delete("crosshair")
+                self.crosshair_lines = []
 
     def on_mouse_up(self, event):
         if self.drag_mode == "move":
             self.drag_mode = None
-            self.save_annotations()
+            self.annotations_dirty = True
+            self.save_annotations()  # IMMEDIATELY save after moving
             return
             
         if self.drag_mode == "create":
@@ -2602,8 +2782,11 @@ class AnnotatorApp:
             # Save for undo BEFORE adding
             self._push_annotation_undo()
             
-            self.annotations.append([self.selected_class_id, ncx, ncy, nw, nh])
-            self.save_annotations()
+            new_ann = [self.selected_class_id, ncx, ncy, nw, nh]
+            self.annotations.append(new_ann)
+            self.last_drawn_box = list(new_ann)  # Save for R to repeat
+            self.annotations_dirty = True
+            self.save_annotations()  # IMMEDIATELY save after creating
             self.redraw()
 
     def on_right_click(self, event):
@@ -2615,7 +2798,8 @@ class AnnotatorApp:
             
             del self.annotations[hit_index]
             self.active_annotation_index = -1
-            self.save_annotations()
+            self.annotations_dirty = True
+            self.save_annotations()  # IMMEDIATELY save after deleting
             self.redraw()
             self._flash_notification("Deleted annotation (Ctrl+Z to undo)")
             
@@ -2626,7 +2810,8 @@ class AnnotatorApp:
             
             del self.annotations[self.active_annotation_index]
             self.active_annotation_index = -1
-            self.save_annotations()
+            self.annotations_dirty = True
+            self.save_annotations()  # IMMEDIATELY save after deleting
             self.redraw()
 
     # --- AUTO ANNOTATION ---
@@ -3390,6 +3575,491 @@ class AnnotatorApp:
         
         self.status_var.set(f"Extracted {copied_images} images to {os.path.basename(dest_dir)}")
         messagebox.showinfo("Extraction Complete", msg)
+
+    def show_query_dialog(self):
+        """Show dialog for building annotation queries to filter images."""
+        if not self.classes:
+            messagebox.showwarning("No Classes", "Please load classes first.")
+            return
+        if not self.image_paths:
+            messagebox.showwarning("No Images", "Please load a workspace first.")
+            return
+        
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Annotation Query - Find Images")
+        dialog.geometry("650x500")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Header
+        tb.Label(dialog, text="🔍 Annotation Query Builder", font=("Arial", 14, "bold")).pack(pady=10)
+        tb.Label(dialog, text="Find images that match conditions on class annotation counts", 
+                font=("Arial", 9)).pack()
+        
+        # Conditions frame with scrolling
+        cond_container = tb.Frame(dialog)
+        cond_container.pack(fill=BOTH, expand=True, padx=20, pady=10)
+        
+        # Label
+        tb.Label(cond_container, text="Conditions:", font=("Arial", 10, "bold")).pack(anchor=W)
+        
+        # Scrollable area for conditions
+        canvas = tk.Canvas(cond_container, bg="#2d2d2d", highlightthickness=0, height=200)
+        scrollbar = tb.Scrollbar(cond_container, orient=VERTICAL, command=canvas.yview)
+        conditions_frame = tb.Frame(canvas)
+        
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=RIGHT, fill=Y)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        
+        canvas_window = canvas.create_window((0, 0), window=conditions_frame, anchor=NW)
+        
+        def update_scroll_region(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(canvas_window, width=canvas.winfo_width())
+        
+        conditions_frame.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(canvas_window, width=e.width))
+        
+        # Store conditions
+        conditions = []
+        operators = ["=", "!=", "<", ">", "<=", ">="]
+        logic_ops = ["AND", "OR"]
+        
+        def add_condition(logic="AND"):
+            row_frame = tb.Frame(conditions_frame)
+            row_frame.pack(fill=X, pady=2)
+            
+            # Logic operator (AND/OR) - show only after first condition
+            if conditions:
+                logic_var = tk.StringVar(value=logic)
+                logic_combo = tb.Combobox(row_frame, values=logic_ops, textvariable=logic_var, 
+                                          width=4, state="readonly")
+                logic_combo.pack(side=LEFT, padx=2)
+            else:
+                logic_var = tk.StringVar(value="")
+                tb.Label(row_frame, text="     ", width=5).pack(side=LEFT, padx=2)
+            
+            # Class dropdown
+            class_var = tk.StringVar(value=self.classes[0] if self.classes else "")
+            class_combo = tb.Combobox(row_frame, values=self.classes, textvariable=class_var, 
+                                      width=15, state="readonly")
+            class_combo.pack(side=LEFT, padx=2)
+            
+            # Operator dropdown
+            op_var = tk.StringVar(value="=")
+            op_combo = tb.Combobox(row_frame, values=operators, textvariable=op_var, 
+                                   width=4, state="readonly")
+            op_combo.pack(side=LEFT, padx=2)
+            
+            # Count entry
+            count_var = tk.StringVar(value="1")
+            count_entry = tb.Entry(row_frame, textvariable=count_var, width=5)
+            count_entry.pack(side=LEFT, padx=2)
+            
+            tb.Label(row_frame, text="instances").pack(side=LEFT, padx=2)
+            
+            # Remove button
+            def remove_this():
+                row_frame.destroy()
+                conditions.remove(cond_data)
+                update_scroll_region()
+            
+            tb.Button(row_frame, text="✕", command=remove_this, bootstyle="danger-outline", 
+                     width=2).pack(side=LEFT, padx=5)
+            
+            cond_data = {
+                'frame': row_frame,
+                'logic': logic_var,
+                'class': class_var,
+                'op': op_var,
+                'count': count_var
+            }
+            conditions.append(cond_data)
+            update_scroll_region()
+        
+        # Add initial condition
+        add_condition()
+        
+        # Add condition buttons
+        btn_frame = tb.Frame(cond_container)
+        btn_frame.pack(fill=X, pady=5)
+        tb.Button(btn_frame, text="+ Add AND", command=lambda: add_condition("AND"), 
+                 bootstyle="success-outline").pack(side=LEFT, padx=2)
+        tb.Button(btn_frame, text="+ Add OR", command=lambda: add_condition("OR"), 
+                 bootstyle="warning-outline").pack(side=LEFT, padx=2)
+        
+        # Quick presets
+        preset_frame = tb.Labelframe(dialog, text="Quick Presets", padding=10)
+        preset_frame.pack(fill=X, padx=20, pady=5)
+        
+        def clear_and_add_preset(preset_conditions):
+            # Clear existing
+            for c in conditions[:]:
+                c['frame'].destroy()
+                conditions.remove(c)
+            # Add preset
+            for i, (cls, op, count) in enumerate(preset_conditions):
+                logic = "AND" if i > 0 else ""
+                add_condition(logic)
+                conditions[-1]['class'].set(cls)
+                conditions[-1]['op'].set(op)
+                conditions[-1]['count'].set(str(count))
+        
+        preset_row1 = tb.Frame(preset_frame)
+        preset_row1.pack(fill=X)
+        
+        if len(self.classes) >= 1:
+            tb.Button(preset_row1, text=f"No '{self.classes[0]}'", 
+                     command=lambda: clear_and_add_preset([(self.classes[0], "=", 0)]),
+                     bootstyle="secondary-outline").pack(side=LEFT, padx=2, pady=2)
+        if len(self.classes) >= 2:
+            tb.Button(preset_row1, text=f"Has '{self.classes[0]}' but not '{self.classes[1]}'",
+                     command=lambda: clear_and_add_preset([
+                         (self.classes[0], ">", 0), (self.classes[1], "=", 0)
+                     ]),
+                     bootstyle="secondary-outline").pack(side=LEFT, padx=2, pady=2)
+        
+        tb.Button(preset_row1, text="Unannotated (0 total)",
+                 command=lambda: clear_and_add_preset([(self.classes[0], "=", 0)] if self.classes else []),
+                 bootstyle="secondary-outline").pack(side=LEFT, padx=2, pady=2)
+        
+        # Results preview
+        result_var = tk.StringVar(value="Click 'Preview' to see matching images")
+        result_label = tb.Label(dialog, textvariable=result_var, font=("Consolas", 10))
+        result_label.pack(pady=5)
+        
+        def evaluate_condition(cond, class_counts):
+            """Evaluate a single condition against class counts."""
+            try:
+                cls_name = cond['class'].get()
+                cls_id = self.classes.index(cls_name)
+                op = cond['op'].get()
+                target = int(cond['count'].get())
+                actual = class_counts.get(cls_id, 0)
+                
+                if op == "=": return actual == target
+                elif op == "!=": return actual != target
+                elif op == "<": return actual < target
+                elif op == ">": return actual > target
+                elif op == "<=": return actual <= target
+                elif op == ">=": return actual >= target
+            except:
+                return False
+            return False
+        
+        def get_class_counts(img_path):
+            """Get annotation class counts for an image."""
+            lbl_path = self._get_label_path(img_path)
+            counts = {}
+            if os.path.exists(lbl_path):
+                try:
+                    with open(lbl_path, 'r') as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if parts:
+                                try:
+                                    cid = int(parts[0])
+                                    counts[cid] = counts.get(cid, 0) + 1
+                                except:
+                                    pass
+                except:
+                    pass
+            return counts
+        
+        def find_matches():
+            """Find all images matching the query."""
+            if not conditions:
+                return []
+            
+            matching = []
+            for img_path in self.image_paths:
+                class_counts = get_class_counts(img_path)
+                
+                # Evaluate with AND/OR logic
+                result = None
+                for i, cond in enumerate(conditions):
+                    cond_result = evaluate_condition(cond, class_counts)
+                    logic = cond['logic'].get()
+                    
+                    if result is None:
+                        result = cond_result
+                    elif logic == "AND":
+                        result = result and cond_result
+                    elif logic == "OR":
+                        result = result or cond_result
+                
+                if result:
+                    matching.append(img_path)
+            
+            return matching
+        
+        def preview_matches():
+            matches = find_matches()
+            result_var.set(f"Found {len(matches)} / {len(self.image_paths)} images matching query")
+        
+        def apply_filter():
+            matches = find_matches()
+            if not matches:
+                messagebox.showinfo("No Matches", "No images match the query.")
+                return
+            
+            # Apply as custom filter
+            self.filtered_image_paths = matches
+            
+            # Update UI
+            self.file_list.delete(0, tk.END)
+            for p in self.filtered_image_paths:
+                img_id = self.image_id_map.get(p, 0)
+                basename = os.path.basename(p)
+                self.file_list.insert(tk.END, f"#{img_id:04d} - {basename}")
+            
+            # Set filter mode to indicate custom query is active
+            self.filter_mode = "Custom Query"
+            self.filter_combo.set("All")  # Reset combo but keep custom filter
+            
+            # Load first match
+            if self.filtered_image_paths:
+                self.load_image(0)
+            
+            self.status_var.set(f"🔍 Query: Showing {len(matches)} matching images")
+            dialog.destroy()
+        
+        # Buttons
+        button_frame = tb.Frame(dialog)
+        button_frame.pack(fill=X, padx=20, pady=15)
+        
+        tb.Button(button_frame, text="Preview", command=preview_matches, 
+                 bootstyle="info").pack(side=LEFT, padx=5)
+        tb.Button(button_frame, text="Apply Filter", command=apply_filter, 
+                 bootstyle="success").pack(side=LEFT, padx=5)
+        tb.Button(button_frame, text="Cancel", command=dialog.destroy, 
+                 bootstyle="secondary").pack(side=RIGHT, padx=5)
+
+    def show_320_export_dialog(self):
+        """Show dialog for creating a 320x320 pallet-only dataset."""
+        if not self.workspace_path:
+            messagebox.showwarning("No Workspace", "Please load a workspace first.")
+            return
+        if not self.image_paths:
+            messagebox.showwarning("No Images", "No images in workspace.")
+            return
+        
+        dialog = tb.Toplevel(self.root)
+        dialog.title("320px Pallet Export")
+        dialog.geometry("550x480")  # Larger to ensure Export button is visible
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Header
+        tb.Label(dialog, text="📦 Create 320x320 Pallet Dataset", font=("Arial", 14, "bold")).pack(pady=10)
+        tb.Label(dialog, text="Resize images to 320x320 and keep only class 0 (pallet) labels", 
+                font=("Arial", 9)).pack()
+        
+        # Options frame
+        options_frame = tb.Labelframe(dialog, text="Options", padding=15)
+        options_frame.pack(fill=X, padx=20, pady=15)
+        
+        # Resolution
+        res_frame = tb.Frame(options_frame)
+        res_frame.pack(fill=X, pady=5)
+        tb.Label(res_frame, text="Output Resolution:").pack(side=LEFT)
+        res_var = tk.StringVar(value="320")
+        res_combo = tb.Combobox(res_frame, values=["320", "416", "512", "640"], 
+                                textvariable=res_var, width=8, state="readonly")
+        res_combo.pack(side=LEFT, padx=10)
+        tb.Label(res_frame, text="x").pack(side=LEFT)
+        tb.Label(res_frame, text="(square)").pack(side=LEFT, padx=5)
+        
+        # Class to keep
+        class_frame = tb.Frame(options_frame)
+        class_frame.pack(fill=X, pady=5)
+        tb.Label(class_frame, text="Keep only class:").pack(side=LEFT)
+        class_var = tk.StringVar(value="0")
+        if self.classes:
+            class_values = [f"{i}: {c}" for i, c in enumerate(self.classes)]
+            class_combo = tb.Combobox(class_frame, values=class_values, width=20, state="readonly")
+            class_combo.current(0)
+            class_combo.pack(side=LEFT, padx=10)
+        else:
+            class_entry = tb.Entry(class_frame, textvariable=class_var, width=8)
+            class_entry.pack(side=LEFT, padx=10)
+            class_combo = None
+        
+        # Include negative examples
+        include_negative_var = tk.BooleanVar(value=True)
+        tb.Checkbutton(options_frame, text="Include negative examples (images with no class 0)", 
+                      variable=include_negative_var).pack(anchor=W, pady=5)
+        
+        # Output directory - default to parent folder with workspace_name_320
+        out_frame = tb.Labelframe(dialog, text="Output Location", padding=10)
+        out_frame.pack(fill=X, padx=20, pady=10)
+        
+        # Create default path: parent_folder/workspace_name_320
+        workspace_name = os.path.basename(self.workspace_path)
+        parent_folder = os.path.dirname(self.workspace_path)
+        default_out = os.path.join(parent_folder, f"{workspace_name}_320")
+        
+        out_path_var = tk.StringVar(value=default_out)
+        out_entry = tb.Entry(out_frame, textvariable=out_path_var, width=50)
+        out_entry.pack(side=LEFT, fill=X, expand=True, padx=(0, 5))
+        
+        def browse_output():
+            d = filedialog.askdirectory(title="Select Output Directory")
+            if d:
+                out_path_var.set(d)
+        
+        tb.Button(out_frame, text="Browse", command=browse_output, 
+                 bootstyle="secondary-outline").pack(side=RIGHT)
+        
+        # Progress
+        progress_var = tk.StringVar(value="Ready to export")
+        progress_label = tb.Label(dialog, textvariable=progress_var, font=("Consolas", 9))
+        progress_label.pack(pady=10)
+        
+        progress_bar = tb.Progressbar(dialog, mode='determinate', length=400)
+        progress_bar.pack(padx=20, pady=5)
+        
+        def do_export():
+            out_dir = out_path_var.get()
+            if not out_dir:
+                messagebox.showerror("Error", "Please select output directory")
+                return
+            
+            # Get resolution
+            try:
+                resolution = int(res_var.get())
+            except:
+                resolution = 320
+            
+            # Get class to keep
+            keep_class = 0
+            if class_combo and self.classes:
+                try:
+                    keep_class = class_combo.current()
+                except:
+                    keep_class = 0
+            else:
+                try:
+                    keep_class = int(class_var.get())
+                except:
+                    keep_class = 0
+            
+            include_negative = include_negative_var.get()
+            
+            # Create output directories
+            out_img_dir = os.path.join(out_dir, "images")
+            out_lbl_dir = os.path.join(out_dir, "labels")
+            os.makedirs(out_img_dir, exist_ok=True)
+            os.makedirs(out_lbl_dir, exist_ok=True)
+            
+            # Process images
+            total = len(self.image_paths)
+            processed = 0
+            with_class = 0
+            negative = 0
+            errors = []
+            
+            progress_bar['maximum'] = total
+            
+            for i, img_path in enumerate(self.image_paths):
+                progress_bar['value'] = i + 1
+                progress_var.set(f"Processing {i+1}/{total}: {os.path.basename(img_path)}")
+                dialog.update()
+                
+                try:
+                    # Read and resize image
+                    img = Image.open(img_path)
+                    # Convert RGBA/P to RGB for JPEG compatibility
+                    if img.mode in ('RGBA', 'P', 'LA'):
+                        # Create white background and paste image on it
+                        background = Image.new('RGB', img.size, (255, 255, 255))
+                        if img.mode == 'P':
+                            img = img.convert('RGBA')
+                        background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                        img = background
+                    elif img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    img_resized = img.resize((resolution, resolution), Image.Resampling.LANCZOS)
+                    
+                    # Get output paths - preserve original filename and extension
+                    original_filename = os.path.basename(img_path)
+                    name = os.path.splitext(original_filename)[0]
+                    ext = os.path.splitext(original_filename)[1].lower()
+                    out_img_path = os.path.join(out_img_dir, original_filename)  # Keep exact name
+                    out_lbl_path = os.path.join(out_lbl_dir, f"{name}.txt")
+                    
+                    # Read and filter labels
+                    lbl_path = self._get_label_path(img_path)
+                    kept_lines = []
+                    if os.path.exists(lbl_path):
+                        with open(lbl_path, 'r') as f:
+                            for line in f:
+                                parts = line.strip().split()
+                                if len(parts) >= 5:
+                                    try:
+                                        cls_id = int(float(parts[0]))
+                                        if cls_id == keep_class:
+                                            # Rewrite as class 0
+                                            kept_lines.append(f"0 {parts[1]} {parts[2]} {parts[3]} {parts[4]}")
+                                    except:
+                                        pass
+                    
+                    # Check if we should include this image
+                    if not kept_lines and not include_negative:
+                        continue  # Skip negative examples
+                    
+                    # Save image in original format
+                    if ext in ('.jpg', '.jpeg'):
+                        img_resized.save(out_img_path, "JPEG", quality=95)
+                    elif ext == '.png':
+                        img_resized.save(out_img_path, "PNG")
+                    else:
+                        img_resized.save(out_img_path)  # Let PIL figure it out
+                    
+                    # Save label
+                    with open(out_lbl_path, 'w') as f:
+                        if kept_lines:
+                            f.write("\n".join(kept_lines) + "\n")
+                            with_class += 1
+                        else:
+                            f.write("")  # Empty file for negative example
+                            negative += 1
+                    
+                    processed += 1
+                    
+                except Exception as e:
+                    errors.append(f"{os.path.basename(img_path)}: {str(e)}")
+            
+            # Summary
+            progress_var.set(f"Done! Processed {processed} images")
+            
+            msg = f"✅ Export Complete!\n\n"
+            msg += f"📁 Output: {out_dir}\n\n"
+            msg += f"📊 Statistics:\n"
+            msg += f"   Total processed: {processed}\n"
+            msg += f"   With class {keep_class}: {with_class}\n"
+            msg += f"   Negative examples: {negative}\n"
+            msg += f"   Resolution: {resolution}x{resolution}\n"
+            
+            if errors:
+                msg += f"\n⚠️ Errors: {len(errors)}\n"
+                if len(errors) <= 3:
+                    msg += "\n".join(errors)
+                else:
+                    msg += "\n".join(errors[:3]) + f"\n... and {len(errors)-3} more"
+            
+            messagebox.showinfo("Export Complete", msg)
+            dialog.destroy()
+        
+        # Buttons
+        button_frame = tb.Frame(dialog)
+        button_frame.pack(fill=X, padx=20, pady=15)
+        
+        tb.Button(button_frame, text="Export", command=do_export, 
+                 bootstyle="success").pack(side=LEFT, padx=5)
+        tb.Button(button_frame, text="Cancel", command=dialog.destroy, 
+                 bootstyle="secondary").pack(side=RIGHT, padx=5)
 
 if __name__ == "__main__":
     app = tb.Window(themename="darkly")

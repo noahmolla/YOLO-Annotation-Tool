@@ -1,24 +1,40 @@
+# ============================================
+# YOLO Annotator - Requirements
+# ============================================
+
+# Core Dependencies (Required)
 Pillow>=9.0.0
 numpy>=1.21.0
 opencv-python>=4.5.5
 ttkbootstrap>=1.10.0
 PyYAML>=6.0
 
-# Inference Engine
-# You need either 'tensorflow' or 'tflite-runtime'.
-# 
-# OPTION 1 (Recommended): Use TensorFlow (easier to install, ~500MB)
-tensorflow>=2.8.0,<2.18.0
-# 
-# OPTION 2: Use tflite-runtime (smaller, ~5MB, but harder to install on Windows)
-# Uncomment the line below and comment out tensorflow above if you want the lighter option:
-# tflite-runtime>=2.5.0
-#
-# Note: On Windows, tflite-runtime may require manual wheel installation.
-# See: https://www.tensorflow.org/lite/guide/python
+# ============================================
+# MODEL INFERENCE OPTIONS
+# Choose ONE or BOTH depending on your needs
+# ============================================
 
-# OPTION 3: PyTorch YOLO models (.pt files) - RECOMMENDED for most users
-# Provides native YOLO support with pretrained models (YOLOv8, YOLOv11, etc.)
+# OPTION A: PyTorch YOLO models (.pt files) - RECOMMENDED
+# Supports YOLOv5, YOLOv8, YOLOv11, etc.
+# Best for most users - easy to use pretrained models
 ultralytics>=8.0.0
-#
-# Note: Comment out the line above if you only want to use TFLite models
+
+# OPTION B: TensorFlow Lite models (.tflite files)
+# Choose ONE of the following:
+
+# B1: Full TensorFlow (Recommended - easier to install, ~500MB)
+tensorflow>=2.8.0,<2.18.0
+
+# B2: tflite-runtime (Smaller ~5MB, but harder on Windows)
+# Uncomment below and comment out tensorflow above if preferred:
+# tflite-runtime>=2.5.0
+
+# ============================================
+# NOTES
+# ============================================
+# - You can use BOTH PyTorch (.pt) and TFLite (.tflite) models
+# - The app automatically detects model type by file extension
+# - If you don't need TFLite, you can comment out tensorflow
+# - If you don't need PyTorch, you can comment out ultralytics
+# - On Windows, tflite-runtime may need manual wheel installation
+#   See: https://www.tensorflow.org/lite/guide/python
