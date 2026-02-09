@@ -287,11 +287,12 @@ class PyTorchYOLOModel:
     """
     Wrapper for PyTorch YOLO models (.pt files) using ultralytics library.
     """
-    def __init__(self, model_path):
+    def __init__(self, model_path, imgsz=None):
         """
         Initialize the PyTorch YOLO model.
         Args:
             model_path: Path to .pt model file
+            imgsz: Image size for inference (e.g., 640, 1280). None = auto-detect from model.
         """
         try:
             from ultralytics import YOLO
@@ -302,6 +303,7 @@ class PyTorchYOLOModel:
         
         self.model = YOLO(model_path)
         self.model_path = model_path
+        self.imgsz = imgsz  # Store custom image size (None = use model default)
         
     def predict(self, image, confidence_threshold=0.5, iou_threshold=0.5, version="Auto"):
         """
@@ -330,7 +332,16 @@ class PyTorchYOLOModel:
         
         # Run inference with ultralytics
         # verbose=False to suppress output
-        results = self.model.predict(image, conf=confidence_threshold, iou=iou_threshold, verbose=False)
+        # Use custom imgsz if specified, otherwise let model use its default
+        predict_kwargs = {
+            'conf': confidence_threshold,
+            'iou': iou_threshold,
+            'verbose': False
+        }
+        if self.imgsz is not None:
+            predict_kwargs['imgsz'] = self.imgsz
+        
+        results = self.model.predict(image, **predict_kwargs)
         
         # Extract results
         boxes_list = []

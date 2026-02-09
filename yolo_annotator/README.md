@@ -156,10 +156,22 @@ Click **"⚙ Confidence & IOU Settings"** to configure:
 
 ### Model Version
 
-For TFLite models, select the appropriate YOLO version:
+Select the appropriate YOLO version:
 - **Auto** - Automatically detect
 - **v5** - YOLOv5 output format
 - **v8/v11** - YOLOv8/v11 output format
+- **v26** - YOLO26 (latest, NMS-free architecture)
+
+### Inference Size
+
+For PyTorch models, you can configure the inference resolution:
+- **Auto** - Use model default (usually 640)
+- **640** - Standard resolution, faster
+- **1280** - High resolution, better for small objects (recommended for YOLO26)
+- **1024** - Good balance for 1024x1024 images
+- **512/320** - Lower resolution for speed
+
+> **Tip:** When using YOLO26, selecting **1280** inference size often gives better accuracy, even if your images are smaller (e.g., 1024x1024). The model will upscale internally.
 
 ---
 

@@ -227,9 +227,18 @@ class AnnotatorApp:
         ver_frame = tb.Frame(model_frame)
         ver_frame.pack(fill=X, pady=1)
         tb.Label(ver_frame, text="YOLO Ver:").pack(side=LEFT)
-        self.model_ver_combo = tb.Combobox(ver_frame, values=["Auto", "v5", "v8/v11"], state="readonly", width=8)
+        self.model_ver_combo = tb.Combobox(ver_frame, values=["Auto", "v5", "v8/v11", "v26"], state="readonly", width=8)
         self.model_ver_combo.current(0)
         self.model_ver_combo.pack(side=RIGHT, fill=X, expand=True)
+        
+        # Inference Image Size (for PyTorch models like YOLO26)
+        imgsz_frame = tb.Frame(model_frame)
+        imgsz_frame.pack(fill=X, pady=1)
+        tb.Label(imgsz_frame, text="Infer Size:").pack(side=LEFT)
+        self.imgsz_combo = tb.Combobox(imgsz_frame, values=["Auto", "640", "1280", "1024", "512", "320"], state="readonly", width=8)
+        self.imgsz_combo.current(0)  # Default to Auto
+        self.imgsz_combo.pack(side=RIGHT, fill=X, expand=True)
+        self.imgsz_combo.bind("<<ComboboxSelected>>", self._on_imgsz_changed)
         
         # Auto annotate row
         auto_frame = tb.Frame(model_frame)
@@ -450,6 +459,18 @@ class AnnotatorApp:
         
         # Resize event
         self.canvas.bind("<Configure>", self.on_canvas_resize)
+
+    def _on_imgsz_changed(self, event=None):
+        """Handle inference size change - update model if loaded."""
+        if hasattr(self, 'model') and self.model is not None:
+            # Only applies to PyTorch models
+            if hasattr(self.model, 'imgsz'):
+                imgsz_str = self.imgsz_combo.get()
+                if imgsz_str == "Auto":
+                    self.model.imgsz = None
+                else:
+                    self.model.imgsz = int(imgsz_str)
+                self.status_var.set(f"Inference size set to: {imgsz_str}")
 
     # --- LOADING & SETUP LOGIC ---
 
@@ -758,13 +779,25 @@ class AnnotatorApp:
         self.root.update()  # Force UI update
         
         try:
+            # Get inference size from combo
+            imgsz_str = self.imgsz_combo.get()
+            imgsz = None if imgsz_str == "Auto" else int(imgsz_str)
+            
+            # Auto-set to 1280 for YOLO26 if user hasn't changed it
+            model_ver = self.model_ver_combo.get()
+            if model_ver == "v26" and imgsz_str == "Auto":
+                imgsz = 1280
+                self.imgsz_combo.set("1280")
+                self.status_var.set("YOLO26 detected - using 1280 inference size for best accuracy")
+                self.root.update()
+            
             # Detect model type based on extension
             if f.lower().endswith('.pt'):
                 self.status_var.set("Loading PyTorch model (this may take a moment)...")
                 self.root.update()
                 
                 from inference import PyTorchYOLOModel
-                self.model = PyTorchYOLOModel(f)
+                self.model = PyTorchYOLOModel(f, imgsz=imgsz)
                 model_type = "PyTorch"
             elif f.lower().endswith('.tflite'):
                 self.status_var.set("Loading TFLite model...")
@@ -777,8 +810,11 @@ class AnnotatorApp:
                 raise ValueError("Unsupported model format. Use .pt or .tflite")
             
             self.model_path_str = f
-            messagebox.showinfo("Loaded", f"{model_type} model loaded successfully!\n\n{os.path.basename(f)}")
-            self.status_var.set(f"Loaded {model_type} model: {os.path.basename(f)}")
+            
+            # Show success with imgsz info if applicable
+            imgsz_info = f" (imgsz={imgsz})" if imgsz and model_type == "PyTorch" else ""
+            messagebox.showinfo("Loaded", f"{model_type} model loaded successfully!{imgsz_info}\n\n{os.path.basename(f)}")
+            self.status_var.set(f"Loaded {model_type} model: {os.path.basename(f)}{imgsz_info}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load model:\n{str(e)}")
             self.status_var.set("Model loading failed")
@@ -801,13 +837,13 @@ class AnnotatorApp:
         split_frame = tb.Labelframe(dialog, text="Train/Val/Test Split", padding=10)
         split_frame.pack(fill="x", padx=20, pady=10)
         
-        # Preset options
-        preset_var = tk.StringVar(value="70/20/10")
+        # Preset options - optimized for small datasets (150-600 images)
+        preset_var = tk.StringVar(value="80/20/0")
         presets = [
-            ("70% / 20% / 10% (Default)", "70/20/10"),
-            ("80% / 10% / 10%", "80/10/10"),
-            ("80% / 20% / 0%", "80/20/0"),
-            ("90% / 10% / 0%", "90/10/0"),
+            ("80% / 20% / 0%  (Small datasets - recommended)", "80/20/0"),
+            ("70% / 30% / 0%  (More validation)", "70/30/0"),
+            ("70% / 20% / 10% (With test set)", "70/20/10"),
+            ("90% / 10% / 0%  (Maximum training)", "90/10/0"),
         ]
         
         for text, value in presets:
