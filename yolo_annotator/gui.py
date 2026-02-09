@@ -3,7 +3,7 @@ from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageFile
 import os
 import glob
 import random
@@ -11,6 +11,9 @@ import numpy as np
 import json
 from inference import TFLiteModel
 import utils
+
+# Enable loading of truncated/corrupted images globally
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 CONFIG_FILE = "config.json"
 
@@ -76,6 +79,11 @@ class AnnotatorApp:
         # Clipboard for repeat function
         self.repeat_clipboard = []  # Annotations to paste on next Y press (from Ctrl+Click selection)
         self.last_drawn_box = None  # Last box drawn: [class_id, cx, cy, w, h] for R to repeat
+        
+        # Click-to-annotate mode
+        self.click_mode = tk.BooleanVar(value=False)  # Toggle for click-to-annotate mode
+        self.first_click_point = None  # Store first click point (canvas coords)
+        self.temp_box_id = None  # ID of temporary box preview
         
         # Rapid navigation
         self.nav_held_key = None
@@ -305,6 +313,10 @@ class AnnotatorApp:
         
         # Crosshair Toggle
         tb.Checkbutton(c_toolbar, text="Crosshair", variable=self.show_crosshair, bootstyle="round-toggle").pack(side=LEFT, padx=10)
+        
+        # Click Mode Toggle
+        tb.Checkbutton(c_toolbar, text="Click Mode", variable=self.click_mode, 
+                      command=self._on_click_mode_toggle, bootstyle="round-toggle").pack(side=LEFT, padx=10)
         
         # Show only selected class toggle
         tb.Checkbutton(c_toolbar, text="Show Only Selected Class (F)", variable=self.show_only_selected_class, 
@@ -1897,6 +1909,19 @@ class AnnotatorApp:
         else:
             self.status_var.set("Showing all classes")
         self.redraw()
+    
+    def _on_click_mode_toggle(self):
+        """Handle click mode toggle - clean up any partial state."""
+        if not self.click_mode.get():
+            # Switching to drag mode - clean up any partial click
+            if self.temp_box_id:
+                self.canvas.delete(self.temp_box_id)
+                self.temp_box_id = None
+            self.first_click_point = None
+            self.status_var.set("Drag mode: Click and drag to create boxes")
+        else:
+            # Switching to click mode
+            self.status_var.set("Click mode: Click two corners to create boxes")
 
     def _on_nav_key_press(self, event):
         """Handle navigation key press - start rapid navigation timer if in rapid mode."""
@@ -1981,6 +2006,7 @@ class AnnotatorApp:
             """Generate a single thumbnail with annotations."""
             try:
                 img = Image.open(img_path)
+                img.load()  # Force load to catch truncation errors early
                 img.thumbnail((size, size))
                 draw = ImageDraw.Draw(img)
                 lbl_path = self._get_label_path(img_path)
@@ -2000,7 +2026,9 @@ class AnnotatorApp:
                                 except:
                                     pass
                 return ImageTk.PhotoImage(img)
-            except:
+            except Exception as e:
+                # Return None for failed images
+                print(f"Warning: Could not load thumbnail for {img_path}: {e}")
                 return None
         
         def rebuild_gallery():
@@ -2300,6 +2328,13 @@ class AnnotatorApp:
         if not 0 <= index < len(self.filtered_image_paths): 
             return
         
+        # Clean up any partial click annotation before switching images
+        if self.click_mode.get() and self.first_click_point:
+            if self.temp_box_id:
+                self.canvas.delete(self.temp_box_id)
+                self.temp_box_id = None
+            self.first_click_point = None
+        
         # ALWAYS save annotations before navigating away - never lose data
         if self.current_image and self.current_file_path:
             self.save_annotations(force=True)
@@ -2326,9 +2361,11 @@ class AnnotatorApp:
         
         try:
             self.current_image = Image.open(path)
+            # Verify image can be loaded by accessing pixel data
+            self.current_image.load()
             self.current_file_path = path # Update this ONLY after successful load
         except Exception as e:
-            self.status_var.set(f"Error loading {os.path.basename(path)}")
+            self.status_var.set(f"Error loading {os.path.basename(path)}: {str(e)}")
             # Clear state to avoid mismatch
             self.current_image = None
             self.current_file_path = None 
@@ -2623,6 +2660,15 @@ class AnnotatorApp:
 
     def escape_action(self):
         """Handle Escape key - clear selection and unlock class."""
+        # Cancel partial click annotation if in click mode
+        if self.click_mode.get() and self.first_click_point:
+            if self.temp_box_id:
+                self.canvas.delete(self.temp_box_id)
+                self.temp_box_id = None
+            self.first_click_point = None
+            self.status_var.set("Click annotation cancelled")
+            return
+        
         # First press clears selection, second unlocks class
         if self.selected_annotations:
             self.clear_selection()
@@ -2635,6 +2681,62 @@ class AnnotatorApp:
     def on_mouse_down(self, event):
         if not self.current_image: return
         
+        # CLICK MODE: Two-click annotation
+        if self.click_mode.get():
+            if self.first_click_point is None:
+                # First click - store point and create preview
+                self.first_click_point = (event.x, event.y)
+                self.temp_box_id = self.canvas.create_rectangle(
+                    event.x, event.y, event.x, event.y, 
+                    outline="white", width=2, dash=(2,2)
+                )
+                self.status_var.set("Click second corner to complete box")
+            else:
+                # Second click - finalize box
+                x1 = min(self.first_click_point[0], event.x)
+                y1 = min(self.first_click_point[1], event.y)
+                x2 = max(self.first_click_point[0], event.x)
+                y2 = max(self.first_click_point[1], event.y)
+                
+                # Clean up
+                if self.temp_box_id:
+                    self.canvas.delete(self.temp_box_id)
+                    self.temp_box_id = None
+                self.first_click_point = None
+                
+                # Ignore tiny boxes
+                if (x2-x1) < 5 or (y2-y1) < 5:
+                    self.status_var.set("Box too small, try again")
+                    return
+                
+                # Convert to normalized coords
+                nx1, ny1 = self._get_norm_coords(x1, y1)
+                nx2, ny2 = self._get_norm_coords(x2, y2)
+                
+                # Clamp
+                nx1 = max(0.0, min(1.0, nx1))
+                ny1 = max(0.0, min(1.0, ny1))
+                nx2 = max(0.0, min(1.0, nx2))
+                ny2 = max(0.0, min(1.0, ny2))
+                
+                nw = nx2 - nx1
+                nh = ny2 - ny1
+                ncx = nx1 + nw/2
+                ncy = ny1 + nh/2
+                
+                # Save for undo BEFORE adding
+                self._push_annotation_undo()
+                
+                new_ann = [self.selected_class_id, ncx, ncy, nw, nh]
+                self.annotations.append(new_ann)
+                self.last_drawn_box = list(new_ann)  # Save for R to repeat
+                self.annotations_dirty = True
+                self.save_annotations()  # IMMEDIATELY save after creating
+                self.redraw()
+                self.status_var.set(f"Annotation added (class {self.selected_class_id})")
+            return
+        
+        # DRAG MODE: Original behavior
         # Check if a class is selected (for class-locked movement)
         class_locked = len(self.cls_list.curselection()) > 0
         
@@ -2718,6 +2820,13 @@ class AnnotatorApp:
              
     def on_mouse_move(self, event):
         """Ultra-responsive crosshair update - optimized for 240fps+."""
+        # Update click mode preview box if first click is active
+        if self.click_mode.get() and self.first_click_point and self.temp_box_id:
+            cur_x, cur_y = event.x, event.y
+            self.canvas.coords(self.temp_box_id, 
+                             self.first_click_point[0], self.first_click_point[1], 
+                             cur_x, cur_y)
+        
         if self.show_crosshair.get():
             # Hide cursor when crosshair is active (cache check to avoid repeated calls)
             if self.canvas.cget('cursor') != 'none':

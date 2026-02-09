@@ -1,5 +1,5 @@
 {
-    "geometry": "3440x1369+-203+13",
+    "geometry": "2560x1494+-203+13",
     "classes": [
         "pallet",
         "board",
@@ -18,6 +18,6 @@
         "brokenStringer"
     ],
     "model_version": "Auto",
-    "last_workspace": "C:/Users/noahm/Downloads/tempmcv/labels",
-    "last_dir": ""
+    "last_workspace": "C:/Users/noahm/Downloads/Madison viking 3 outfeed",
+    "last_dir": "C:/Users/noahm/Downloads/Madison viking 3 outfeed\\images"
 }

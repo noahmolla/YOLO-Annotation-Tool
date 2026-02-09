@@ -1,5 +1,5 @@
 {
-    "geometry": "3440x1369+243+56",
+    "geometry": "2560x1494+243+56",
     "classes": [
         "pallet",
         "board",
@@ -18,7 +18,6 @@
         "brokenStringer"
     ],
     "model_version": "v8/v11",
-    "last_workspace": "C:/Users/noahm/Downloads/mergethismcv",
-    "last_dir": "C:/Users/noahm/Downloads/mergethismcv\\images",
-    "model_path": "C:/Users/noahm/Downloads/model_- 4 february 2026 15_12 (1).pt"
+    "last_workspace": "C:/Users/noahm/Downloads/Madison viking 3 outfeed",
+    "last_dir": "C:/Users/noahm/Downloads/Madison viking 3 outfeed\\images"
 }
