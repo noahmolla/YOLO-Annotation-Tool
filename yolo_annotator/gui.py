@@ -98,6 +98,9 @@ class AnnotatorApp:
         # Show only selected class annotations
         self.show_only_selected_class = tk.BooleanVar(value=False)
         
+        # Draw-only mode: skip annotation selection/movement on click
+        self.draw_only_mode = tk.BooleanVar(value=False)
+        
         # Auto-annotation settings
         self.default_confidence_threshold = 0.50  # Default confidence for all classes
         self.class_confidence_thresholds = {}  # Per-class confidence thresholds
@@ -282,6 +285,12 @@ class AnnotatorApp:
         tb.Button(extract_row, text="Extract Filtered", command=self.extract_filtered_images, bootstyle="success-outline", width=12).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
         tb.Button(extract_row, text="🔍 Query", command=self.show_query_dialog, bootstyle="primary-outline", width=8).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
         
+        # Suspicious & YOLO Check row
+        check_row = tb.Frame(quick_frame)
+        check_row.pack(fill=X, pady=1)
+        tb.Button(check_row, text="🔎 Suspicious", command=self.check_suspicious_annotations_dialog, bootstyle="danger-outline", width=10).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
+        tb.Button(check_row, text="✅ YOLO Check", command=self.yolo_format_check_dialog, bootstyle="success-outline", width=10).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+
         # 320 Export row
         export_row = tb.Frame(quick_frame)
         export_row.pack(fill=X, pady=1)
@@ -326,6 +335,10 @@ class AnnotatorApp:
         # Click Mode Toggle
         tb.Checkbutton(c_toolbar, text="Click Mode", variable=self.click_mode, 
                       command=self._on_click_mode_toggle, bootstyle="round-toggle").pack(side=LEFT, padx=10)
+        
+        # Draw Only Mode Toggle
+        tb.Checkbutton(c_toolbar, text="Draw Only (T)", variable=self.draw_only_mode, 
+                      bootstyle="round-toggle").pack(side=LEFT, padx=10)
         
         # Show only selected class toggle
         tb.Checkbutton(c_toolbar, text="Show Only Selected Class (F)", variable=self.show_only_selected_class, 
@@ -456,6 +469,9 @@ class AnnotatorApp:
         
         # F to toggle show only selected class
         self.root.bind("f", lambda e: self._toggle_show_only_selected_class())
+        
+        # T to toggle draw-only mode
+        self.root.bind("t", lambda e: self.draw_only_mode.set(not self.draw_only_mode.get()))
         
         # F5 to refresh workspace
         self.root.bind("<F5>", lambda e: self.refresh_workspace())
@@ -761,7 +777,7 @@ class AnnotatorApp:
             self.class_colors[i] = hex_col
             
         # Update filter list with advanced options
-        base_vals = ["All", "Unannotated", "Overlapping"]
+        base_vals = ["All", "Unannotated", "Overlapping", "Suspicious"]
         has_vals = [f"Has: {c}" for c in self.classes]
         missing_vals = [f"Missing: {c}" for c in self.classes]
         only_vals = [f"Only: {c}" for c in self.classes]
@@ -1612,6 +1628,9 @@ class AnnotatorApp:
             elif self.filter_mode == "Overlapping":
                 if not self._image_has_overlaps(p):
                     continue
+            elif self.filter_mode == "Suspicious":
+                if not self._image_has_suspicious_annotations(p):
+                    continue
             elif self.filter_mode.startswith("Has: "):
                 class_name = self.filter_mode[5:]
                 try:
@@ -2336,6 +2355,9 @@ class AnnotatorApp:
             self.status_var.set(f"Clipboard has {len(self.repeat_clipboard)} - Y to paste")
         else:
             self.status_var.set(f"Ctrl+Click to select, then Y to copy & repeat")
+        
+        # Ensure focus stays on canvas so keyboard shortcuts keep working
+        self.canvas.focus_set()
 
     # --- IMAGE & ANNOTATION LOGIC ---
 
@@ -2446,6 +2468,10 @@ class AnnotatorApp:
             self.cls_list.see(self.selected_class_id)
         
         self.redraw()
+        
+        # Ensure focus stays on canvas so keyboard shortcuts work
+        # (Listbox widgets steal letter/number key events for type-to-search)
+        self.canvas.focus_set()
 
     def save_annotations(self, force=False):
         """Save annotations to disk. Optimized for speed.
@@ -2777,30 +2803,33 @@ class AnnotatorApp:
         class_locked = len(self.cls_list.curselection()) > 0
         
         # 1. Check collision with existing boxes (to select/move)
-        # Iterate reverse to pick top
-        ix, iy = self._get_img_coords(event.x, event.y)
-        iw, ih = self.current_image.width, self.current_image.height
-        
+        #    SKIP if draw-only mode is enabled - always create new boxes
         hit_index = -1
-        for i in range(len(self.annotations)-1, -1, -1):
-            ann = self.annotations[i]
-            
-            # If class is locked, only consider annotations of that class
-            if class_locked and ann[0] != self.selected_class_id:
-                continue
+        
+        if not self.draw_only_mode.get():
+            # Iterate reverse to pick top
+            ix, iy = self._get_img_coords(event.x, event.y)
+            iw, ih = self.current_image.width, self.current_image.height
+        
+            for i in range(len(self.annotations)-1, -1, -1):
+                ann = self.annotations[i]
                 
-            # ann is [class_id, cx, cy, w, h] norm
-            n_cx, n_cy, n_w, n_h = ann[1:]
-            
-            # Convert to pixel bbox
-            l = (n_cx - n_w/2) * iw
-            r = (n_cx + n_w/2) * iw
-            t = (n_cy - n_h/2) * ih
-            b = (n_cy + n_h/2) * ih
-            
-            if l <= ix <= r and t <= iy <= b:
-                hit_index = i
-                break
+                # If class is locked, only consider annotations of that class
+                if class_locked and ann[0] != self.selected_class_id:
+                    continue
+                    
+                # ann is [class_id, cx, cy, w, h] norm
+                n_cx, n_cy, n_w, n_h = ann[1:]
+                
+                # Convert to pixel bbox
+                l = (n_cx - n_w/2) * iw
+                r = (n_cx + n_w/2) * iw
+                t = (n_cy - n_h/2) * ih
+                b = (n_cy + n_h/2) * ih
+                
+                if l <= ix <= r and t <= iy <= b:
+                    hit_index = i
+                    break
         
         if hit_index != -1:
             # Save state for undo BEFORE moving
@@ -3559,6 +3588,617 @@ class AnnotatorApp:
             self.status_var.set(f"Cleaned up {deleted} empty label files")
             self._build_annotation_cache()  # Rebuild cache after cleanup
         self.load_image(self.current_index)
+
+    def _image_has_suspicious_annotations(self, img_path):
+        """Check if an image has suspicious annotations (tiny boxes or extreme overlapping)."""
+        lbl_path = self._get_label_path(img_path)
+        if not os.path.exists(lbl_path):
+            return False
+        
+        annotations = []
+        with open(lbl_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    try:
+                        cid = int(parts[0])
+                        cx, cy, w, h = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                        annotations.append((cid, cx, cy, w, h))
+                    except:
+                        pass
+        
+        if not annotations:
+            return False
+        
+        # Check for tiny annotations (area < 0.1% of image = 0.001 normalized)
+        for cid, cx, cy, w, h in annotations:
+            area = w * h
+            if area < 0.001:
+                return True
+        
+        # Check for extreme overlapping (IoU > 0.8 = nearly identical boxes)
+        for i in range(len(annotations)):
+            for j in range(i + 1, len(annotations)):
+                box1 = (annotations[i][1], annotations[i][2], annotations[i][3], annotations[i][4])
+                box2 = (annotations[j][1], annotations[j][2], annotations[j][3], annotations[j][4])
+                if self._boxes_overlap(box1, box2, threshold=0.8):
+                    return True
+        
+        return False
+
+    def check_suspicious_annotations_dialog(self):
+        """Scan all images for suspicious annotations and show interactive inspector."""
+        if not self.workspace_path:
+            messagebox.showerror("Error", "No workspace loaded.")
+            return
+        
+        self.status_var.set("Scanning for suspicious annotations...")
+        self.root.update()
+        
+        # Gather suspicious images with detailed info
+        # Each entry: (img_path, tiny_indices, overlap_pairs)
+        #   tiny_indices = set of annotation indices that are tiny
+        #   overlap_pairs = list of (idx_i, idx_j) pairs that overlap extremely
+        suspicious_images = []
+        total_tiny = 0
+        total_overlaps = 0
+        
+        for p in self.image_paths:
+            lbl_path = self._get_label_path(p)
+            if not os.path.exists(lbl_path):
+                continue
+            
+            annotations = []
+            with open(lbl_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        try:
+                            cid = int(parts[0])
+                            cx, cy, w, h = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                            annotations.append((cid, cx, cy, w, h))
+                        except:
+                            pass
+            
+            if not annotations:
+                continue
+            
+            tiny_indices = set()
+            overlap_pairs = []
+            
+            # Check tiny
+            for idx, (cid, cx, cy, w, h) in enumerate(annotations):
+                area = w * h
+                if area < 0.001:
+                    tiny_indices.add(idx)
+            
+            # Check extreme overlap
+            for i in range(len(annotations)):
+                for j in range(i + 1, len(annotations)):
+                    box1 = (annotations[i][1], annotations[i][2], annotations[i][3], annotations[i][4])
+                    box2 = (annotations[j][1], annotations[j][2], annotations[j][3], annotations[j][4])
+                    if self._boxes_overlap(box1, box2, threshold=0.8):
+                        overlap_pairs.append((i, j))
+            
+            if tiny_indices or overlap_pairs:
+                suspicious_images.append((p, annotations, tiny_indices, overlap_pairs))
+                total_tiny += len(tiny_indices)
+                total_overlaps += len(overlap_pairs)
+        
+        # --- Build interactive inspector dialog ---
+        dlg = tb.Toplevel(self.root)
+        dlg.title("Suspicious Annotations Inspector")
+        dlg.geometry("1100x650")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        
+        # Keep references for PhotoImage to prevent GC
+        dlg._photo_refs = []
+        
+        # Summary header
+        summary_frame = tb.Frame(dlg, padding=10)
+        summary_frame.pack(fill=X)
+        
+        if not suspicious_images:
+            tb.Label(summary_frame, text="✅ No suspicious annotations found!", font=("Arial", 12, "bold"), bootstyle="success").pack(anchor=W)
+            tb.Button(summary_frame, text="Close", command=dlg.destroy, bootstyle="secondary").pack(anchor=E, pady=5)
+            self.status_var.set("Suspicious scan complete: all clean!")
+            return
+        
+        tb.Label(summary_frame, text=f"⚠️ {len(suspicious_images)} image(s) with suspicious annotations", font=("Arial", 12, "bold"), bootstyle="danger").pack(anchor=W)
+        
+        legend_frame = tb.Frame(summary_frame)
+        legend_frame.pack(fill=X, pady=(2, 0))
+        tb.Label(legend_frame, text="■", foreground="#FF00FF", font=("Arial", 10, "bold")).pack(side=LEFT)
+        tb.Label(legend_frame, text="Tiny (< 0.1% area)  ", font=("Consolas", 9)).pack(side=LEFT)
+        tb.Label(legend_frame, text="■", foreground="#FF3333", font=("Arial", 10, "bold")).pack(side=LEFT)
+        tb.Label(legend_frame, text="Extreme overlap (IoU > 0.8)  ", font=("Consolas", 9)).pack(side=LEFT)
+        tb.Label(legend_frame, text="■", foreground="#66FF66", font=("Arial", 10, "bold")).pack(side=LEFT)
+        tb.Label(legend_frame, text="Normal", font=("Consolas", 9)).pack(side=LEFT)
+        
+        # Main split: image list on left, preview+label on right
+        main_pane = ttk.PanedWindow(dlg, orient=HORIZONTAL)
+        main_pane.pack(fill=BOTH, expand=True, padx=5, pady=5)
+        
+        # --- LEFT: Image list ---
+        left_frame = tb.Frame(main_pane, width=280)
+        main_pane.add(left_frame, weight=1)
+        
+        tb.Label(left_frame, text="Suspicious Images", font=("Arial", 10, "bold")).pack(anchor=W, padx=5)
+        
+        list_frame = tb.Frame(left_frame)
+        list_frame.pack(fill=BOTH, expand=True, padx=5, pady=2)
+        
+        img_listbox = tk.Listbox(list_frame, bg="#222", fg="#eee", bd=0, highlightthickness=0,
+                                  font=("Consolas", 9), selectbackground="#0078D7", 
+                                  selectforeground="#FFF", activestyle="none")
+        img_listbox.pack(side=LEFT, fill=BOTH, expand=True)
+        list_scroll = tb.Scrollbar(list_frame, orient=VERTICAL, command=img_listbox.yview)
+        list_scroll.pack(side=RIGHT, fill=Y)
+        img_listbox.config(yscrollcommand=list_scroll.set)
+        
+        for img_path, annotations, tiny_indices, overlap_pairs in suspicious_images:
+            basename = os.path.basename(img_path)
+            issues = []
+            if tiny_indices:
+                issues.append(f"{len(tiny_indices)}T")
+            if overlap_pairs:
+                issues.append(f"{len(overlap_pairs)}O")
+            img_listbox.insert(tk.END, f"{basename}  [{','.join(issues)}]")
+        
+        # --- RIGHT: Preview + Label text ---
+        right_frame = tb.Frame(main_pane)
+        main_pane.add(right_frame, weight=3)
+        
+        # Top: image preview canvas
+        preview_canvas = tk.Canvas(right_frame, bg="#1a1a1a", highlightthickness=0, height=350)
+        preview_canvas.pack(fill=BOTH, expand=True, padx=5, pady=(0, 5))
+        
+        # Bottom: label text with color coding
+        label_frame = tb.Labelframe(right_frame, text="Label File (color-coded)", padding=5)
+        label_frame.pack(fill=BOTH, expand=True, padx=5, pady=(0, 5))
+        
+        label_text = tk.Text(label_frame, bg="#1e1e1e", fg="#eee", font=("Consolas", 10), 
+                            height=8, wrap=tk.NONE, bd=0)
+        label_scroll_y = tb.Scrollbar(label_frame, orient=VERTICAL, command=label_text.yview)
+        label_scroll_x = tb.Scrollbar(label_frame, orient=HORIZONTAL, command=label_text.xview)
+        label_text.config(yscrollcommand=label_scroll_y.set, xscrollcommand=label_scroll_x.set)
+        label_scroll_y.pack(side=RIGHT, fill=Y)
+        label_scroll_x.pack(side=BOTTOM, fill=X)
+        label_text.pack(fill=BOTH, expand=True)
+        
+        # Configure text tags for color coding
+        label_text.tag_configure("tiny", foreground="#FF00FF", font=("Consolas", 10, "bold"))
+        label_text.tag_configure("overlap", foreground="#FF3333", font=("Consolas", 10, "bold"))
+        label_text.tag_configure("normal", foreground="#66FF66")
+        label_text.tag_configure("header", foreground="#888888", font=("Consolas", 9, "italic"))
+        
+        def show_suspicious_image(idx):
+            """Display selected suspicious image with highlighted annotations."""
+            if idx < 0 or idx >= len(suspicious_images):
+                return
+            
+            img_path, annotations, tiny_indices, overlap_pairs = suspicious_images[idx]
+            
+            # Collect all overlap-involved indices
+            overlap_indices = set()
+            for i, j in overlap_pairs:
+                overlap_indices.add(i)
+                overlap_indices.add(j)
+            
+            # --- Draw preview image ---
+            try:
+                img = Image.open(img_path)
+                img.load()
+                
+                # Fit to canvas
+                canvas_w = preview_canvas.winfo_width() or 600
+                canvas_h = preview_canvas.winfo_height() or 350
+                
+                # Scale to fit
+                iw, ih = img.size
+                scale = min(canvas_w / iw, canvas_h / ih, 1.0)
+                new_w, new_h = int(iw * scale), int(ih * scale)
+                if new_w > 0 and new_h > 0:
+                    img = img.resize((new_w, new_h), Image.LANCZOS)
+                
+                draw = ImageDraw.Draw(img)
+                diw, dih = img.size
+                
+                # Draw ALL annotations, color-coded
+                for ann_idx, (cid, cx, cy, w, h) in enumerate(annotations):
+                    x1 = int((cx - w / 2) * diw)
+                    y1 = int((cy - h / 2) * dih)
+                    x2 = int((cx + w / 2) * diw)
+                    y2 = int((cy + h / 2) * dih)
+                    
+                    if ann_idx in tiny_indices:
+                        # Tiny: magenta, thick border, crosshair marker
+                        color = "#FF00FF"
+                        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+                        # Draw crosshair at center for visibility
+                        ccx, ccy = int(cx * diw), int(cy * dih)
+                        arm = max(8, int(min(diw, dih) * 0.02))
+                        draw.line([ccx - arm, ccy, ccx + arm, ccy], fill=color, width=2)
+                        draw.line([ccx, ccy - arm, ccx, ccy + arm], fill=color, width=2)
+                        # Circle around the tiny box
+                        draw.ellipse([ccx - arm, ccy - arm, ccx + arm, ccy + arm], outline=color, width=2)
+                    elif ann_idx in overlap_indices:
+                        # Overlap: red, thick dashed-style (solid for PIL)
+                        color = "#FF3333"
+                        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+                        # Draw diagonal lines in the box to show overlap
+                        draw.line([x1, y1, x2, y2], fill=color, width=1)
+                        draw.line([x2, y1, x1, y2], fill=color, width=1)
+                    else:
+                        # Normal: green, thin
+                        color = self.class_colors.get(cid, "#66FF66")
+                        draw.rectangle([x1, y1, x2, y2], outline=color, width=1)
+                    
+                    # Class label
+                    class_name = self.classes[cid] if cid < len(self.classes) else f"cls{cid}"
+                    draw.text((x1 + 2, y1 + 1), f"{cid}:{class_name}", fill=color)
+                
+                photo = ImageTk.PhotoImage(img)
+                dlg._photo_refs = [photo]  # Keep reference
+                
+                preview_canvas.delete("all")
+                # Center image on canvas
+                off_x = (canvas_w - diw) // 2
+                off_y = (canvas_h - dih) // 2
+                preview_canvas.create_image(off_x, off_y, anchor=tk.NW, image=photo)
+                
+            except Exception as e:
+                preview_canvas.delete("all")
+                preview_canvas.create_text(300, 175, text=f"Could not load image:\n{e}", fill="#FF5555", font=("Arial", 11))
+            
+            # --- Show label text with color coding ---
+            label_text.config(state=tk.NORMAL)
+            label_text.delete("1.0", tk.END)
+            
+            # Header
+            label_text.insert(tk.END, f"# {os.path.basename(img_path)}\n", "header")
+            label_text.insert(tk.END, f"# Line | Class  CX       CY       W        H        | Status\n", "header")
+            label_text.insert(tk.END, f"# {'─' * 70}\n", "header")
+            
+            # Read raw label file 
+            lbl_path = self._get_label_path(img_path)
+            raw_lines = []
+            if os.path.exists(lbl_path):
+                with open(lbl_path, 'r') as f:
+                    raw_lines = f.readlines()
+            
+            ann_idx = 0
+            for line_num, raw_line in enumerate(raw_lines):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                
+                parts = line.split()
+                if len(parts) < 5:
+                    label_text.insert(tk.END, f"  {line_num+1:3d} | {line}  ← MALFORMED\n", "tiny")
+                    continue
+                
+                try:
+                    cid = int(parts[0])
+                    cx, cy, w, h = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                except:
+                    label_text.insert(tk.END, f"  {line_num+1:3d} | {line}  ← PARSE ERROR\n", "tiny")
+                    continue
+                
+                area = w * h
+                class_name = self.classes[cid] if cid < len(self.classes) else f"cls{cid}"
+                
+                # Determine status
+                reasons = []
+                tag = "normal"
+                
+                if ann_idx in tiny_indices:
+                    reasons.append(f"TINY (area={area:.6f})")
+                    tag = "tiny"
+                
+                if ann_idx in overlap_indices:
+                    # Find which partner(s) it overlaps with
+                    partners = []
+                    for pi, pj in overlap_pairs:
+                        if pi == ann_idx:
+                            partners.append(str(pj + 1))
+                        elif pj == ann_idx:
+                            partners.append(str(pi + 1))
+                    reasons.append(f"OVERLAP with line {','.join(partners)}")
+                    tag = "overlap"
+                
+                status = " | ".join(reasons) if reasons else "OK"
+                prefix = "⚠" if reasons else " "
+                
+                formatted_line = f" {prefix}{line_num+1:3d} | {cid:<5d} {cx:<8.5f} {cy:<8.5f} {w:<8.5f} {h:<8.5f} | {status}\n"
+                label_text.insert(tk.END, formatted_line, tag)
+                
+                ann_idx += 1
+            
+            label_text.config(state=tk.DISABLED)
+        
+        def on_list_select(event):
+            sel = img_listbox.curselection()
+            if sel:
+                show_suspicious_image(sel[0])
+        
+        img_listbox.bind("<<ListboxSelect>>", on_list_select)
+        
+        # Bottom buttons
+        btn_frame = tb.Frame(dlg, padding=10)
+        btn_frame.pack(fill=X)
+        
+        def apply_filter():
+            dlg.destroy()
+            self.filter_combo.set("Suspicious")
+            self.on_filter_changed(None)
+        
+        def go_to_selected():
+            """Navigate main editor to the selected suspicious image."""
+            sel = img_listbox.curselection()
+            if not sel:
+                return
+            img_path = suspicious_images[sel[0]][0]
+            dlg.destroy()
+            # Find in filtered list
+            if img_path in self.filtered_image_paths:
+                idx = self.filtered_image_paths.index(img_path)
+                self.load_image(idx)
+                self.file_list.selection_clear(0, tk.END)
+                self.file_list.selection_set(idx)
+                self.file_list.see(idx)
+            else:
+                # Switch to All filter first
+                self.filter_combo.set("All")
+                self.filter_mode = "All"
+                self._build_annotation_cache_and_stats()
+                self._refresh_file_list()
+                if img_path in self.filtered_image_paths:
+                    idx = self.filtered_image_paths.index(img_path)
+                    self.load_image(idx)
+                    self.file_list.selection_clear(0, tk.END)
+                    self.file_list.selection_set(idx)
+                    self.file_list.see(idx)
+        
+        tb.Button(btn_frame, text="Go To Image", command=go_to_selected, bootstyle="primary").pack(side=LEFT, padx=5)
+        tb.Button(btn_frame, text="Filter Suspicious", command=apply_filter, bootstyle="warning").pack(side=LEFT, padx=5)
+        tb.Button(btn_frame, text="Close", command=dlg.destroy, bootstyle="secondary").pack(side=RIGHT, padx=5)
+        
+        # Auto-select first image
+        if suspicious_images:
+            img_listbox.selection_set(0)
+            # Defer the preview to after dialog is fully laid out
+            dlg.after(100, lambda: show_suspicious_image(0))
+        
+        self.status_var.set(f"Suspicious scan complete: {total_tiny} tiny, {total_overlaps} overlapping in {len(suspicious_images)} images")
+
+    def yolo_format_check_dialog(self):
+        """Validate all YOLO label files, clamp out-of-range values, and report issues."""
+        if not self.workspace_path:
+            messagebox.showerror("Error", "No workspace loaded.")
+            return
+        
+        self.status_var.set("Running YOLO format check...")
+        self.root.update()
+        
+        lbl_dir = os.path.join(self.workspace_path, "labels")
+        if not os.path.exists(lbl_dir):
+            messagebox.showinfo("YOLO Check", "No labels directory found.")
+            return
+        
+        lbl_files = glob.glob(os.path.join(lbl_dir, "*.txt"))
+        max_class = len(self.classes) - 1 if self.classes else -1
+        
+        # Counters
+        files_checked = 0
+        files_fixed = 0
+        values_clamped = 0
+        negative_class_ids = 0
+        bad_class_ids = 0
+        malformed_lines_removed = 0
+        empty_files_removed = 0
+        widths_clamped = 0
+        heights_clamped = 0
+        centers_clamped = 0
+        issues_detail = []  # List of (filename, issue_description)
+        
+        for lbl_file in lbl_files:
+            files_checked += 1
+            basename = os.path.basename(lbl_file)
+            file_modified = False
+            new_lines = []
+            
+            try:
+                with open(lbl_file, 'r') as f:
+                    raw_lines = f.readlines()
+            except Exception as e:
+                issues_detail.append((basename, f"Could not read: {e}"))
+                continue
+            
+            for line_num, raw_line in enumerate(raw_lines, 1):
+                line = raw_line.strip()
+                if not line:
+                    continue  # Skip blank lines
+                
+                parts = line.split()
+                
+                # Check minimum field count
+                if len(parts) < 5:
+                    malformed_lines_removed += 1
+                    file_modified = True
+                    issues_detail.append((basename, f"Line {line_num}: removed (only {len(parts)} values, need 5)"))
+                    continue
+                
+                # Parse values
+                try:
+                    class_id = int(parts[0])
+                    cx = float(parts[1])
+                    cy = float(parts[2])
+                    w = float(parts[3])
+                    h = float(parts[4])
+                except ValueError:
+                    malformed_lines_removed += 1
+                    file_modified = True
+                    issues_detail.append((basename, f"Line {line_num}: removed (non-numeric values)"))
+                    continue
+                
+                # Check class ID
+                if class_id < 0:
+                    negative_class_ids += 1
+                    file_modified = True
+                    issues_detail.append((basename, f"Line {line_num}: removed (negative class ID {class_id})"))
+                    continue
+                
+                if max_class >= 0 and class_id > max_class:
+                    bad_class_ids += 1
+                    issues_detail.append((basename, f"Line {line_num}: class ID {class_id} exceeds max {max_class} (kept, but may be wrong)"))
+                
+                # Clamp center coordinates to [0, 1]
+                orig_cx, orig_cy = cx, cy
+                cx = max(0.0, min(1.0, cx))
+                cy = max(0.0, min(1.0, cy))
+                if cx != orig_cx or cy != orig_cy:
+                    centers_clamped += 1
+                    values_clamped += 1
+                    file_modified = True
+                    issues_detail.append((basename, f"Line {line_num}: center clamped ({orig_cx:.6f},{orig_cy:.6f}) → ({cx:.6f},{cy:.6f})"))
+                
+                # Clamp width and height to [0, 1]
+                orig_w, orig_h = w, h
+                w = max(0.0, min(1.0, w))
+                h = max(0.0, min(1.0, h))
+                if w != orig_w:
+                    widths_clamped += 1
+                    values_clamped += 1
+                    file_modified = True
+                    issues_detail.append((basename, f"Line {line_num}: width clamped {orig_w:.6f} → {w:.6f}"))
+                if h != orig_h:
+                    heights_clamped += 1
+                    values_clamped += 1
+                    file_modified = True
+                    issues_detail.append((basename, f"Line {line_num}: height clamped {orig_h:.6f} → {h:.6f}"))
+                
+                # Clamp so box doesn't extend past image boundary
+                # Ensure cx - w/2 >= 0 and cx + w/2 <= 1 (same for y)
+                if cx - w / 2 < 0:
+                    w = cx * 2
+                    if w != orig_w:
+                        values_clamped += 1
+                        file_modified = True
+                        issues_detail.append((basename, f"Line {line_num}: width reduced to keep box in bounds"))
+                if cx + w / 2 > 1:
+                    w = (1.0 - cx) * 2
+                    if w != orig_w:
+                        values_clamped += 1
+                        file_modified = True
+                        issues_detail.append((basename, f"Line {line_num}: width reduced to keep box in bounds"))
+                if cy - h / 2 < 0:
+                    h = cy * 2
+                    if h != orig_h:
+                        values_clamped += 1
+                        file_modified = True
+                        issues_detail.append((basename, f"Line {line_num}: height reduced to keep box in bounds"))
+                if cy + h / 2 > 1:
+                    h = (1.0 - cy) * 2
+                    if h != orig_h:
+                        values_clamped += 1
+                        file_modified = True
+                        issues_detail.append((basename, f"Line {line_num}: height reduced to keep box in bounds"))
+                
+                # Check for zero-size annotations
+                if w <= 0 or h <= 0:
+                    malformed_lines_removed += 1
+                    file_modified = True
+                    issues_detail.append((basename, f"Line {line_num}: removed (zero-sized box after clamping)"))
+                    continue
+                
+                new_lines.append(f"{class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+            
+            # Write back if modified
+            if file_modified:
+                if new_lines:
+                    with open(lbl_file, 'w') as f:
+                        f.write("\n".join(new_lines) + "\n")
+                    files_fixed += 1
+                else:
+                    # File is now empty - delete it
+                    os.remove(lbl_file)
+                    empty_files_removed += 1
+                    issues_detail.append((basename, "File removed (no valid lines remaining)"))
+        
+        # Rebuild cache after fixes
+        if files_fixed > 0 or empty_files_removed > 0:
+            self._build_annotation_cache_and_stats()
+            # Reload current image to reflect any changes
+            if self.filtered_image_paths and 0 <= self.current_index < len(self.filtered_image_paths):
+                self.load_image(self.current_index)
+        
+        # Show results in a scrollable dialog
+        dlg = tb.Toplevel(self.root)
+        dlg.title("YOLO Format Check Results")
+        dlg.geometry("650x500")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        
+        # Summary
+        summary_frame = tb.Frame(dlg, padding=10)
+        summary_frame.pack(fill=X)
+        
+        all_good = (values_clamped == 0 and malformed_lines_removed == 0 and 
+                    negative_class_ids == 0 and empty_files_removed == 0)
+        
+        if all_good:
+            tb.Label(summary_frame, text="✅ All YOLO labels are valid!", font=("Arial", 12, "bold"), bootstyle="success").pack(anchor=W)
+        else:
+            tb.Label(summary_frame, text="🔧 Fixes applied to YOLO labels", font=("Arial", 12, "bold"), bootstyle="warning").pack(anchor=W)
+        
+        stats_text = (
+            f"Files checked: {files_checked}\n"
+            f"Files modified: {files_fixed}\n"
+            f"Values clamped to [0,1]: {values_clamped}\n"
+            f"  ├ Centers clamped: {centers_clamped}\n"
+            f"  ├ Widths clamped: {widths_clamped}\n"
+            f"  └ Heights clamped: {heights_clamped}\n"
+            f"Malformed lines removed: {malformed_lines_removed}\n"
+            f"Negative class IDs removed: {negative_class_ids}\n"
+            f"Out-of-range class IDs (kept): {bad_class_ids}\n"
+            f"Empty files removed: {empty_files_removed}"
+        )
+        
+        tb.Label(summary_frame, text=stats_text, font=("Consolas", 9), justify=LEFT).pack(anchor=W, pady=(5, 0))
+        
+        tb.Separator(dlg, orient=HORIZONTAL).pack(fill=X, padx=10, pady=5)
+        
+        # Details
+        text_frame = tb.Frame(dlg, padding=10)
+        text_frame.pack(fill=BOTH, expand=True)
+        
+        text_widget = tk.Text(text_frame, bg="#1e1e1e", fg="#eee", font=("Consolas", 9), wrap=tk.WORD, bd=0)
+        scroll = tb.Scrollbar(text_frame, orient=VERTICAL, command=text_widget.yview)
+        text_widget.config(yscrollcommand=scroll.set)
+        scroll.pack(side=RIGHT, fill=Y)
+        text_widget.pack(fill=BOTH, expand=True)
+        
+        if issues_detail:
+            text_widget.insert(tk.END, "=== DETAILED CHANGES ===\n\n")
+            current_file = None
+            for fname, desc in issues_detail:
+                if fname != current_file:
+                    current_file = fname
+                    text_widget.insert(tk.END, f"\n📄 {fname}\n")
+                text_widget.insert(tk.END, f"   {desc}\n")
+        else:
+            text_widget.insert(tk.END, "No issues found. All labels are properly formatted.\n")
+        
+        text_widget.config(state=tk.DISABLED)
+        
+        # Close button
+        btn_frame = tb.Frame(dlg, padding=10)
+        btn_frame.pack(fill=X)
+        tb.Button(btn_frame, text="Close", command=dlg.destroy, bootstyle="secondary").pack(side=RIGHT, padx=5)
+        
+        self.status_var.set(f"YOLO check complete: {files_fixed} files fixed, {values_clamped} values clamped")
 
     def validate_dataset_dialog(self):
         """Check for orphaned labels, empty images, or class mismatches."""

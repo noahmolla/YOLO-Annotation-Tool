@@ -1,24 +1,11 @@
 {
-    "geometry": "3440x1369+243+56",
+    "geometry": "3440x1369+-53+-17",
     "classes": [
-        "pallet",
-        "board",
-        "stringer",
-        "stringerProfile",
-        "leadBoard",
-        "boardCluster",
-        "brokenBoard",
-        "majorCrack",
-        "minorCrack",
-        "missingBoard",
-        "missingStringer",
-        "mold",
-        "nail",
-        "protrudeNail",
-        "brokenStringer"
+        "stack",
+        "Person",
+        "board"
     ],
-    "model_version": "v26",
-    "last_workspace": "C:/Users/noahm/Downloads/testre",
-    "last_dir": "C:/Users/noahm/Downloads/testre\\images",
-    "model_path": "C:/Users/noahm/Downloads/model_- 5 february 2026 18_25.pt"
+    "model_version": "Auto",
+    "last_workspace": "C:/Users/noahm/Downloads/cfp stacker",
+    "last_dir": "C:/Users/noahm/Downloads/cfp stacker\\images"
 }
