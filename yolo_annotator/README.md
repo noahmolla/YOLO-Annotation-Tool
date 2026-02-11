@@ -147,6 +147,8 @@ Annotations are saved in **YOLO format**:
 
 ## 🔧 Configuration
 
+The app stores user-specific settings (last workspace, classes, window geometry) in `config.json`, which is generated automatically on first run. See [`config.example.json`](config.example.json) for the format.
+
 ### Confidence & IOU Settings
 
 Click **"⚙ Confidence & IOU Settings"** to configure:
@@ -214,9 +216,20 @@ This is normal. TFLite is optimized for edge devices. For desktop use, PyTorch (
 
 ---
 
+## 🤝 Contributing
+
+Contributions are welcome! Feel free to:
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+---
+
 ## 📜 License
 
-MIT License - Feel free to use and modify!
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
 ---
 
