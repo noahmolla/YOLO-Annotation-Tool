@@ -3,7 +3,7 @@
 A modern, feature-rich Python application for annotating images using YOLO models. Supports both manual annotation and AI-assisted auto-annotation with TFLite (`.tflite`) and PyTorch (`.pt`) models.
 
 ![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)
-![License MIT](https://img.shields.io/badge/license-MIT-green.svg)
+![License AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)
 
 ---
 
@@ -229,7 +229,17 @@ Contributions are welcome! Feel free to:
 
 ## 📜 License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** — see the [LICENSE](LICENSE) file for details.
+
+This license is required because the project depends on [ultralytics](https://github.com/ultralytics/ultralytics), which is distributed under AGPL-3.0.
+
+---
+
+## 👤 Author
+
+Created by **Noah Molla**.
+
+This project was built with the assistance of AI coding tools. All code has been reviewed and tested by the author.
 
 ---
 
@@ -237,6 +247,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 Built with:
 - [ttkbootstrap](https://github.com/israel-dryer/ttkbootstrap) - Modern Tkinter themes
-- [ultralytics](https://github.com/ultralytics/ultralytics) - YOLO implementation
+- [ultralytics](https://github.com/ultralytics/ultralytics) - YOLO implementation (AGPL-3.0)
 - [TensorFlow Lite](https://www.tensorflow.org/lite) - Edge inference
 - [Pillow](https://python-pillow.org/) - Image processing

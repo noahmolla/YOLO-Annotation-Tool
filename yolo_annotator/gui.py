@@ -21,7 +21,6 @@ class AnnotatorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Modern YOLO Annotator")
-        self.root.title("Modern YOLO Annotator")
         self.root.geometry("1600x900")
         self.root.state('zoomed') # Maximize on start
         
@@ -158,8 +157,6 @@ class AnnotatorApp:
             "model_version": self.model_ver_combo.get(),
             "last_workspace": self.workspace_path,
             "last_dir": os.path.dirname(self.image_paths[0]) if self.image_paths else "",
-             # We unfortunately don't track model path in self.model easily unless we store it.
-             # Let's add self.model_path variable
         }
         if hasattr(self, 'model_path_str'):
              cfg["model_path"] = self.model_path_str
@@ -181,8 +178,7 @@ class AnnotatorApp:
     def _setup_ui(self):
         # Main layout: Toolbar Top, Paned Window (Left, Center, Right)
         
-        # 1. Top Status/Toolbar area (Optional, maybe put status at bottom)
-        # Let's put a simple status bar at the bottom
+        # Status bar at bottom
         # Status bar at bottom with image size on right
         status_frame = tb.Frame(self.root)
         status_frame.pack(side=BOTTOM, fill=X)
@@ -427,15 +423,9 @@ class AnnotatorApp:
         # H for help/shortcuts
         self.root.bind("h", lambda e: self.show_shortcuts_dialog())
         
-        # Mouse buttons for nav
-        # Windows XButtons are often not mapped cleanly in raw Tkinter without extensions
-        # But we can try common bindings
+        # Alt+Arrow navigation
         self.root.bind("<Alt-Left>", self.prev_image)
         self.root.bind("<Alt-Right>", self.next_image)
-        # Try Button-8/9 (Linux/X11 usually, sometimes Windows with certain drivers)
-        self.root.bind("<Alt-Right>", self.next_image)
-        # Mouse extra buttons are not standard in base Tkinter on Windows
-        # We can rely on Alt-Arrow for now.
         
         # Number keys 1-9 map to class 0-8 (more ergonomic)
         for i in range(1, 10):
@@ -2709,8 +2699,6 @@ class AnnotatorApp:
                 self.status_var.set(f"Selected annotation {hit_index} ({len(self.selected_annotations)} total selected - press R to repeat)")
             self.redraw()
         else:
-            # Clicked on empty space - could clear selection if desired
-            # For now, just show help
             self.status_var.set("Ctrl+Click on annotations to select them for repeat (R)")
 
     def clear_selection(self):
@@ -2997,7 +2985,7 @@ class AnnotatorApp:
         If no classes are defined, asks user if they want to proceed with ALL.
         """
         if not self.classes:
-            return None # Should probably allow all if no classes defined, but usually classes are loaded.
+            return None
             
         dlg = tb.Toplevel(self.root)
         dlg.title("Select Classes")
@@ -3281,9 +3269,7 @@ class AnnotatorApp:
         lbl_status = tb.Label(top, text="Starting...")
         lbl_status.pack(pady=5)
         
-        # To avoid UI freeze, we should ideally run this in a thread or use update() carefully.
-        # But for now, update() loop is okay for simple tool.
-        
+
         for i, p in enumerate(self.image_paths):
             try:
                 img = Image.open(p)
@@ -3292,11 +3278,8 @@ class AnnotatorApp:
                 # Inference
                 boxes, classes, scores = self.model.predict(np.array(img), version=ver)
                 
-                # Append to file
+                # Append detections to label file
                 os.makedirs(os.path.dirname(lbl), exist_ok=True)
-                
-                # We append to the file. 
-                # Note: this appends duplicate boxes if they already exist, we don't check for that here yet.
                 with open(lbl, 'a') as f: 
                      for b, c, s in zip(boxes, classes, scores):
                          if int(c) in allowed_classes:

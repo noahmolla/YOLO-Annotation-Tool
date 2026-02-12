@@ -85,17 +85,14 @@ class TFLiteModel:
 
     def _parse_ssd_style_output(self, threshold):
         """
-        Parse outputs for models that return [Boxes, Classes, Scores, Count]
+        Parse outputs for models that return [Boxes, Classes, Scores, Count].
         Common in TFLite Model Maker or TF Object Detection API.
         """
-        # Usually: 
+        # Standard SSD output layout:
         # Index 0: Locations (1, N, 4) in [y1, x1, y2, x2]
         # Index 1: Classes (1, N)
         # Index 2: Scores (1, N)
         # Index 3: Number of detections (1)
-        # (Indices can vary, strictly we should map by name, but order is often standard)
-        
-        # We'll map by shape if possible or just assume standard order for now.
         boxes_data = self.interpreter.get_tensor(self.output_details[0]['index'])[0] # [y1, x1, y2, x2]
         classes_data = self.interpreter.get_tensor(self.output_details[1]['index'])[0]
         scores_data = self.interpreter.get_tensor(self.output_details[2]['index'])[0]
@@ -126,57 +123,38 @@ class TFLiteModel:
         """
         output = self.interpreter.get_tensor(self.output_details[0]['index'])[0]
         
-        # 1. Normalize orientation: ensure [N, 4+classes]
-        # Most standardized output these days for NMS is [N, Dimensions]
-        # But v8/v11 native output is [Dimensions, N] (e.g. 84, 8400)
-        
+        # Normalize orientation to [N, 4+classes]
+        # v5 outputs [N, Dims], v8/v11 outputs [Dims, N] — transpose if needed
         transpose = False
         if version == "v8/v11":
-            # Force check if dim[0] < dim[1]
             if output.shape[0] < output.shape[1]:
                 transpose = True
         elif version == "v5":
-            # v5 usually [N, Dims]
             if output.shape[0] < output.shape[1]:
-                transpose = True # Rare but possible if exported that way
+                transpose = True
         else:
-             # Auto
+             # Auto-detect based on shape
              if output.shape[0] < output.shape[1]: 
                  transpose = True
 
         if transpose:
              output = output.T
             
-        # 2. Extract components
-        boxes = []
-        confidences = []
-        class_ids = []
+        # Extract detection components
         
         cols = output.shape[1]
         
-        # Heuristic Logic
-        # v5: [cx, cy, w, h, obj_conf, cls...] -> cols = 5 + nc
-        # v8: [cx, cy, w, h, cls...] -> cols = 4 + nc (NO obj_conf)
-        
+        # Determine output format:
+        #   v5:     [cx, cy, w, h, obj_conf, cls_scores...] → cols = 5 + num_classes
+        #   v8/v11: [cx, cy, w, h, cls_scores...]           → cols = 4 + num_classes
         has_obj_conf = False
         
         if version == "v5":
             has_obj_conf = True
         elif version == "v8/v11":
             has_obj_conf = False
-        else: # Auto
-             # Guess based on counts. 
-             # If cols is small (e.g. 85), could be v5 (80 cls) or v8 (81 cls). Hard to say.
-             # However, v5 output usually has explicit logistic activation on obj_conf.
-             # Safest heuristic: if cols == 4 + num_classes (from some external knowledge) we know.
-             # Lacking that, if cols >= 6 (at least 1 class, 5 items), 
-             # and values in col 4 are typically lower than values in cls scores... hard.
-             
-             # Let's assume v5 structure (has obj conf) IF cols >= 6 AND not consistent with 4+cls structure?
-             # Actually, most generic YOLO outputs in TFLite from ultralytics v8/v11 export are 4+cls.
-             # Old v5 export was 5+cls.
-             
-             # Let's assume v8 (no obj conf) if we can't decide, OR check typically v5 has 85 cols for COCO, v8 has 84.
+        else:
+             # Auto-detect: v5 COCO models have 85 cols (5 + 80), v8 have 84 (4 + 80)
              if cols % 85 == 0 or cols == 85: has_obj_conf = True
              else: has_obj_conf = False
 
@@ -193,14 +171,11 @@ class TFLiteModel:
             max_cls_ids = np.argmax(cls_scores, axis=1)
             final_scores = max_cls_scores * obj_conf
             
-        else: # v8 style
+        else:
+            # v8/v11 style — no objectness confidence, class scores are direct
             cls_scores = output[:, 4:]
             final_scores = np.max(cls_scores, axis=1)
             max_cls_ids = np.argmax(cls_scores, axis=1)
-            
-        # ... logic continues in existing code ...
-        # We need to bridge to the existing filter/NMS logic.
-        # Let's just output the variables needed for the next block
         
         # Filter weak detections
         mask = final_scores >= threshold
@@ -212,50 +187,36 @@ class TFLiteModel:
         if len(filtered_scores) == 0:
              return [], [], []
              
-        # Prepare for NMS (NMSBoxes expects top-left x, y, w, h)
-        # Our boxes are cx, cy, w, h. And potentially normalized.
-        # We need to assume the model output scale. 
-        # Most "raw" TFLite models output in PIXELS relative to the input tensor size (e.g. 640x640) 
-        # OR normalized 0-1.
-        
-        # Let's check max value to guess.
+        # Prepare for NMS — convert [cx, cy, w, h] to [x_tl, y_tl, w, h]
+        # Detect whether coordinates are normalized (0-1) or in pixels
         max_box_val = np.max(filtered_boxes)
-        is_normalized = max_box_val <= 1.05 # Margin for error
+        is_normalized = max_box_val <= 1.05
         
         nms_boxes = []
         for i in range(len(filtered_boxes)):
             cx, cy, bw, bh = filtered_boxes[i]
             if is_normalized:
-                # Keep normalized for final output, but NMSBoxes might prefer pixel? 
-                # Actually NMS works on any scale as long as consistent.
-                # However, we need to return normalized [cx, cy, w, h].
-                
-                # Convert to standard [x, y, w, h] for NMS (top-left)
+                # Already normalized — convert center to top-left for NMS
                 x_tl = cx - bw/2
                 y_tl = cy - bh/2
-                # Pass as float
                 nms_boxes.append([x_tl, y_tl, bw, bh])
             else:
-                 # It's in pixels relative to model input
+                 # Pixel coordinates — normalize relative to model input size
                  input_w = self.input_shape[2]
                  input_h = self.input_shape[1]
                  
-                 # Normalize for output first
                  ncx = cx / input_w
                  ncy = cy / input_h
                  nbw = bw / input_w
                  nbh = bh / input_h
                  
-                 # Store normalized version for later result
                  filtered_boxes[i] = [ncx, ncy, nbw, nbh]
                  
-                 # NMS needs coordinate system. Normalizing is fine.
                  x_tl = ncx - nbw/2
                  y_tl = ncy - nbh/2
                  nms_boxes.append([x_tl, y_tl, nbw, nbh])
 
-        # Run NMS
-        # indices = cv2.dnn.NMSBoxes(bboxes, scores, score_threshold, nms_threshold)
+        # Run Non-Maximum Suppression
         indices = cv2.dnn.NMSBoxes(nms_boxes, filtered_scores.tolist(), threshold, iou_threshold)
         
         results_boxes = []
@@ -264,18 +225,8 @@ class TFLiteModel:
         
         if len(indices) > 0:
             for i in indices.flatten():
-                # We need to return [cx, cy, w, h] normalized
-                # We updated filtered_boxes[i] to be normalized [cx, cy, w, h] above if it wasn't
-                # If it was, it stays [cx, cy, w, h]
-                
-                # Wait, inside the is_normalized block I didn't update filtered_boxes[i].
-                # Let's correct that logic:
-                
-                if is_normalized:
-                    b_norm = filtered_boxes[i] # already [cx, cy, w, h] norm
-                else:
-                    b_norm = filtered_boxes[i] # we updated this in loop
-                
+                # filtered_boxes[i] is already normalized [cx, cy, w, h]
+                b_norm = filtered_boxes[i]
                 results_boxes.append(b_norm.tolist())
                 results_classes.append(int(filtered_cls_ids[i]))
                 results_scores.append(float(filtered_scores[i]))
