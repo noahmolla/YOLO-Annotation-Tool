@@ -2451,6 +2451,27 @@ class AnnotatorApp:
                             self.annotations.append([cid, cx, cy, w, h])
                         except: pass
         
+        # Auto-normalize and clamp annotations to [0, 1] on load
+        needs_resave = False
+        sanitized = []
+        for ann in self.annotations:
+            cid, cx, cy, w, h = ann
+            # Clamp center to [0, 1]
+            new_cx = max(0.0, min(1.0, cx))
+            new_cy = max(0.0, min(1.0, cy))
+            # Clamp dimensions so box stays within [0, 1]
+            new_w = max(0.001, min(abs(w), 2*new_cx, 2*(1-new_cx)))
+            new_h = max(0.001, min(abs(h), 2*new_cy, 2*(1-new_cy)))
+            if cx != new_cx or cy != new_cy or w != new_w or h != new_h:
+                needs_resave = True
+            sanitized.append([cid, new_cx, new_cy, new_w, new_h])
+        self.annotations = sanitized
+        
+        # If any values were clamped, save the corrected file immediately
+        if needs_resave and self.annotations:
+            self.current_file_path = path  # Ensure path is set for save
+            self.save_annotations(force=True)
+        
         # Maintain class selection when switching images
         if self.classes and 0 <= self.selected_class_id < len(self.classes):
             self.cls_list.selection_clear(0, tk.END)
@@ -3017,151 +3038,219 @@ class AnnotatorApp:
         return result['selected']
     
     def show_annotation_settings(self):
-        """Show dialog to configure confidence and IOU thresholds for auto-annotation."""
+        """Show dialog to configure inference resolution, confidence and IOU thresholds."""
         dlg = tb.Toplevel(self.root)
-        dlg.title("Auto-Annotation Settings")
-        dlg.geometry("500x600")
+        dlg.title("Inference & Detection Settings")
+        dlg.geometry("600x750")
         dlg.transient(self.root)
         dlg.grab_set()
         
-        # Main container with scrollbar
-        main_frame = tb.Frame(dlg)
-        main_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        # Main container
+        main_frame = tb.Frame(dlg, padding=15)
+        main_frame.pack(fill=BOTH, expand=True)
         
         # Title
-        tb.Label(main_frame, text="Confidence & IOU Thresholds", font=("Arial", 14, "bold")).pack(pady=(0, 10))
+        tb.Label(main_frame, text="Inference & Detection Settings", 
+                font=("Arial", 15, "bold")).pack(pady=(0, 12))
         
-        # Global settings frame
-        global_frame = tb.Labelframe(main_frame, text="Global Settings", padding=10)
-        global_frame.pack(fill=X, pady=5)
+        # ── Inference Resolution ──
+        res_frame = tb.Labelframe(main_frame, text="Inference Resolution", padding=10)
+        res_frame.pack(fill=X, pady=(0, 8))
         
-        # Default confidence threshold
-        default_conf_frame = tb.Frame(global_frame)
-        default_conf_frame.pack(fill=X, pady=5)
-        tb.Label(default_conf_frame, text="Default Confidence:", width=20, anchor=W).pack(side=LEFT)
-        default_conf_var = tk.DoubleVar(value=self.default_confidence_threshold)
-        default_conf_scale = tb.Scale(default_conf_frame, from_=0.0, to=1.0, variable=default_conf_var, 
-                                      orient=HORIZONTAL, length=200)
-        default_conf_scale.pack(side=LEFT, fill=X, expand=True, padx=5)
-        default_conf_label = tb.Label(default_conf_frame, text=f"{self.default_confidence_threshold:.2f}", width=5)
-        default_conf_label.pack(side=LEFT)
+        res_row = tb.Frame(res_frame)
+        res_row.pack(fill=X)
+        tb.Label(res_row, text="Image Size (imgsz):", anchor=W).pack(side=LEFT)
         
-        def update_default_label(val):
-            default_conf_label.config(text=f"{float(val):.2f}")
-        default_conf_scale.config(command=update_default_label)
+        current_imgsz = self.imgsz_combo.get()
+        imgsz_var = tk.StringVar(value=current_imgsz)
+        imgsz_combo_dlg = tb.Combobox(res_row, textvariable=imgsz_var,
+                                       values=["Auto", "320", "512", "640", "1024", "1280"],
+                                       state="readonly", width=10)
+        imgsz_combo_dlg.pack(side=RIGHT, padx=5)
         
-        # IOU threshold
-        iou_frame = tb.Frame(global_frame)
-        iou_frame.pack(fill=X, pady=5)
-        tb.Label(iou_frame, text="IOU Threshold (NMS):", width=20, anchor=W).pack(side=LEFT)
+        tb.Label(res_frame, text="Resolution used for model inference. 'Auto' uses model default (640 for most .pt models). "
+                 "TFLite models always use their built-in size.",
+                 font=("Arial", 8), foreground="#888", wraplength=540, justify=LEFT).pack(anchor=W, pady=(4, 0))
+        
+        def on_imgsz_changed(*_):
+            val = imgsz_var.get()
+            self.imgsz_combo.set(val)
+            self._on_imgsz_changed()
+        imgsz_combo_dlg.bind("<<ComboboxSelected>>", on_imgsz_changed)
+        
+        # ── IOU Threshold ──
+        iou_frame = tb.Labelframe(main_frame, text="NMS (Non-Maximum Suppression)", padding=10)
+        iou_frame.pack(fill=X, pady=(0, 8))
+        
+        iou_row = tb.Frame(iou_frame)
+        iou_row.pack(fill=X)
+        tb.Label(iou_row, text="IOU Threshold:", width=16, anchor=W).pack(side=LEFT)
         iou_var = tk.DoubleVar(value=self.iou_threshold)
-        iou_scale = tb.Scale(iou_frame, from_=0.0, to=1.0, variable=iou_var, 
-                            orient=HORIZONTAL, length=200)
+        iou_scale = tb.Scale(iou_row, from_=0.0, to=1.0, variable=iou_var,
+                            orient=HORIZONTAL, length=250)
         iou_scale.pack(side=LEFT, fill=X, expand=True, padx=5)
-        iou_label = tb.Label(iou_frame, text=f"{self.iou_threshold:.2f}", width=5)
+        iou_label = tb.Label(iou_row, text=f"{self.iou_threshold:.2f}", width=5, font=("Consolas", 10))
         iou_label.pack(side=LEFT)
         
-        def update_iou_label(val):
-            iou_label.config(text=f"{float(val):.2f}")
-        iou_scale.config(command=update_iou_label)
+        def update_iou(val):
+            v = float(val)
+            iou_label.config(text=f"{v:.2f}")
+            self.iou_threshold = v
+        iou_scale.config(command=update_iou)
         
-        # Per-class settings frame
+        # ── Confidence Thresholds ──
+        conf_frame = tb.Labelframe(main_frame, text="Confidence Thresholds", padding=10)
+        conf_frame.pack(fill=BOTH, expand=True, pady=(0, 8))
+        
+        # Mode toggle: Global vs Per-Class
+        use_per_class = tk.BooleanVar(value=bool(self.class_confidence_thresholds))
+        
+        mode_row = tb.Frame(conf_frame)
+        mode_row.pack(fill=X, pady=(0, 8))
+        tb.Label(mode_row, text="Mode:", anchor=W).pack(side=LEFT)
+        global_rb = tb.Radiobutton(mode_row, text="Global (one threshold for all)", 
+                                    variable=use_per_class, value=False, bootstyle="toolbutton-outline")
+        global_rb.pack(side=LEFT, padx=(10, 5))
+        perclass_rb = tb.Radiobutton(mode_row, text="Per-Class (individual thresholds)", 
+                                      variable=use_per_class, value=True, bootstyle="toolbutton-outline")
+        perclass_rb.pack(side=LEFT, padx=5)
+        
+        # Separator
+        ttk.Separator(conf_frame, orient=HORIZONTAL).pack(fill=X, pady=5)
+        
+        # ── Global confidence section ──
+        global_conf_frame = tb.Frame(conf_frame)
+        global_conf_frame.pack(fill=X, pady=5)
+        
+        global_conf_label_title = tb.Label(global_conf_frame, text="Default Confidence:", width=18, anchor=W)
+        global_conf_label_title.pack(side=LEFT)
+        default_conf_var = tk.DoubleVar(value=self.default_confidence_threshold)
+        global_conf_scale = tb.Scale(global_conf_frame, from_=0.0, to=1.0, variable=default_conf_var,
+                                      orient=HORIZONTAL, length=250)
+        global_conf_scale.pack(side=LEFT, fill=X, expand=True, padx=5)
+        global_conf_value = tb.Label(global_conf_frame, text=f"{self.default_confidence_threshold:.2f}", 
+                                      width=5, font=("Consolas", 10))
+        global_conf_value.pack(side=LEFT)
+        
+        def update_global_conf(val):
+            v = float(val)
+            global_conf_value.config(text=f"{v:.2f}")
+            self.default_confidence_threshold = v
+        global_conf_scale.config(command=update_global_conf)
+        
+        # ── Per-class confidence section ──
+        perclass_container = tb.Frame(conf_frame)
+        perclass_container.pack(fill=BOTH, expand=True, pady=(5, 0))
+        
+        class_vars = {}
+        class_scales = []
+        class_value_labels = []
+        class_name_labels = []
+        
         if self.classes:
-            class_frame = tb.Labelframe(main_frame, text="Per-Class Confidence Thresholds", padding=10)
-            class_frame.pack(fill=BOTH, expand=True, pady=5)
-            
-            # Add scrollbar
-            canvas = tk.Canvas(class_frame, height=300)
-            scrollbar = tb.Scrollbar(class_frame, orient=VERTICAL, command=canvas.yview)
-            scrollable_frame = tb.Frame(canvas)
-            
-            scrollable_frame.bind(
-                "<Configure>",
-                lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-            )
-            
-            canvas.create_window((0, 0), window=scrollable_frame, anchor=NW)
-            canvas.configure(yscrollcommand=scrollbar.set)
-            
-            canvas.pack(side=LEFT, fill=BOTH, expand=True)
-            scrollbar.pack(side=RIGHT, fill=Y)
-            
-            # Class threshold controls
-            class_vars = {}
-            class_labels = {}
-            
             for i, class_name in enumerate(self.classes):
-                class_row = tb.Frame(scrollable_frame)
-                class_row.pack(fill=X, pady=3)
+                class_row = tb.Frame(perclass_container)
+                class_row.pack(fill=X, pady=2)
                 
-                # Class name
-                tb.Label(class_row, text=f"{i}: {class_name}", width=15, anchor=W).pack(side=LEFT)
+                name_lbl = tb.Label(class_row, text=f"{i}: {class_name}", width=15, anchor=W)
+                name_lbl.pack(side=LEFT)
+                class_name_labels.append(name_lbl)
                 
-                # Get current threshold for this class
                 current_threshold = self.class_confidence_thresholds.get(i, self.default_confidence_threshold)
                 class_var = tk.DoubleVar(value=current_threshold)
                 class_vars[i] = class_var
                 
-                # Scale
                 class_scale = tb.Scale(class_row, from_=0.0, to=1.0, variable=class_var,
-                                      orient=HORIZONTAL, length=150)
+                                      orient=HORIZONTAL, length=200)
                 class_scale.pack(side=LEFT, fill=X, expand=True, padx=5)
+                class_scales.append(class_scale)
                 
-                # Value label
-                class_label = tb.Label(class_row, text=f"{current_threshold:.2f}", width=5)
-                class_label.pack(side=LEFT)
-                class_labels[i] = class_label
+                class_val_lbl = tb.Label(class_row, text=f"{current_threshold:.2f}", 
+                                          width=5, font=("Consolas", 10))
+                class_val_lbl.pack(side=LEFT)
+                class_value_labels.append(class_val_lbl)
                 
-                # Update function
                 def make_update_func(idx, lbl):
                     def update(val):
-                        lbl.config(text=f"{float(val):.2f}")
+                        v = float(val)
+                        lbl.config(text=f"{v:.2f}")
+                        self.class_confidence_thresholds[idx] = v
                     return update
                 
-                class_scale.config(command=make_update_func(i, class_label))
+                class_scale.config(command=make_update_func(i, class_val_lbl))
         else:
-            tb.Label(main_frame, text="Load classes to set per-class thresholds", 
-                    font=("Arial", 10, "italic"), foreground="gray").pack(pady=20)
-            class_vars = {}
+            tb.Label(perclass_container, text="Load classes to set per-class thresholds",
+                    font=("Arial", 10, "italic"), foreground="#666").pack(pady=10)
         
-        # Info text
-        info_frame = tb.Frame(main_frame)
-        info_frame.pack(fill=X, pady=10)
-        info_text = (
-            "💡 Tip:\n"
-            "• Higher confidence = fewer false positives\n"
-            "• Lower confidence = more detections\n"
-            "• IOU threshold controls overlap removal"
-        )
-        tb.Label(info_frame, text=info_text, font=("Arial", 9), justify=LEFT, 
-                foreground="#888").pack(anchor=W)
+        # ── Toggle logic: enable/disable sections ──
+        def update_mode(*_):
+            is_per_class = use_per_class.get()
+            
+            # Global section
+            g_state = "disabled" if is_per_class else "normal"
+            global_conf_scale.config(state=g_state)
+            fg_color = "#666" if is_per_class else ""
+            global_conf_label_title.config(foreground=fg_color)
+            global_conf_value.config(foreground=fg_color)
+            
+            # Per-class section
+            p_state = "normal" if is_per_class else "disabled"
+            p_fg = "" if is_per_class else "#666"
+            for s in class_scales:
+                s.config(state=p_state)
+            for lbl in class_value_labels:
+                lbl.config(foreground=p_fg)
+            for lbl in class_name_labels:
+                lbl.config(foreground=p_fg)
+            
+            # When switching to global, clear per-class overrides so global is used
+            if not is_per_class:
+                self.class_confidence_thresholds.clear()
+            else:
+                # When switching to per-class, populate from current global if empty
+                for idx, var in class_vars.items():
+                    if idx not in self.class_confidence_thresholds:
+                        self.class_confidence_thresholds[idx] = self.default_confidence_threshold
+                        var.set(self.default_confidence_threshold)
         
-        # Buttons
+        use_per_class.trace_add("write", update_mode)
+        update_mode()  # Set initial state
+        
+        # ── Bottom bar ──
+        ttk.Separator(main_frame, orient=HORIZONTAL).pack(fill=X, pady=(4, 8))
+        
         btn_frame = tb.Frame(main_frame)
-        btn_frame.pack(fill=X, pady=10)
-        
-        def on_save():
-            # Save settings
-            self.default_confidence_threshold = default_conf_var.get()
-            self.iou_threshold = iou_var.get()
-            
-            # Save per-class thresholds
-            for class_id, var in class_vars.items():
-                self.class_confidence_thresholds[class_id] = var.get()
-            
-            self.status_var.set(f"Settings saved: Default conf={self.default_confidence_threshold:.2f}, IOU={self.iou_threshold:.2f}")
-            dlg.destroy()
+        btn_frame.pack(fill=X)
         
         def on_reset():
-            # Reset to defaults
             default_conf_var.set(0.50)
+            update_global_conf("0.50")
             iou_var.set(0.50)
-            for var in class_vars.values():
+            update_iou("0.50")
+            for idx, var in class_vars.items():
                 var.set(0.50)
+                self.class_confidence_thresholds[idx] = 0.50
+            for lbl in class_value_labels:
+                lbl.config(text="0.50")
+            self.status_var.set("Settings reset to 0.50")
         
-        tb.Button(btn_frame, text="Save", command=on_save, bootstyle="success", width=12).pack(side=LEFT, padx=5)
-        tb.Button(btn_frame, text="Reset to 0.50", command=on_reset, bootstyle="warning-outline", width=12).pack(side=LEFT, padx=5)
-        tb.Button(btn_frame, text="Cancel", command=dlg.destroy, bootstyle="secondary", width=12).pack(side=RIGHT, padx=5)
+        def on_close():
+            self.status_var.set(
+                f"Settings: conf={self.default_confidence_threshold:.2f}, "
+                f"IOU={self.iou_threshold:.2f}, "
+                f"imgsz={self.imgsz_combo.get()}, "
+                f"mode={'Per-Class' if use_per_class.get() else 'Global'}"
+            )
+            dlg.destroy()
+        
+        tb.Button(btn_frame, text="Reset to 0.50", command=on_reset, 
+                 bootstyle="warning-outline", width=14).pack(side=LEFT, padx=5)
+        
+        tb.Label(btn_frame, text="Changes apply instantly", 
+                font=("Arial", 9, "italic"), foreground="#888").pack(side=LEFT, padx=15)
+        
+        tb.Button(btn_frame, text="Close", command=on_close, 
+                 bootstyle="primary", width=12).pack(side=RIGHT, padx=5)
 
     def auto_annotate_current(self):
         if not self.model or not self.current_image:
