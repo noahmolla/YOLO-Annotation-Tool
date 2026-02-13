@@ -1,9 +1,15 @@
+"""
+Utility Functions Module
+Helper functions for workspace management, class loading, and dataset operations.
+"""
+
 import os
 import yaml
 import shutil
 import zipfile
 import random
 from glob import glob
+
 
 def ensure_workspace_structure(root_path):
     """
@@ -20,12 +26,12 @@ def ensure_workspace_structure(root_path):
     os.makedirs(labels_dir, exist_ok=True)
 
     if not os.path.exists(yaml_path):
-        # Create default
+        # Create default with Ultralytics-compatible format
         default_data = {
             'path': '.',  # root
             'train': 'images',
             'val': 'images', 
-            'names': {}
+            'names': []
         }
         with open(yaml_path, 'w') as f:
             yaml.dump(default_data, f, sort_keys=False)
@@ -71,8 +77,15 @@ def save_classes_to_yaml(yaml_path, class_list):
                 data = yaml.safe_load(f) or {}
             except: data = {}
 
-    # Update names
-    # YOLOv8 prefers dict {0: 'name'} generally
+    # Ensure required Ultralytics fields exist
+    if 'path' not in data:
+        data['path'] = '.'
+    if 'train' not in data:
+        data['train'] = 'images'
+    if 'val' not in data:
+        data['val'] = 'images'
+    
+    # Update names as dict {0: 'name'} (Ultralytics preferred format)
     names_dict = {i: name for i, name in enumerate(class_list)}
     data['names'] = names_dict
     data['nc'] = len(class_list)
@@ -184,7 +197,7 @@ def validate_dataset(workspace_path):
     
     return stats, issues, warnings
 
-def export_yolo_zip(workspace_path, zip_out_path, train_ratio=0.7, val_ratio=0.2, test_ratio=0.1):
+def export_yolo_zip(workspace_path, zip_out_path, train_ratio=0.7, val_ratio=0.2, test_ratio=0.1, class_list=None, annotation_type="all"):
     """
     Creates a standardized YOLO zip with train/val/test splits.
     
@@ -192,6 +205,8 @@ def export_yolo_zip(workspace_path, zip_out_path, train_ratio=0.7, val_ratio=0.2
         workspace_path: Path to workspace
         zip_out_path: Output zip file path
         train_ratio, val_ratio, test_ratio: Split ratios (should sum to 1.0)
+        class_list: Optional list of class names to write to data.yaml (prevents stale file issues)
+        annotation_type: "all", "detect", or "segment". Filters label lines.
     
     Returns:
         (success: bool, message: str, stats: dict)
@@ -214,17 +229,36 @@ def export_yolo_zip(workspace_path, zip_out_path, train_ratio=0.7, val_ratio=0.2
     val_ratio /= total_ratio
     test_ratio /= total_ratio
     
-    # 1. Gather all images
+    # 1. Gather all images and check if they have valid labels (after filtering)
     exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
     
     paired_files = []  # Images with labels
     unlabeled_files = []  # Images without labels (negative examples)
     
+    # Pre-scan to separate labeled vs unlabeled based on filter
     for f in os.listdir(images_src):
         name, ext = os.path.splitext(f)
         if ext.lower() in exts:
             txt_path = os.path.join(labels_src, name + ".txt")
+            has_labels = False
             if os.path.exists(txt_path):
+                if annotation_type == "all":
+                    has_labels = True
+                else:
+                    # Check if file has any valid lines for the mode
+                    try:
+                        with open(txt_path, 'r') as tf:
+                            for line in tf:
+                                parts = line.strip().split()
+                                if not parts: continue
+                                is_seg = len(parts) > 5
+                                if annotation_type == "segment" and is_seg:
+                                    has_labels = True; break
+                                elif annotation_type == "detect" and not is_seg:
+                                    has_labels = True; break
+                    except: pass
+            
+            if has_labels:
                 paired_files.append(f)
             else:
                 unlabeled_files.append(f)
@@ -284,38 +318,60 @@ def export_yolo_zip(workspace_path, zip_out_path, train_ratio=0.7, val_ratio=0.2
             dst_img = os.path.join(temp_root, split_name, "images", img_file)
             shutil.copy2(src_img, dst_img)
             
-            # Copy or create Label
+            # Copy or create Label with filtering
             name = os.path.splitext(img_file)[0]
             txt_file = name + ".txt"
             src_txt = os.path.join(labels_src, txt_file)
             dst_txt = os.path.join(temp_root, split_name, "labels", txt_file)
             
+            lines_to_write = []
             if os.path.exists(src_txt):
-                shutil.copy2(src_txt, dst_txt)
-            else:
-                # Create empty label file for negative examples
-                with open(dst_txt, 'w') as f:
-                    pass  # Empty file
+                if annotation_type == "all":
+                    shutil.copy2(src_txt, dst_txt)
+                    continue # Optimized path
+                
+                try:
+                    with open(src_txt, 'r') as rf:
+                        for line in rf:
+                            parts = line.strip().split()
+                            if not parts: continue
+                            is_seg = len(parts) > 5
+                            
+                            # Keep if matches filter
+                            keep = False
+                            if annotation_type == "segment" and is_seg: keep = True
+                            elif annotation_type == "detect" and not is_seg: keep = True
+                            
+                            if keep:
+                                lines_to_write.append(line)
+                except: pass
+            
+            # Write key file (empty for negative examples or if all lines filtered out)
+            with open(dst_txt, 'w') as f:
+                f.writelines(lines_to_write)
     
-    # Create data.yaml
-    ws_yaml = os.path.join(workspace_path, "data.yaml")
-    classes = load_classes_from_yaml(ws_yaml)
+    # Create data.yaml in Ultralytics-compatible format
+    if class_list is not None:
+        classes = class_list
+    else:
+        ws_yaml = os.path.join(workspace_path, "data.yaml")
+        classes = load_classes_from_yaml(ws_yaml)
     
-    # Write YAML manually to get exact format
-    yaml_lines = [
-        "train: ../train/images",
-        "val: ../val/images",
-    ]
+    # Build proper YAML data structure
+    yaml_data = {
+        'path': '.',  # dataset root dir (relative to where yaml is)
+        'train': 'train/images',
+        'val': 'val/images',
+    }
     if test_files:
-        yaml_lines.append("test: ../test/images")
-    yaml_lines.append(f"nc: {len(classes)}")
+        yaml_data['test'] = 'test/images'
     
-    # Format names as ['Class1', 'Class2', ...]
-    names_str = "[" + ", ".join(f"'{c}'" for c in classes) + "]"
-    yaml_lines.append(f"names: {names_str}")
+    yaml_data['nc'] = len(classes)
+    # Names as dict {0: 'class'} — Ultralytics preferred format
+    yaml_data['names'] = {i: name for i, name in enumerate(classes)}
     
     with open(os.path.join(temp_root, "data.yaml"), 'w') as f:
-        f.write("\n".join(yaml_lines) + "\n")
+        yaml.dump(yaml_data, f, sort_keys=False)
         
     # Zip it
     try:

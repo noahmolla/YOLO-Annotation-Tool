@@ -11,6 +11,8 @@ A modern, feature-rich Python application for annotating images using YOLO model
 
 - 🎯 **Auto-annotation** - Use YOLO models to automatically detect and annotate objects
 - ✏️ **Manual annotation** - Intuitive click-and-drag bounding box creation
+- ✂️ **Segmentation mode** - Polygon annotation for instance segmentation (YOLO seg format)
+- 🔍 **Zoom & Pan** - Scroll wheel zoom centered on cursor, middle-drag pan, spacebar reset
 - 🎨 **Modern UI** - Dark theme with ttkbootstrap styling
 - ⌨️ **Keyboard shortcuts** - Fast workflow with hotkeys (1-9 for classes, R to repeat, etc.)
 - 💾 **Auto-save** - Annotations saved automatically when navigating
@@ -95,17 +97,42 @@ For auto-annotation:
    - `.pt` - PyTorch models (YOLOv5, v8, v11, etc.)
    - `.tflite` - TensorFlow Lite models
 
-### Annotating Images
+### Annotating Images (Detection Mode)
 
 | Action | Method |
 |--------|--------|
 | Create box | Click and drag on canvas |
 | Delete box | Right-click on box |
+| Change class | **Ctrl+Right-click** on annotation |
+| Copy annotation | **Ctrl+C** (selected or under cursor) |
+| Paste annotation | **Ctrl+V** (with slight offset) |
 | Select class | Click in class list OR press 1-9 keys |
 | Move box | Click and drag existing box |
-| Resize box | Drag box edges/corners |
+| Resize box | Drag box edges/corners (Edit Mode) |
 | Repeat last box | Press **R** |
 | Auto-annotate | Press **Q** or click "Current" button |
+
+### Annotating Images (Segmentation Mode)
+
+Switch to **Segmentation** mode using the Mode selector in the toolbar.
+
+| Action | Method |
+|--------|--------|
+| Add point | Click on canvas |
+| Close polygon | Click near green circle (first point) or double-click |
+| Cancel polygon | Right-click or **Esc** |
+| Undo last point | **Backspace** |
+| Move polygon | Click and drag existing polygon |
+| Delete polygon | Right-click on polygon |
+
+### Zoom & Pan
+
+| Key | Action |
+|-----|--------|
+| **Scroll Up** | Zoom in toward cursor |
+| **Scroll Down** | Zoom out from cursor |
+| **Space** | Reset zoom to fit image |
+| **Middle-drag** | Pan when zoomed in |
 
 ### Navigation
 
@@ -135,12 +162,16 @@ For auto-annotation:
 Annotations are saved in **YOLO format**:
 - Location: `labels/` folder (parallel to `images/`)
 - File format: One `.txt` file per image with same name
-- Content: `class_id x_center y_center width height` (normalized 0-1)
 
-**Example (`image001.txt`):**
+**Detection format:** `class_id x_center y_center width height` (normalized 0-1)
 ```
 0 0.453125 0.634375 0.21875 0.5125
 1 0.7125 0.34375 0.15 0.2875
+```
+
+**Segmentation format:** `class_id x1 y1 x2 y2 ... xn yn` (normalized 0-1 polygon vertices)
+```
+0 0.12 0.34 0.56 0.34 0.78 0.67 0.45 0.89 0.12 0.67
 ```
 
 ---

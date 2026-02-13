@@ -1,10 +1,15 @@
+"""
+TFLite Model Inference Module
+Handles YOLO model inference using TensorFlow Lite runtime.
+"""
+
 try:
     import tensorflow.lite as tflite
 except ImportError:
     try:
         import tflite_runtime.interpreter as tflite
     except ImportError:
-        print("Error: neither 'tensorflow' nor 'tflite_runtime' found. Please install one of them.")
+        print("Error: neither 'tensorflow' nor 'tflite_runtime' found. Please install one.")
         raise
 
 import numpy as np
