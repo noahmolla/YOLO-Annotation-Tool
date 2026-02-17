@@ -5171,7 +5171,7 @@ class AnnotatorApp:
                  bootstyle="secondary").pack(side=RIGHT, padx=5)
 
     def show_320_export_dialog(self):
-        """Show dialog for creating a 320x320 pallet-only dataset."""
+        """Show dialog for creating a resized, single-class YOLO dataset export."""
         if not self.workspace_path:
             messagebox.showwarning("No Workspace", "Please load a workspace first.")
             return
@@ -5180,34 +5180,33 @@ class AnnotatorApp:
             return
         
         dialog = tb.Toplevel(self.root)
-        dialog.title("320px Pallet Export")
-        dialog.geometry("550x480")  # Larger to ensure Export button is visible
+        dialog.title("YOLO Dataset Export")
+        dialog.geometry("580x620")
         dialog.transient(self.root)
         dialog.grab_set()
         
         # Header
-        tb.Label(dialog, text="📦 Create 320x320 Pallet Dataset", font=("Arial", 14, "bold")).pack(pady=10)
-        tb.Label(dialog, text="Resize images to 320x320 and keep only class 0 (pallet) labels", 
+        tb.Label(dialog, text="📦 YOLO Dataset Export", font=("Arial", 14, "bold")).pack(pady=10)
+        tb.Label(dialog, text="Resize images and export as a YOLO-format dataset", 
                 font=("Arial", 9)).pack()
         
         # Options frame
         options_frame = tb.Labelframe(dialog, text="Options", padding=15)
-        options_frame.pack(fill=X, padx=20, pady=15)
+        options_frame.pack(fill=X, padx=20, pady=10)
         
         # Resolution
         res_frame = tb.Frame(options_frame)
-        res_frame.pack(fill=X, pady=5)
+        res_frame.pack(fill=X, pady=3)
         tb.Label(res_frame, text="Output Resolution:").pack(side=LEFT)
         res_var = tk.StringVar(value="320")
         res_combo = tb.Combobox(res_frame, values=["320", "416", "512", "640"], 
                                 textvariable=res_var, width=8, state="readonly")
         res_combo.pack(side=LEFT, padx=10)
-        tb.Label(res_frame, text="x").pack(side=LEFT)
-        tb.Label(res_frame, text="(square)").pack(side=LEFT, padx=5)
+        tb.Label(res_frame, text="x (square)").pack(side=LEFT)
         
         # Class to keep
         class_frame = tb.Frame(options_frame)
-        class_frame.pack(fill=X, pady=5)
+        class_frame.pack(fill=X, pady=3)
         tb.Label(class_frame, text="Keep only class:").pack(side=LEFT)
         class_var = tk.StringVar(value="0")
         if self.classes:
@@ -5222,14 +5221,41 @@ class AnnotatorApp:
         
         # Include negative examples
         include_negative_var = tk.BooleanVar(value=True)
-        tb.Checkbutton(options_frame, text="Include negative examples (images with no class 0)", 
-                      variable=include_negative_var).pack(anchor=W, pady=5)
+        tb.Checkbutton(options_frame, text="Include negative examples (images with no matching class)", 
+                      variable=include_negative_var).pack(anchor=W, pady=3)
         
-        # Output directory - default to parent folder with workspace_name_320
+        # --- Format options ---
+        format_frame = tb.Labelframe(dialog, text="Export Format", padding=15)
+        format_frame.pack(fill=X, padx=20, pady=5)
+        
+        # Folder structure: flat vs train/val split
+        structure_var = tk.StringVar(value="flat")
+        struct_row1 = tb.Frame(format_frame)
+        struct_row1.pack(fill=X, pady=2)
+        tb.Radiobutton(struct_row1, text="Flat (images/ + labels/)", 
+                       variable=structure_var, value="flat").pack(side=LEFT)
+        
+        struct_row2 = tb.Frame(format_frame)
+        struct_row2.pack(fill=X, pady=2)
+        tb.Radiobutton(struct_row2, text="Train/Val split", 
+                       variable=structure_var, value="split").pack(side=LEFT)
+        
+        # Split ratio
+        split_pct_var = tk.IntVar(value=80)
+        tb.Label(struct_row2, text="   Train %:").pack(side=LEFT, padx=(10, 0))
+        split_spin = tb.Spinbox(struct_row2, from_=50, to=95, increment=5, 
+                                textvariable=split_pct_var, width=5)
+        split_spin.pack(side=LEFT, padx=5)
+        
+        # Zip option  
+        zip_var = tk.BooleanVar(value=False)
+        tb.Checkbutton(format_frame, text="Create .zip file after export", 
+                      variable=zip_var).pack(anchor=W, pady=3)
+        
+        # Output directory
         out_frame = tb.Labelframe(dialog, text="Output Location", padding=10)
-        out_frame.pack(fill=X, padx=20, pady=10)
+        out_frame.pack(fill=X, padx=20, pady=5)
         
-        # Create default path: parent_folder/workspace_name_320
         workspace_name = os.path.basename(self.workspace_path)
         parent_folder = os.path.dirname(self.workspace_path)
         default_out = os.path.join(parent_folder, f"{workspace_name}_320")
@@ -5249,12 +5275,15 @@ class AnnotatorApp:
         # Progress
         progress_var = tk.StringVar(value="Ready to export")
         progress_label = tb.Label(dialog, textvariable=progress_var, font=("Consolas", 9))
-        progress_label.pack(pady=10)
+        progress_label.pack(pady=5)
         
         progress_bar = tb.Progressbar(dialog, mode='determinate', length=400)
-        progress_bar.pack(padx=20, pady=5)
+        progress_bar.pack(padx=20, pady=3)
         
         def do_export():
+            import random
+            import shutil
+            
             out_dir = out_path_var.get()
             if not out_dir:
                 messagebox.showerror("Error", "Please select output directory")
@@ -5268,113 +5297,191 @@ class AnnotatorApp:
             
             # Get class to keep
             keep_class = 0
+            keep_class_name = "class_0"
             if class_combo and self.classes:
                 try:
                     keep_class = class_combo.current()
+                    keep_class_name = self.classes[keep_class]
                 except:
                     keep_class = 0
+                    keep_class_name = self.classes[0] if self.classes else "class_0"
             else:
                 try:
                     keep_class = int(class_var.get())
+                    keep_class_name = self.classes[keep_class] if keep_class < len(self.classes) else f"class_{keep_class}"
                 except:
                     keep_class = 0
+                    keep_class_name = self.classes[0] if self.classes else "class_0"
             
             include_negative = include_negative_var.get()
+            use_split = structure_var.get() == "split"
+            split_pct = split_pct_var.get() / 100.0
+            create_zip = zip_var.get()
             
-            # Create output directories
-            out_img_dir = os.path.join(out_dir, "images")
-            out_lbl_dir = os.path.join(out_dir, "labels")
-            os.makedirs(out_img_dir, exist_ok=True)
-            os.makedirs(out_lbl_dir, exist_ok=True)
+            # Create output directory structure
+            os.makedirs(out_dir, exist_ok=True)
             
-            # Process images
+            if use_split:
+                train_img_dir = os.path.join(out_dir, "train", "images")
+                train_lbl_dir = os.path.join(out_dir, "train", "labels")
+                val_img_dir = os.path.join(out_dir, "val", "images")
+                val_lbl_dir = os.path.join(out_dir, "val", "labels")
+                os.makedirs(train_img_dir, exist_ok=True)
+                os.makedirs(train_lbl_dir, exist_ok=True)
+                os.makedirs(val_img_dir, exist_ok=True)
+                os.makedirs(val_lbl_dir, exist_ok=True)
+            else:
+                out_img_dir = os.path.join(out_dir, "images")
+                out_lbl_dir = os.path.join(out_dir, "labels")
+                os.makedirs(out_img_dir, exist_ok=True)
+                os.makedirs(out_lbl_dir, exist_ok=True)
+            
+            # First pass: collect valid images and their labels
             total = len(self.image_paths)
-            processed = 0
-            with_class = 0
-            negative = 0
-            errors = []
+            export_items = []  # (img_path, kept_label_lines)
             
             progress_bar['maximum'] = total
             
             for i, img_path in enumerate(self.image_paths):
                 progress_bar['value'] = i + 1
-                progress_var.set(f"Processing {i+1}/{total}: {os.path.basename(img_path)}")
-                dialog.update()
+                progress_var.set(f"Scanning {i+1}/{total}: {os.path.basename(img_path)}")
+                if i % 20 == 0:
+                    dialog.update()
                 
-                try:
-                    # Read and resize image
-                    img = Image.open(img_path)
-                    # Convert RGBA/P to RGB for JPEG compatibility
-                    if img.mode in ('RGBA', 'P', 'LA'):
-                        # Create white background and paste image on it
-                        background = Image.new('RGB', img.size, (255, 255, 255))
-                        if img.mode == 'P':
-                            img = img.convert('RGBA')
-                        background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-                        img = background
-                    elif img.mode != 'RGB':
-                        img = img.convert('RGB')
-                    img_resized = img.resize((resolution, resolution), Image.Resampling.LANCZOS)
-                    
-                    # Get output paths - preserve original filename and extension
-                    original_filename = os.path.basename(img_path)
-                    name = os.path.splitext(original_filename)[0]
-                    ext = os.path.splitext(original_filename)[1].lower()
-                    out_img_path = os.path.join(out_img_dir, original_filename)  # Keep exact name
-                    out_lbl_path = os.path.join(out_lbl_dir, f"{name}.txt")
-                    
-                    # Read and filter labels
-                    lbl_path = self._get_label_path(img_path)
-                    kept_lines = []
-                    if os.path.exists(lbl_path):
-                        with open(lbl_path, 'r') as f:
-                            for line in f:
-                                parts = line.strip().split()
-                                if len(parts) >= 5:
-                                    try:
-                                        cls_id = int(float(parts[0]))
-                                        if cls_id == keep_class:
-                                            # Rewrite as class 0
-                                            kept_lines.append(f"0 {parts[1]} {parts[2]} {parts[3]} {parts[4]}")
-                                    except:
-                                        pass
-                    
-                    # Check if we should include this image
-                    if not kept_lines and not include_negative:
-                        continue  # Skip negative examples
-                    
-                    # Save image in original format
-                    if ext in ('.jpg', '.jpeg'):
-                        img_resized.save(out_img_path, "JPEG", quality=95)
-                    elif ext == '.png':
-                        img_resized.save(out_img_path, "PNG")
-                    else:
-                        img_resized.save(out_img_path)  # Let PIL figure it out
-                    
-                    # Save label
-                    with open(out_lbl_path, 'w') as f:
-                        if kept_lines:
-                            f.write("\n".join(kept_lines) + "\n")
-                            with_class += 1
-                        else:
-                            f.write("")  # Empty file for negative example
-                            negative += 1
-                    
+                # Read and filter labels
+                lbl_path = self._get_label_path(img_path)
+                kept_lines = []
+                if os.path.exists(lbl_path):
+                    with open(lbl_path, 'r') as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) >= 5:
+                                try:
+                                    cls_id = int(float(parts[0]))
+                                    if cls_id == keep_class:
+                                        # Remap to class 0, keep coordinates
+                                        coords = " ".join(parts[1:])
+                                        kept_lines.append(f"0 {coords}")
+                                except:
+                                    pass
+                
+                if kept_lines or include_negative:
+                    export_items.append((img_path, kept_lines))
+            
+            # Shuffle and split if needed
+            if use_split:
+                random.shuffle(export_items)
+                split_idx = int(len(export_items) * split_pct)
+                train_items = export_items[:split_idx]
+                val_items = export_items[split_idx:]
+                batches = [
+                    (train_items, os.path.join(out_dir, "train", "images"), os.path.join(out_dir, "train", "labels")),
+                    (val_items, os.path.join(out_dir, "val", "images"), os.path.join(out_dir, "val", "labels")),
+                ]
+            else:
+                batches = [
+                    (export_items, os.path.join(out_dir, "images"), os.path.join(out_dir, "labels")),
+                ]
+            
+            # Second pass: resize and save
+            processed = 0
+            with_class = 0
+            negative = 0
+            errors = []
+            total_export = len(export_items)
+            progress_bar['maximum'] = total_export
+            
+            for items, img_dir, lbl_dir in batches:
+                for img_path, kept_lines in items:
                     processed += 1
+                    progress_bar['value'] = processed
+                    progress_var.set(f"Exporting {processed}/{total_export}: {os.path.basename(img_path)}")
+                    if processed % 10 == 0:
+                        dialog.update()
                     
-                except Exception as e:
-                    errors.append(f"{os.path.basename(img_path)}: {str(e)}")
+                    try:
+                        img = Image.open(img_path)
+                        # Convert to RGB
+                        if img.mode in ('RGBA', 'P', 'LA'):
+                            background = Image.new('RGB', img.size, (255, 255, 255))
+                            if img.mode == 'P':
+                                img = img.convert('RGBA')
+                            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                            img = background
+                        elif img.mode != 'RGB':
+                            img = img.convert('RGB')
+                        img_resized = img.resize((resolution, resolution), Image.Resampling.LANCZOS)
+                        
+                        original_filename = os.path.basename(img_path)
+                        name = os.path.splitext(original_filename)[0]
+                        ext = os.path.splitext(original_filename)[1].lower()
+                        
+                        out_img_path = os.path.join(img_dir, original_filename)
+                        out_lbl_path = os.path.join(lbl_dir, f"{name}.txt")
+                        
+                        # Save image
+                        if ext in ('.jpg', '.jpeg'):
+                            img_resized.save(out_img_path, "JPEG", quality=95)
+                        elif ext == '.png':
+                            img_resized.save(out_img_path, "PNG")
+                        else:
+                            img_resized.save(out_img_path)
+                        
+                        # Save label
+                        with open(out_lbl_path, 'w') as f:
+                            if kept_lines:
+                                f.write("\n".join(kept_lines) + "\n")
+                                with_class += 1
+                            else:
+                                f.write("")
+                                negative += 1
+                        
+                    except Exception as e:
+                        errors.append(f"{os.path.basename(img_path)}: {str(e)}")
+            
+            # Write data.yaml
+            progress_var.set("Writing data.yaml...")
+            dialog.update()
+            
+            yaml_path = os.path.join(out_dir, "data.yaml")
+            yaml_data = {
+                'nc': 1,
+                'names': {0: keep_class_name},
+            }
+            if use_split:
+                yaml_data['train'] = './train/images'
+                yaml_data['val'] = './val/images'
+            else:
+                yaml_data['train'] = './images'
+                yaml_data['val'] = './images'
+            
+            import yaml
+            with open(yaml_path, 'w') as f:
+                yaml.dump(yaml_data, f, sort_keys=False)
+            
+            # Create zip if requested
+            zip_path = None
+            if create_zip:
+                progress_var.set("Creating zip file...")
+                dialog.update()
+                zip_path = out_dir + ".zip"
+                shutil.make_archive(out_dir, 'zip', os.path.dirname(out_dir), os.path.basename(out_dir))
             
             # Summary
-            progress_var.set(f"Done! Processed {processed} images")
+            progress_var.set(f"Done! Exported {processed} images")
             
             msg = f"✅ Export Complete!\n\n"
-            msg += f"📁 Output: {out_dir}\n\n"
-            msg += f"📊 Statistics:\n"
-            msg += f"   Total processed: {processed}\n"
-            msg += f"   With class {keep_class}: {with_class}\n"
+            msg += f"📁 Output: {out_dir}\n"
+            if zip_path:
+                msg += f"📦 Zip: {zip_path}\n"
+            msg += f"\n📊 Statistics:\n"
+            msg += f"   Total exported: {processed}\n"
+            msg += f"   With {keep_class_name} (class {keep_class}): {with_class}\n"
             msg += f"   Negative examples: {negative}\n"
             msg += f"   Resolution: {resolution}x{resolution}\n"
+            if use_split:
+                msg += f"   Train: {len(train_items)}  |  Val: {len(val_items)}\n"
+            msg += f"   data.yaml: ✓ (class 0 = {keep_class_name})\n"
             
             if errors:
                 msg += f"\n⚠️ Errors: {len(errors)}\n"
@@ -5388,7 +5495,7 @@ class AnnotatorApp:
         
         # Buttons
         button_frame = tb.Frame(dialog)
-        button_frame.pack(fill=X, padx=20, pady=15)
+        button_frame.pack(fill=X, padx=20, pady=10)
         
         tb.Button(button_frame, text="Export", command=do_export, 
                  bootstyle="success").pack(side=LEFT, padx=5)
