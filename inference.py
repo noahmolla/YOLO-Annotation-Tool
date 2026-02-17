@@ -14,13 +14,20 @@ except ImportError:
 
 import numpy as np
 import cv2
+import os
 
 class TFLiteModel:
     def __init__(self, model_path):
         """
-        Initialize the TFLite interpreter.
+        Initialize the TFLite interpreter with multi-threaded CPU execution.
         """
-        self.interpreter = tflite.Interpreter(model_path=model_path)
+        if tflite is None:
+            raise ImportError(
+                "TFLite runtime not found. Install tensorflow or tflite-runtime:\n"
+                "  pip install tensorflow  OR  pip install tflite-runtime"
+            )
+        num_threads = os.cpu_count() or 4
+        self.interpreter = tflite.Interpreter(model_path=model_path, num_threads=num_threads)
         self.interpreter.allocate_tensors()
 
         self.input_details = self.interpreter.get_input_details()

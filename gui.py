@@ -13,8 +13,11 @@ from PIL import Image, ImageTk, ImageDraw, ImageFile
 import os
 import glob
 import random
+import threading
+import time
 import numpy as np
 import json
+import cv2
 from inference import TFLiteModel
 import utils
 
@@ -61,6 +64,10 @@ class AnnotatorApp:
         # --- Interaction State ---
         self.selected_class_id = 0
         self.filter_mode = "All"        # Filter mode string
+        self.custom_query_paths = None  # Set of paths matching last custom query
+        self.last_query_conditions = [] # Saved query conditions for re-opening dialog
+        self.suspicious_include_tiny = False  # Whether to flag tiny annotations as suspicious
+        self.suspicious_tiny_exclude_classes = set()  # Classes to ignore for tiny check
         
         self.drag_mode = None          # None, "create", "move", "resize"
         self.start_x = 0
@@ -446,6 +453,15 @@ class AnnotatorApp:
         tb.Label(stats_frame, textvariable=self.stats_annotated_var, font=("Consolas", 9)).pack(anchor=W)
         tb.Label(stats_frame, textvariable=self.stats_boxes_var, font=("Consolas", 9)).pack(anchor=W)
         tb.Label(stats_frame, textvariable=self.stats_classes_var, font=("Consolas", 9)).pack(anchor=W)
+        
+        # Current image annotation stats
+        ttk.Separator(stats_frame, orient=HORIZONTAL).pack(fill=X, pady=5)
+        self.stats_current_img_var = tk.StringVar(value="This Image: —")
+        tb.Label(stats_frame, textvariable=self.stats_current_img_var, font=("Consolas", 9, "bold")).pack(anchor=W)
+        self.stats_current_classes_var = tk.StringVar(value="")
+        self.stats_current_classes_label = tb.Label(stats_frame, textvariable=self.stats_current_classes_var, 
+                                                      font=("Consolas", 8), foreground="#aaa", wraplength=250, justify=LEFT)
+        self.stats_current_classes_label.pack(anchor=W)
 
         self.file_list = tk.Listbox(file_frame, selectmode=tk.EXTENDED,
                                     bg="#222", fg="#eee", bd=0, highlightthickness=0, font=("Consolas", 9),
@@ -701,6 +717,7 @@ class AnnotatorApp:
         # Reset filter to "All" when reloading to prevent stale filters
         self.filter_mode = "All"
         self.filter_combo.set("All")
+        self.custom_query_paths = None
         
         self._refresh_file_list()
         if self.image_paths:
@@ -1473,6 +1490,9 @@ class AnnotatorApp:
         norm_path = os.path.normpath(img_path)
         if norm_path in self.image_to_classes_cache:
             del self.image_to_classes_cache[norm_path]
+        # Remove from custom query paths if active
+        if self.custom_query_paths and img_path in self.custom_query_paths:
+            self.custom_query_paths.discard(img_path)
         
         # Clear state to prevent 'save_annotations' from resurrecting the labels
         self.current_image = None
@@ -1804,6 +1824,10 @@ class AnnotatorApp:
             # Filter logic based on mode
             if self.filter_mode == "All":
                 pass  # No filter
+            elif self.filter_mode in ("Custom Query", "🔍 Query Active"):
+                # Custom query - use saved path set
+                if self.custom_query_paths and p not in self.custom_query_paths:
+                    continue
             elif self.filter_mode == "Unannotated":
                 if cache:  # Has annotations, skip
                     continue
@@ -1918,6 +1942,47 @@ class AnnotatorApp:
                 return True
         return False
 
+    def _is_duplicate_or_overlapping(self, new_ann, existing_annotations, iou_threshold=0.3, coord_tolerance=0.02):
+        """Check if a new annotation duplicates or significantly overlaps any existing one.
+        
+        Uses two checks:
+        1. Near-exact coordinate match (catches subtle duplicates)
+        2. IoU overlap check (catches overlapping boxes of same class)
+        
+        Returns True if the annotation should be skipped.
+        """
+        new_box = (new_ann[1], new_ann[2], new_ann[3], new_ann[4])
+        for ann in existing_annotations:
+            if ann[0] != new_ann[0]:  # Different class - allow overlap
+                continue
+            # Check 1: Near-exact coordinate match
+            if (abs(ann[1] - new_ann[1]) < coord_tolerance and
+                abs(ann[2] - new_ann[2]) < coord_tolerance and
+                abs(ann[3] - new_ann[3]) < coord_tolerance and
+                abs(ann[4] - new_ann[4]) < coord_tolerance):
+                return True
+            # Check 2: Significant IoU overlap
+            existing_box = (ann[1], ann[2], ann[3], ann[4])
+            if self._boxes_overlap(new_box, existing_box, threshold=iou_threshold):
+                return True
+        return False
+
+    def _load_annotations_from_file(self, label_path):
+        """Load annotations from a label file. Returns list of [cid, cx, cy, w, h]."""
+        annotations = []
+        if os.path.exists(label_path):
+            with open(label_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        try:
+                            cid = int(parts[0])
+                            coords = [float(p) for p in parts[1:]]
+                            annotations.append([cid] + coords)
+                        except:
+                            pass
+        return annotations
+
     def on_filter_changed(self, event):
         # Save before list changes/invalidation
         if self.current_image:
@@ -1933,6 +1998,10 @@ class AnnotatorApp:
 
         val = self.filter_combo.get()
         self.filter_mode = val
+        
+        # Clear custom query paths when switching to a normal filter
+        if val != "🔍 Query Active":
+            self.custom_query_paths = None
         
         # Rebuild cache to ensure filter uses fresh annotation data
         # This is crucial for filters like "Unannotated" and "Missing: X" to work correctly
@@ -2503,6 +2572,8 @@ class AnnotatorApp:
         pasted = 0
         removed = 0
         if self.repeat_clipboard:
+            # Save state for undo BEFORE pasting
+            self._push_annotation_undo()
             for new_ann in self.repeat_clipboard:
                 # Find and remove any overlapping annotations of the same class
                 new_box = (new_ann[1], new_ann[2], new_ann[3], new_ann[4])
@@ -2906,6 +2977,9 @@ class AnnotatorApp:
             
         if self.crosshair_lines:
             self.canvas.tag_raise("crosshair")
+        
+        # Update current image annotation stats
+        self._update_current_image_stats()
 
     def draw_annotation(self, index, ann):
         """Draw a single annotation - either bounding box or segmentation polygon."""
@@ -4194,51 +4268,60 @@ class AnnotatorApp:
                  bootstyle="primary", width=12).pack(side=RIGHT, padx=5)
 
     def auto_annotate_current(self):
+        """Auto-annotate the current image with class selection dialog."""
         if not self.model or not self.current_image:
              messagebox.showerror("Error", "Load Model and Image first.")
              return
         
-        # Ask for classes
         allowed_classes = self._select_classes_dialog()
-        if allowed_classes is None: return # Cancelled
+        if allowed_classes is None: return
+        
+        self._push_annotation_undo()
         
         ver = self.model_ver_combo.get()
-        # Run inference with default confidence (we'll filter per-class later)
         try:
             boxes, classes, scores = self.model.predict(
                 np.array(self.current_image), 
-                confidence_threshold=0.01,  # Use low threshold, filter later
+                confidence_threshold=0.01,
                 iou_threshold=self.iou_threshold,
                 version=ver
             )
             
             added = 0
+            skipped_dupes = 0
             for b, c, s in zip(boxes, classes, scores):
                 class_id = int(c)
                 
-                # Check if class is allowed
                 if class_id not in allowed_classes: 
                     continue
                 
-                # Get confidence threshold for this class
                 threshold = self.class_confidence_thresholds.get(class_id, self.default_confidence_threshold)
-                
-                # Filter by per-class confidence
                 if s < threshold:
                     continue
                 
-                # b is [cx, cy, w, h] norm
-                self.annotations.append([class_id, b[0], b[1], b[2], b[3]])
-                added += 1
+                new_ann = [class_id, b[0], b[1], b[2], b[3]]
                 
-            self.save_annotations()
+                # Skip if duplicate or overlapping existing annotation
+                if self._is_duplicate_or_overlapping(new_ann, self.annotations):
+                    skipped_dupes += 1
+                    continue
+                
+                self.annotations.append(new_ann)
+                added += 1
+            
+            if added > 0:
+                self.annotations_dirty = True
+                self.save_annotations()
             self.redraw()
-            self.status_var.set(f"Auto-Annotate: Added {added} boxes.")
+            msg = f"Auto-Annotate: Added {added} boxes"
+            if skipped_dupes > 0:
+                msg += f" (skipped {skipped_dupes} duplicates)"
+            self.status_var.set(msg)
         except Exception as e:
             messagebox.showerror("Inference Error", str(e))
 
     def auto_annotate_quick(self):
-        """Quick auto-annotate current image with ALL classes - no dialog, single keypress."""
+        """Quick auto-annotate current image with ALL classes - no dialog."""
         if not self.model:
             self.status_var.set("No model loaded - press Load Model first")
             return
@@ -4246,87 +4329,312 @@ class AnnotatorApp:
             self.status_var.set("No image loaded")
             return
         
-        # Use all defined classes
         allowed_classes = set(range(len(self.classes))) if self.classes else set(range(100))
+        
+        self._push_annotation_undo()
         
         ver = self.model_ver_combo.get()
         try:
             boxes, classes, scores = self.model.predict(
                 np.array(self.current_image), 
-                confidence_threshold=0.01,  # Use low threshold, filter later
+                confidence_threshold=0.01,
                 iou_threshold=self.iou_threshold,
                 version=ver
             )
             
             added = 0
+            skipped_dupes = 0
             for b, c, s in zip(boxes, classes, scores):
                 class_id = int(c)
                 
                 if class_id not in allowed_classes:
                     continue
                 
-                # Get confidence threshold for this class
                 threshold = self.class_confidence_thresholds.get(class_id, self.default_confidence_threshold)
-                
-                # Filter by per-class confidence
                 if s < threshold:
                     continue
                 
-                # b is [cx, cy, w, h] norm
-                self.annotations.append([class_id, b[0], b[1], b[2], b[3]])
-                added += 1
+                new_ann = [class_id, b[0], b[1], b[2], b[3]]
                 
-            self.save_annotations()
+                # Skip if duplicate or overlapping existing annotation
+                if self._is_duplicate_or_overlapping(new_ann, self.annotations):
+                    skipped_dupes += 1
+                    continue
+                
+                self.annotations.append(new_ann)
+                added += 1
+            
+            if added > 0:
+                self.annotations_dirty = True
+                self.save_annotations()
             self.redraw()
-            self.status_var.set(f"Quick Auto-Annotate: Added {added} boxes")
+            msg = f"Quick Auto-Annotate: Added {added} boxes"
+            if skipped_dupes > 0:
+                msg += f" (skipped {skipped_dupes} duplicates)"
+            self.status_var.set(msg)
         except Exception as e:
             self.status_var.set(f"Auto-annotate error: {e}")
 
     def auto_annotate_all(self):
+        """Auto-annotate all images in the workspace with mode selection (threaded)."""
         if not self.model: return
-        if not messagebox.askyesno("Process All", f"Process {len(self.image_paths)} images?"): return
         
-        # Ask for classes
         allowed_classes = self._select_classes_dialog()
-        if allowed_classes is None: return # Cancelled
+        if allowed_classes is None: return
         
+        # --- Mode Selection Dialog ---
+        mode_dlg = tb.Toplevel(self.root)
+        mode_dlg.title("Auto-Annotate All Images")
+        mode_dlg.geometry("420x280")
+        mode_dlg.transient(self.root)
+        mode_dlg.grab_set()
+        
+        tb.Label(mode_dlg, text="Auto-Annotate Mode", font=("Arial", 13, "bold")).pack(pady=(15, 10))
+        tb.Label(mode_dlg, text=f"{len(self.image_paths)} images in workspace", 
+                font=("Arial", 10), foreground="#888").pack(pady=(0, 10))
+        
+        mode_var = tk.StringVar(value="add_missing")
+        
+        modes = [
+            ("add_missing", "Add Missing (skip duplicates)", 
+             "Detect new objects and add them, skipping any that overlap existing annotations."),
+            ("unannotated_only", "Only Unannotated Images", 
+             "Only process images that have no existing annotations at all."),
+            ("overwrite", "Overwrite Selected Classes", 
+             "Replace annotations of selected classes with new detections. Other classes are preserved."),
+        ]
+        
+        for value, label, desc in modes:
+            frame = tb.Frame(mode_dlg)
+            frame.pack(fill=X, padx=20, pady=2)
+            tb.Radiobutton(frame, text=label, variable=mode_var, value=value).pack(anchor=W)
+            tb.Label(frame, text=desc, font=("Arial", 8), foreground="#888", wraplength=360).pack(anchor=W, padx=20)
+        
+        result = {'mode': None}
+        
+        def on_start():
+            result['mode'] = mode_var.get()
+            mode_dlg.destroy()
+        
+        def on_cancel():
+            mode_dlg.destroy()
+        
+        btn_frame = tb.Frame(mode_dlg)
+        btn_frame.pack(fill=X, padx=20, pady=15)
+        tb.Button(btn_frame, text="Start", command=on_start, bootstyle="primary", width=12).pack(side=RIGHT, padx=5)
+        tb.Button(btn_frame, text="Cancel", command=on_cancel, bootstyle="secondary-outline", width=12).pack(side=RIGHT, padx=5)
+        
+        self.root.wait_window(mode_dlg)
+        
+        mode = result['mode']
+        if mode is None:
+            return  # Cancelled
+        
+        # Save current image first if dirty
+        if self.current_image and self.current_file_path and self.annotations_dirty:
+            self.save_annotations(force=True)
+        
+        # --- Snapshot settings for the worker thread ---
         ver = self.model_ver_combo.get()
-        cnt = 0
+        iou_thresh = self.iou_threshold
+        conf_thresholds = dict(self.class_confidence_thresholds)
+        default_conf = self.default_confidence_threshold
+        image_paths = list(self.image_paths)
+        model = self.model
+        
+        # --- Progress dialog with cancel ---
         top = tb.Toplevel(self.root)
         top.title("Auto Annotating...")
-        pb = tb.Progressbar(top, maximum=len(self.image_paths))
-        pb.pack(fill=X, padx=20, pady=20)
-        lbl_status = tb.Label(top, text="Starting...")
-        lbl_status.pack(pady=5)
+        top.geometry("480x160")
+        top.transient(self.root)
+        top.protocol("WM_DELETE_WINDOW", lambda: None)  # Prevent close via X
         
-
-        for i, p in enumerate(self.image_paths):
-            try:
-                img = Image.open(p)
-                lbl = self._get_label_path(p)
-                
-                # Inference
-                boxes, classes, scores = self.model.predict(np.array(img), version=ver)
-                
-                # Append detections to label file
-                os.makedirs(os.path.dirname(lbl), exist_ok=True)
-                with open(lbl, 'a') as f: 
-                     for b, c, s in zip(boxes, classes, scores):
-                         if int(c) in allowed_classes:
-                             f.write(f"{int(c)} {b[0]:.6f} {b[1]:.6f} {b[2]:.6f} {b[3]:.6f}\n")
-                             cnt += 1
-            except Exception as e: 
-                print(f"Error on {p}: {e}")
+        pb = tb.Progressbar(top, maximum=len(image_paths))
+        pb.pack(fill=X, padx=20, pady=(20, 5))
+        lbl_status = tb.Label(top, text="Starting...", font=("Consolas", 9))
+        lbl_status.pack(pady=2)
+        lbl_speed = tb.Label(top, text="", font=("Arial", 8), foreground="#888")
+        lbl_speed.pack(pady=0)
+        
+        cancel_flag = {'cancelled': False}
+        
+        def on_cancel_batch():
+            cancel_flag['cancelled'] = True
+            cancel_btn.config(state="disabled", text="Cancelling...")
+        
+        cancel_btn = tb.Button(top, text="Cancel", command=on_cancel_batch, bootstyle="danger-outline", width=14)
+        cancel_btn.pack(pady=8)
+        
+        # --- Shared state between worker and UI ---
+        progress = {'i': 0, 'cnt': 0, 'skipped_images': 0, 'skipped_dupes': 0, 
+                     'done': False, 'error': None, 'start_time': time.time()}
+        
+        def worker():
+            """Background thread: runs inference and writes label files."""
+            cnt = 0
+            skipped_images = 0
+            skipped_dupes = 0
             
-            if i % 5 == 0:
-                pb['value'] = i
-                lbl_status.config(text=f"Processed {i+1}/{len(self.image_paths)}")
-                top.update()
+            for i, p in enumerate(image_paths):
+                if cancel_flag['cancelled']:
+                    break
+                
+                try:
+                    lbl = self._get_label_path(p)
+                    
+                    # Load existing annotations for this image
+                    existing_anns = self._load_annotations_from_file(lbl)
+                    
+                    # Mode: unannotated_only - skip if already has annotations
+                    if mode == "unannotated_only" and existing_anns:
+                        skipped_images += 1
+                        progress['i'] = i + 1
+                        progress['skipped_images'] = skipped_images
+                        continue
+                    
+                    # Use cv2 for faster image loading (reads as BGR)
+                    img_bgr = cv2.imread(p)
+                    if img_bgr is None:
+                        # Fallback to PIL for unusual formats
+                        pil_img = Image.open(p)
+                        img_arr = np.array(pil_img)
+                    else:
+                        img_arr = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                    
+                    boxes, classes, scores = model.predict(
+                        img_arr,
+                        confidence_threshold=0.01,
+                        iou_threshold=iou_thresh,
+                        version=ver
+                    )
+                    
+                    # Filter and collect valid detections
+                    new_lines = []
+                    for b, c, s in zip(boxes, classes, scores):
+                        class_id = int(c)
+                        if class_id not in allowed_classes:
+                            continue
+                        threshold = conf_thresholds.get(class_id, default_conf)
+                        if s < threshold:
+                            continue
+                        
+                        new_ann = [class_id, b[0], b[1], b[2], b[3]]
+                        
+                        # Mode: add_missing - check against existing annotations
+                        if mode == "add_missing":
+                            if self._is_duplicate_or_overlapping(new_ann, existing_anns):
+                                skipped_dupes += 1
+                                continue
+                            # Also check against annotations we're about to add
+                            new_anns_so_far = [[int(l.split()[0])] + [float(x) for x in l.split()[1:]] for l in new_lines]
+                            if self._is_duplicate_or_overlapping(new_ann, new_anns_so_far):
+                                skipped_dupes += 1
+                                continue
+                        
+                        new_lines.append(f"{class_id} {b[0]:.6f} {b[1]:.6f} {b[2]:.6f} {b[3]:.6f}\n")
+                    
+                    if mode == "overwrite":
+                        preserved_lines = []
+                        if os.path.exists(lbl):
+                            with open(lbl, 'r') as f:
+                                for line in f:
+                                    parts = line.strip().split()
+                                    if len(parts) >= 5:
+                                        try:
+                                            cid = int(parts[0])
+                                            if cid not in allowed_classes:
+                                                preserved_lines.append(line if line.endswith('\n') else line + '\n')
+                                        except ValueError:
+                                            preserved_lines.append(line if line.endswith('\n') else line + '\n')
+                        all_lines = preserved_lines + new_lines
+                        if all_lines:
+                            os.makedirs(os.path.dirname(lbl), exist_ok=True)
+                            with open(lbl, 'w') as f:
+                                f.writelines(all_lines)
+                            cnt += len(new_lines)
+                        elif os.path.exists(lbl) and not preserved_lines:
+                            with open(lbl, 'w') as f:
+                                pass
+                        else:
+                            skipped_images += 1
+                    elif new_lines:
+                        os.makedirs(os.path.dirname(lbl), exist_ok=True)
+                        with open(lbl, 'a') as f:
+                            f.writelines(new_lines)
+                        cnt += len(new_lines)
+                    else:
+                        skipped_images += 1
+                        
+                except Exception as e: 
+                    print(f"Error on {p}: {e}")
+                
+                # Update shared progress
+                progress['i'] = i + 1
+                progress['cnt'] = cnt
+                progress['skipped_images'] = skipped_images
+                progress['skipped_dupes'] = skipped_dupes
             
-        top.destroy()
-        self.status_var.set(f"Batch Done: Added {cnt} annotations.")
-        # Reload current to show changes
-        self.load_image(self.current_index)
+            progress['cnt'] = cnt
+            progress['skipped_images'] = skipped_images
+            progress['skipped_dupes'] = skipped_dupes
+            progress['done'] = True
+        
+        # Start worker thread
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        
+        # --- UI poll loop (runs on main thread) ---
+        def poll_progress():
+            i = progress['i']
+            cnt = progress['cnt']
+            total = len(image_paths)
+            
+            pb['value'] = i
+            lbl_status.config(text=f"Processed {i}/{total}  •  {cnt} annotations added")
+            
+            # Speed estimate
+            elapsed = time.time() - progress['start_time']
+            if i > 0 and elapsed > 0:
+                ips = i / elapsed
+                remaining = (total - i) / ips if ips > 0 else 0
+                mins, secs = divmod(int(remaining), 60)
+                lbl_speed.config(text=f"{ips:.1f} img/sec  •  ~{mins}m {secs}s remaining")
+            
+            if progress['done'] or cancel_flag['cancelled']:
+                # Worker finished — finalize
+                thread.join(timeout=2)
+                top.destroy()
+                
+                self._build_annotation_cache()
+                
+                cnt = progress['cnt']
+                skipped_dupes = progress['skipped_dupes']
+                skipped_images = progress['skipped_images']
+                
+                if cancel_flag['cancelled']:
+                    msg = f"Cancelled: Added {cnt} annotations ({progress['i']}/{total} processed)"
+                else:
+                    msg = f"Batch Done: Added {cnt} annotations"
+                if skipped_dupes > 0:
+                    msg += f", skipped {skipped_dupes} duplicates"
+                if skipped_images > 0:
+                    msg += f", {skipped_images} images unchanged"
+                self.status_var.set(msg)
+                
+                # Clear current image state so load_image doesn't save stale
+                # in-memory annotations back to disk (overwriting worker's results)
+                self.current_image = None
+                self.current_file_path = None
+                self.annotations = []
+                self.annotations_dirty = False
+                
+                self.load_image(self.current_index)
+                return
+            
+            # Poll again in 100ms
+            top.after(100, poll_progress)
+        
+        poll_progress()
 
     def reduce_dataset_dialog(self):
         if not self.workspace_path:
@@ -4602,8 +4910,16 @@ class AnnotatorApp:
             self._build_annotation_cache()  # Rebuild cache after cleanup
         self.load_image(self.current_index)
 
-    def _image_has_suspicious_annotations(self, img_path):
-        """Check if an image has suspicious annotations (tiny boxes or extreme overlapping)."""
+    def _image_has_suspicious_annotations(self, img_path, include_tiny=None, tiny_exclude_classes=None):
+        """Check if an image has suspicious annotations (optionally tiny boxes, and extreme overlapping).
+        
+        Args:
+            include_tiny: Override self.suspicious_include_tiny if provided.
+            tiny_exclude_classes: Override self.suspicious_tiny_exclude_classes if provided.
+        """
+        check_tiny = include_tiny if include_tiny is not None else self.suspicious_include_tiny
+        exclude_classes = tiny_exclude_classes if tiny_exclude_classes is not None else self.suspicious_tiny_exclude_classes
+        
         lbl_path = self._get_label_path(img_path)
         if not os.path.exists(lbl_path):
             return False
@@ -4624,10 +4940,13 @@ class AnnotatorApp:
             return False
         
         # Check for tiny annotations (area < 0.1% of image = 0.001 normalized)
-        for cid, cx, cy, w, h in annotations:
-            area = w * h
-            if area < 0.001:
-                return True
+        if check_tiny:
+            for cid, cx, cy, w, h in annotations:
+                if cid in exclude_classes:
+                    continue
+                area = w * h
+                if area < 0.001:
+                    return True
         
         # Check for extreme overlapping (IoU > 0.8 = nearly identical boxes)
         for i in range(len(annotations)):
@@ -4644,6 +4963,93 @@ class AnnotatorApp:
         if not self.workspace_path:
             messagebox.showerror("Error", "No workspace loaded.")
             return
+        
+        # --- Options dialog before scanning ---
+        opts_dlg = tb.Toplevel(self.root)
+        opts_dlg.title("Suspicious Scan Options")
+        opts_dlg.geometry("400x360")
+        opts_dlg.transient(self.root)
+        opts_dlg.grab_set()
+        
+        tb.Label(opts_dlg, text="Suspicious Scan Options", font=("Arial", 13, "bold")).pack(pady=(15, 5))
+        tb.Label(opts_dlg, text="Choose what to look for:", font=("Arial", 9), foreground="#888").pack(pady=(0, 10))
+        
+        # Always-on: extreme overlaps
+        always_frame = tb.Frame(opts_dlg)
+        always_frame.pack(fill=X, padx=20, pady=2)
+        tb.Label(always_frame, text="✓  Extreme overlaps (IoU > 0.8)", font=("Arial", 10)).pack(anchor=W)
+        tb.Label(always_frame, text="Always checked — nearly duplicate boxes", font=("Arial", 8), foreground="#888").pack(anchor=W, padx=18)
+        
+        # Tiny toggle
+        tiny_var = tk.BooleanVar(value=self.suspicious_include_tiny)
+        tiny_frame = tb.Frame(opts_dlg)
+        tiny_frame.pack(fill=X, padx=20, pady=(8, 2))
+        tb.Checkbutton(tiny_frame, text="Include tiny annotations (area < 0.1%)", variable=tiny_var,
+                       bootstyle="round-toggle").pack(anchor=W)
+        tb.Label(tiny_frame, text="Flag annotations with extremely small area", font=("Arial", 8), foreground="#888").pack(anchor=W, padx=18)
+        
+        # Class exclusion for tiny — only relevant when tiny is on
+        exclude_frame = tb.Labelframe(opts_dlg, text="Exclude classes from tiny check", padding=8)
+        exclude_frame.pack(fill=BOTH, expand=True, padx=20, pady=(8, 5))
+        
+        # Scrollable class list with checkbuttons
+        exclude_canvas = tk.Canvas(exclude_frame, bg="#1e1e1e", highlightthickness=0, height=100)
+        exclude_scroll = tb.Scrollbar(exclude_frame, orient=VERTICAL, command=exclude_canvas.yview)
+        exclude_inner = tb.Frame(exclude_canvas)
+        exclude_canvas.create_window((0, 0), window=exclude_inner, anchor=NW)
+        exclude_canvas.config(yscrollcommand=exclude_scroll.set)
+        exclude_scroll.pack(side=RIGHT, fill=Y)
+        exclude_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        
+        class_vars = {}
+        for i, cls_name in enumerate(self.classes):
+            var = tk.BooleanVar(value=(i in self.suspicious_tiny_exclude_classes))
+            class_vars[i] = var
+            cb = tb.Checkbutton(exclude_inner, text=f"{i}: {cls_name}", variable=var, bootstyle="danger")
+            cb.pack(anchor=W, padx=5, pady=1)
+        
+        def update_scroll(event=None):
+            exclude_canvas.configure(scrollregion=exclude_canvas.bbox("all"))
+        exclude_inner.bind("<Configure>", update_scroll)
+        
+        # Toggle tiny enables/disables the exclude frame
+        def on_tiny_toggle(*_):
+            state = "normal" if tiny_var.get() else "disabled"
+            for child in exclude_inner.winfo_children():
+                try:
+                    child.configure(state=state)
+                except:
+                    pass
+        tiny_var.trace_add("write", on_tiny_toggle)
+        on_tiny_toggle()  # Set initial state
+        
+        result = {'go': False}
+        
+        def on_scan():
+            result['go'] = True
+            opts_dlg.destroy()
+        
+        def on_cancel():
+            opts_dlg.destroy()
+        
+        btn_frame = tb.Frame(opts_dlg)
+        btn_frame.pack(fill=X, padx=20, pady=10)
+        tb.Button(btn_frame, text="Scan", command=on_scan, bootstyle="primary", width=12).pack(side=RIGHT, padx=5)
+        tb.Button(btn_frame, text="Cancel", command=on_cancel, bootstyle="secondary-outline", width=12).pack(side=RIGHT, padx=5)
+        
+        self.root.wait_window(opts_dlg)
+        
+        if not result['go']:
+            return
+        
+        # Save settings for future use (filter mode, re-opening dialog)
+        include_tiny = tiny_var.get()
+        self.suspicious_include_tiny = include_tiny
+        tiny_exclude = set()
+        for cid, var in class_vars.items():
+            if var.get():
+                tiny_exclude.add(cid)
+        self.suspicious_tiny_exclude_classes = tiny_exclude
         
         self.status_var.set("Scanning for suspicious annotations...")
         self.root.update()
@@ -4679,11 +5085,14 @@ class AnnotatorApp:
             tiny_indices = set()
             overlap_pairs = []
             
-            # Check tiny
-            for idx, (cid, cx, cy, w, h) in enumerate(annotations):
-                area = w * h
-                if area < 0.001:
-                    tiny_indices.add(idx)
+            # Check tiny (only if toggled on, respecting excluded classes)
+            if include_tiny:
+                for idx, (cid, cx, cy, w, h) in enumerate(annotations):
+                    if cid in tiny_exclude:
+                        continue
+                    area = w * h
+                    if area < 0.001:
+                        tiny_indices.add(idx)
             
             # Check extreme overlap
             for i in range(len(annotations)):
@@ -4714,16 +5123,33 @@ class AnnotatorApp:
         
         if not suspicious_images:
             tb.Label(summary_frame, text="✅ No suspicious annotations found!", font=("Arial", 12, "bold"), bootstyle="success").pack(anchor=W)
+            checked = "overlaps"
+            if include_tiny:
+                checked += " + tiny"
+            tb.Label(summary_frame, text=f"Checked: {checked}", font=("Arial", 9), foreground="#888").pack(anchor=W)
             tb.Button(summary_frame, text="Close", command=dlg.destroy, bootstyle="secondary").pack(anchor=E, pady=5)
             self.status_var.set("Suspicious scan complete: all clean!")
             return
         
         tb.Label(summary_frame, text=f"⚠️ {len(suspicious_images)} image(s) with suspicious annotations", font=("Arial", 12, "bold"), bootstyle="danger").pack(anchor=W)
         
+        # Settings note
+        settings_parts = ["Overlaps: on"]
+        if include_tiny:
+            if tiny_exclude:
+                excl_names = [self.classes[c] if c < len(self.classes) else f"cls{c}" for c in sorted(tiny_exclude)]
+                settings_parts.append(f"Tiny: on (excluding {', '.join(excl_names)})")
+            else:
+                settings_parts.append("Tiny: on")
+        else:
+            settings_parts.append("Tiny: off")
+        tb.Label(summary_frame, text="  |  ".join(settings_parts), font=("Arial", 8), foreground="#888").pack(anchor=W, pady=(0, 2))
+        
         legend_frame = tb.Frame(summary_frame)
         legend_frame.pack(fill=X, pady=(2, 0))
-        tb.Label(legend_frame, text="■", foreground="#FF00FF", font=("Arial", 10, "bold")).pack(side=LEFT)
-        tb.Label(legend_frame, text="Tiny (< 0.1% area)  ", font=("Consolas", 9)).pack(side=LEFT)
+        if include_tiny:
+            tb.Label(legend_frame, text="■", foreground="#FF00FF", font=("Arial", 10, "bold")).pack(side=LEFT)
+            tb.Label(legend_frame, text="Tiny (< 0.1% area)  ", font=("Consolas", 9)).pack(side=LEFT)
         tb.Label(legend_frame, text="■", foreground="#FF3333", font=("Arial", 10, "bold")).pack(side=LEFT)
         tb.Label(legend_frame, text="Extreme overlap (IoU > 0.8)  ", font=("Consolas", 9)).pack(side=LEFT)
         tb.Label(legend_frame, text="■", foreground="#66FF66", font=("Arial", 10, "bold")).pack(side=LEFT)
@@ -4984,7 +5410,11 @@ class AnnotatorApp:
             # Defer the preview to after dialog is fully laid out
             dlg.after(100, lambda: show_suspicious_image(0))
         
-        self.status_var.set(f"Suspicious scan complete: {total_tiny} tiny, {total_overlaps} overlapping in {len(suspicious_images)} images")
+        status_parts = []
+        if include_tiny:
+            status_parts.append(f"{total_tiny} tiny")
+        status_parts.append(f"{total_overlaps} overlapping")
+        self.status_var.set(f"Suspicious scan complete: {', '.join(status_parts)} in {len(suspicious_images)} images")
 
     def yolo_format_check_dialog(self):
         """Validate all YOLO label files, clamp out-of-range values, and report issues."""
@@ -5530,8 +5960,15 @@ class AnnotatorApp:
             conditions.append(cond_data)
             update_scroll_region()
         
-        # Add initial condition
-        add_condition()
+        # Restore last query conditions or add a blank one
+        if self.last_query_conditions:
+            for saved in self.last_query_conditions:
+                add_condition(saved.get('logic', 'AND'))
+                conditions[-1]['class'].set(saved.get('class', self.classes[0] if self.classes else ''))
+                conditions[-1]['op'].set(saved.get('op', '='))
+                conditions[-1]['count'].set(saved.get('count', '1'))
+        else:
+            add_condition()
         
         # Add condition buttons
         btn_frame = tb.Frame(cond_container)
@@ -5656,19 +6093,25 @@ class AnnotatorApp:
                 messagebox.showinfo("No Matches", "No images match the query.")
                 return
             
-            # Apply as custom filter
-            self.filtered_image_paths = matches
+            # Save query conditions for re-opening dialog later
+            self.last_query_conditions = []
+            for cond in conditions:
+                self.last_query_conditions.append({
+                    'logic': cond['logic'].get(),
+                    'class': cond['class'].get(),
+                    'op': cond['op'].get(),
+                    'count': cond['count'].get()
+                })
             
-            # Update UI
-            self.file_list.delete(0, tk.END)
-            for p in self.filtered_image_paths:
-                img_id = self.image_id_map.get(p, 0)
-                basename = os.path.basename(p)
-                self.file_list.insert(tk.END, f"#{img_id:04d} - {basename}")
+            # Save matching paths so _refresh_file_list can reapply the filter
+            self.custom_query_paths = set(matches)
             
             # Set filter mode to indicate custom query is active
             self.filter_mode = "Custom Query"
-            self.filter_combo.set("All")  # Reset combo but keep custom filter
+            self.filter_combo.set("🔍 Query Active")
+            
+            # Use standard refresh to populate the list
+            self._refresh_file_list()
             
             # Load first match
             if self.filtered_image_paths:
