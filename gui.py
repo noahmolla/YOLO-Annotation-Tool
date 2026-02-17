@@ -7,8 +7,11 @@ from PIL import Image, ImageTk, ImageDraw, ImageFile
 import os
 import glob
 import random
+import threading
+import time
 import numpy as np
 import json
+import cv2
 from inference import TFLiteModel
 import utils
 
@@ -136,10 +139,21 @@ class AnnotatorApp:
                 
             # Restore Model
             if "model_path" in cfg and os.path.exists(cfg["model_path"]):
+                model_path = cfg["model_path"]
                 try:
-                    self.model = TFLiteModel(cfg["model_path"])
-                    self.status_var.set(f"Restored model: {os.path.basename(cfg['model_path'])}")
-                except: pass
+                    if model_path.lower().endswith('.pt'):
+                        from inference import PyTorchYOLOModel
+                        imgsz_str = self.imgsz_combo.get()
+                        imgsz = None if imgsz_str == "Auto" else int(imgsz_str)
+                        self.model = PyTorchYOLOModel(model_path, imgsz=imgsz)
+                        self.model_path_str = model_path
+                        self.status_var.set(f"Restored PyTorch model: {os.path.basename(model_path)}")
+                    elif model_path.lower().endswith('.tflite'):
+                        self.model = TFLiteModel(model_path)
+                        self.model_path_str = model_path
+                        self.status_var.set(f"Restored TFLite model: {os.path.basename(model_path)}")
+                except Exception as e:
+                    print(f"Failed to restore model: {e}")
                 
             if "model_version" in cfg:
                 self.model_ver_combo.set(cfg["model_version"])
@@ -1629,7 +1643,7 @@ class AnnotatorApp:
             # Filter logic based on mode
             if self.filter_mode == "All":
                 pass  # No filter
-            elif self.filter_mode == "Custom Query":
+            elif self.filter_mode in ("Custom Query", "🔍 Query Active"):
                 # Custom query - use saved path set
                 if self.custom_query_paths and p not in self.custom_query_paths:
                     continue
@@ -2372,6 +2386,8 @@ class AnnotatorApp:
         pasted = 0
         removed = 0
         if self.repeat_clipboard:
+            # Save state for undo BEFORE pasting
+            self._push_annotation_undo()
             for new_ann in self.repeat_clipboard:
                 # Find and remove any overlapping annotations of the same class
                 new_box = (new_ann[1], new_ann[2], new_ann[3], new_ann[4])
@@ -3453,7 +3469,7 @@ class AnnotatorApp:
             self.status_var.set(f"Auto-annotate error: {e}")
 
     def auto_annotate_all(self):
-        """Auto-annotate all images in the workspace with mode selection."""
+        """Auto-annotate all images in the workspace with mode selection (threaded)."""
         if not self.model: return
         
         allowed_classes = self._select_classes_dialog()
@@ -3511,119 +3527,207 @@ class AnnotatorApp:
         if self.current_image and self.current_file_path and self.annotations_dirty:
             self.save_annotations(force=True)
         
+        # --- Snapshot settings for the worker thread ---
         ver = self.model_ver_combo.get()
-        cnt = 0
-        skipped_images = 0
-        skipped_dupes = 0
+        iou_thresh = self.iou_threshold
+        conf_thresholds = dict(self.class_confidence_thresholds)
+        default_conf = self.default_confidence_threshold
+        image_paths = list(self.image_paths)
+        model = self.model
+        
+        # --- Progress dialog with cancel ---
         top = tb.Toplevel(self.root)
         top.title("Auto Annotating...")
-        top.geometry("450x130")
-        pb = tb.Progressbar(top, maximum=len(self.image_paths))
-        pb.pack(fill=X, padx=20, pady=20)
-        lbl_status = tb.Label(top, text="Starting...")
-        lbl_status.pack(pady=5)
-
-        for i, p in enumerate(self.image_paths):
-            try:
-                lbl = self._get_label_path(p)
+        top.geometry("480x160")
+        top.transient(self.root)
+        top.protocol("WM_DELETE_WINDOW", lambda: None)  # Prevent close via X
+        
+        pb = tb.Progressbar(top, maximum=len(image_paths))
+        pb.pack(fill=X, padx=20, pady=(20, 5))
+        lbl_status = tb.Label(top, text="Starting...", font=("Consolas", 9))
+        lbl_status.pack(pady=2)
+        lbl_speed = tb.Label(top, text="", font=("Arial", 8), foreground="#888")
+        lbl_speed.pack(pady=0)
+        
+        cancel_flag = {'cancelled': False}
+        
+        def on_cancel_batch():
+            cancel_flag['cancelled'] = True
+            cancel_btn.config(state="disabled", text="Cancelling...")
+        
+        cancel_btn = tb.Button(top, text="Cancel", command=on_cancel_batch, bootstyle="danger-outline", width=14)
+        cancel_btn.pack(pady=8)
+        
+        # --- Shared state between worker and UI ---
+        progress = {'i': 0, 'cnt': 0, 'skipped_images': 0, 'skipped_dupes': 0, 
+                     'done': False, 'error': None, 'start_time': time.time()}
+        
+        def worker():
+            """Background thread: runs inference and writes label files."""
+            cnt = 0
+            skipped_images = 0
+            skipped_dupes = 0
+            
+            for i, p in enumerate(image_paths):
+                if cancel_flag['cancelled']:
+                    break
                 
-                # Load existing annotations for this image
-                existing_anns = self._load_annotations_from_file(lbl)
-                
-                # Mode: unannotated_only - skip if already has annotations
-                if mode == "unannotated_only" and existing_anns:
-                    skipped_images += 1
-                    continue
-                
-                img = Image.open(p)
-                
-                boxes, classes, scores = self.model.predict(
-                    np.array(img),
-                    confidence_threshold=0.01,
-                    iou_threshold=self.iou_threshold,
-                    version=ver
-                )
-                
-                # Filter and collect valid detections
-                new_lines = []
-                for b, c, s in zip(boxes, classes, scores):
-                    class_id = int(c)
-                    if class_id not in allowed_classes:
+                try:
+                    lbl = self._get_label_path(p)
+                    
+                    # Load existing annotations for this image
+                    existing_anns = self._load_annotations_from_file(lbl)
+                    
+                    # Mode: unannotated_only - skip if already has annotations
+                    if mode == "unannotated_only" and existing_anns:
+                        skipped_images += 1
+                        progress['i'] = i + 1
+                        progress['skipped_images'] = skipped_images
                         continue
-                    threshold = self.class_confidence_thresholds.get(class_id, self.default_confidence_threshold)
-                    if s < threshold:
-                        continue
                     
-                    new_ann = [class_id, b[0], b[1], b[2], b[3]]
+                    # Use cv2 for faster image loading (reads as BGR)
+                    img_bgr = cv2.imread(p)
+                    if img_bgr is None:
+                        # Fallback to PIL for unusual formats
+                        pil_img = Image.open(p)
+                        img_arr = np.array(pil_img)
+                    else:
+                        img_arr = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
                     
-                    # Mode: add_missing - check against existing annotations
-                    if mode == "add_missing":
-                        if self._is_duplicate_or_overlapping(new_ann, existing_anns):
-                            skipped_dupes += 1
+                    boxes, classes, scores = model.predict(
+                        img_arr,
+                        confidence_threshold=0.01,
+                        iou_threshold=iou_thresh,
+                        version=ver
+                    )
+                    
+                    # Filter and collect valid detections
+                    new_lines = []
+                    for b, c, s in zip(boxes, classes, scores):
+                        class_id = int(c)
+                        if class_id not in allowed_classes:
                             continue
-                        # Also check against annotations we're about to add (prevent self-duplicates)
-                        new_anns_so_far = [[int(l.split()[0])] + [float(x) for x in l.split()[1:]] for l in new_lines]
-                        if self._is_duplicate_or_overlapping(new_ann, new_anns_so_far):
-                            skipped_dupes += 1
+                        threshold = conf_thresholds.get(class_id, default_conf)
+                        if s < threshold:
                             continue
+                        
+                        new_ann = [class_id, b[0], b[1], b[2], b[3]]
+                        
+                        # Mode: add_missing - check against existing annotations
+                        if mode == "add_missing":
+                            if self._is_duplicate_or_overlapping(new_ann, existing_anns):
+                                skipped_dupes += 1
+                                continue
+                            # Also check against annotations we're about to add
+                            new_anns_so_far = [[int(l.split()[0])] + [float(x) for x in l.split()[1:]] for l in new_lines]
+                            if self._is_duplicate_or_overlapping(new_ann, new_anns_so_far):
+                                skipped_dupes += 1
+                                continue
+                        
+                        new_lines.append(f"{class_id} {b[0]:.6f} {b[1]:.6f} {b[2]:.6f} {b[3]:.6f}\n")
                     
-                    new_lines.append(f"{class_id} {b[0]:.6f} {b[1]:.6f} {b[2]:.6f} {b[3]:.6f}\n")
-                
-                if mode == "overwrite":
-                    # Keep annotations for classes NOT being overwritten
-                    preserved_lines = []
-                    if os.path.exists(lbl):
-                        with open(lbl, 'r') as f:
-                            for line in f:
-                                parts = line.strip().split()
-                                if len(parts) >= 5:
-                                    try:
-                                        cid = int(parts[0])
-                                        if cid not in allowed_classes:
+                    if mode == "overwrite":
+                        preserved_lines = []
+                        if os.path.exists(lbl):
+                            with open(lbl, 'r') as f:
+                                for line in f:
+                                    parts = line.strip().split()
+                                    if len(parts) >= 5:
+                                        try:
+                                            cid = int(parts[0])
+                                            if cid not in allowed_classes:
+                                                preserved_lines.append(line if line.endswith('\n') else line + '\n')
+                                        except ValueError:
                                             preserved_lines.append(line if line.endswith('\n') else line + '\n')
-                                    except ValueError:
-                                        preserved_lines.append(line if line.endswith('\n') else line + '\n')
-                    all_lines = preserved_lines + new_lines
-                    if all_lines:
+                        all_lines = preserved_lines + new_lines
+                        if all_lines:
+                            os.makedirs(os.path.dirname(lbl), exist_ok=True)
+                            with open(lbl, 'w') as f:
+                                f.writelines(all_lines)
+                            cnt += len(new_lines)
+                        elif os.path.exists(lbl) and not preserved_lines:
+                            with open(lbl, 'w') as f:
+                                pass
+                        else:
+                            skipped_images += 1
+                    elif new_lines:
                         os.makedirs(os.path.dirname(lbl), exist_ok=True)
-                        with open(lbl, 'w') as f:
-                            f.writelines(all_lines)
+                        with open(lbl, 'a') as f:
+                            f.writelines(new_lines)
                         cnt += len(new_lines)
-                    elif os.path.exists(lbl) and not preserved_lines:
-                        # All classes were selected and no new detections — clear the file
-                        with open(lbl, 'w') as f:
-                            pass
                     else:
                         skipped_images += 1
-                elif new_lines:
-                    os.makedirs(os.path.dirname(lbl), exist_ok=True)
-                    with open(lbl, 'a') as f:
-                        f.writelines(new_lines)
-                    cnt += len(new_lines)
+                        
+                except Exception as e: 
+                    print(f"Error on {p}: {e}")
+                
+                # Update shared progress
+                progress['i'] = i + 1
+                progress['cnt'] = cnt
+                progress['skipped_images'] = skipped_images
+                progress['skipped_dupes'] = skipped_dupes
+            
+            progress['cnt'] = cnt
+            progress['skipped_images'] = skipped_images
+            progress['skipped_dupes'] = skipped_dupes
+            progress['done'] = True
+        
+        # Start worker thread
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        
+        # --- UI poll loop (runs on main thread) ---
+        def poll_progress():
+            i = progress['i']
+            cnt = progress['cnt']
+            total = len(image_paths)
+            
+            pb['value'] = i
+            lbl_status.config(text=f"Processed {i}/{total}  •  {cnt} annotations added")
+            
+            # Speed estimate
+            elapsed = time.time() - progress['start_time']
+            if i > 0 and elapsed > 0:
+                ips = i / elapsed
+                remaining = (total - i) / ips if ips > 0 else 0
+                mins, secs = divmod(int(remaining), 60)
+                lbl_speed.config(text=f"{ips:.1f} img/sec  •  ~{mins}m {secs}s remaining")
+            
+            if progress['done'] or cancel_flag['cancelled']:
+                # Worker finished — finalize
+                thread.join(timeout=2)
+                top.destroy()
+                
+                self._build_annotation_cache()
+                
+                cnt = progress['cnt']
+                skipped_dupes = progress['skipped_dupes']
+                skipped_images = progress['skipped_images']
+                
+                if cancel_flag['cancelled']:
+                    msg = f"Cancelled: Added {cnt} annotations ({progress['i']}/{total} processed)"
                 else:
-                    skipped_images += 1
-                    
-            except Exception as e: 
-                print(f"Error on {p}: {e}")
+                    msg = f"Batch Done: Added {cnt} annotations"
+                if skipped_dupes > 0:
+                    msg += f", skipped {skipped_dupes} duplicates"
+                if skipped_images > 0:
+                    msg += f", {skipped_images} images unchanged"
+                self.status_var.set(msg)
+                
+                # Clear current image state so load_image doesn't save stale
+                # in-memory annotations back to disk (overwriting worker's results)
+                self.current_image = None
+                self.current_file_path = None
+                self.annotations = []
+                self.annotations_dirty = False
+                
+                self.load_image(self.current_index)
+                return
             
-            if i % 5 == 0:
-                pb['value'] = i
-                lbl_status.config(text=f"Processed {i+1}/{len(self.image_paths)} ({cnt} added)")
-                top.update()
-            
-        top.destroy()
+            # Poll again in 100ms
+            top.after(100, poll_progress)
         
-        # Rebuild cache since we wrote files directly
-        self._build_annotation_cache()
-        
-        msg = f"Batch Done: Added {cnt} annotations"
-        if skipped_dupes > 0:
-            msg += f", skipped {skipped_dupes} duplicates"
-        if skipped_images > 0:
-            msg += f", {skipped_images} images unchanged"
-        self.status_var.set(msg)
-        # Reload current image to show changes
-        self.load_image(self.current_index)
+        poll_progress()
 
     def reduce_dataset_dialog(self):
         if not self.workspace_path:
