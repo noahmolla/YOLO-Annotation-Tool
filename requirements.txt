@@ -10,31 +10,29 @@ ttkbootstrap>=1.10.0
 PyYAML>=6.0
 
 # ============================================
-# MODEL INFERENCE OPTIONS
-# Choose ONE or BOTH depending on your needs
+# MODEL INFERENCE (at least one required)
 # ============================================
 
-# OPTION A: PyTorch YOLO models (.pt files) - RECOMMENDED
-# Supports YOLOv5, YOLOv8, YOLOv11, etc.
-# Best for most users - easy to use pretrained models
+# PyTorch YOLO models (.pt files) - RECOMMENDED
+# Supports YOLOv5, YOLOv8, YOLOv11, YOLO26, etc.
 ultralytics>=8.0.0
 
-# OPTION B: TensorFlow Lite models (.tflite files)
-# Choose ONE of the following:
+# ============================================
+# OPTIONAL: TensorFlow Lite (.tflite files)
+# Uncomment ONE of the lines below if needed:
+# ============================================
 
-# B1: Full TensorFlow (Recommended - easier to install, ~500MB)
-tensorflow>=2.8.0,<2.18.0
+# Full TensorFlow (~500MB):
+# tensorflow>=2.8.0,<2.18.0
 
-# B2: tflite-runtime (Smaller ~5MB, but harder on Windows)
-# Uncomment below and comment out tensorflow above if preferred:
+# OR tflite-runtime only (~5MB, may need manual install on Windows):
 # tflite-runtime>=2.5.0
 
 # ============================================
 # NOTES
 # ============================================
-# - You can use BOTH PyTorch (.pt) and TFLite (.tflite) models
-# - The app automatically detects model type by file extension
-# - If you don't need TFLite, you can comment out tensorflow
-# - If you don't need PyTorch, you can comment out ultralytics
+# - Most users only need ultralytics (above) for .pt models
+# - TensorFlow/tflite is only needed for .tflite model files
+# - The app auto-detects model type by file extension
 # - On Windows, tflite-runtime may need manual wheel installation
 #   See: https://www.tensorflow.org/lite/guide/python

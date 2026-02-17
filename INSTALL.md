@@ -46,34 +46,33 @@ python main.py
 
 ## 📦 Dependency Options
 
-The requirements file includes options for different use cases:
+The requirements file defaults to **PyTorch only** (recommended for most users).
 
-### Option A: Full Installation (Recommended)
-Includes both PyTorch and TensorFlow support:
+### Default Installation (PyTorch - Recommended)
 ```bash
 pip install -r requirements.txt
 ```
-- Supports `.pt` and `.tflite` models
-- Larger download (~1.5GB)
-- Best compatibility
+- Supports `.pt` models (YOLOv5, v8, v11, YOLO26, etc.)
+- Download size: ~800MB
+- Works on all platforms
 
-### Option B: PyTorch Only (Lightweight)
-Edit `requirements.txt` and comment out the tensorflow line:
+### Full Installation (PyTorch + TFLite)
+Edit `requirements.txt` and uncomment the tensorflow line:
 ```
-# tensorflow>=2.8.0,<2.18.0
+tensorflow>=2.8.0,<2.18.0
 ```
 Then install:
 ```bash
 pip install -r requirements.txt
 ```
-- Supports `.pt` models only
-- Smaller download (~800MB)
-- Recommended for most users
+- Supports both `.pt` and `.tflite` models
+- Larger download (~1.5GB)
 
-### Option C: TFLite Only (Edge Devices)
-Edit `requirements.txt` and comment out the ultralytics line:
+### TFLite Only (Edge Devices)
+Edit `requirements.txt`: uncomment tensorflow and comment out ultralytics:
 ```
 # ultralytics>=8.0.0
+tensorflow>=2.8.0,<2.18.0
 ```
 Then install:
 ```bash
