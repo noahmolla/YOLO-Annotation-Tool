@@ -1,0 +1,2759 @@
+﻿diff --git a/gui.py b/gui.py
+index 3196216..28e36ee 100644
+--- a/gui.py
++++ b/gui.py
+@@ -1,3 +1,9 @@
++"""
++YOLO Annotation Tool - GUI Module
++A modern annotation tool for YOLO object detection and segmentation datasets.
++Supports bounding box and polygon annotations with auto-annotation capabilities.
++"""
++
+ import tkinter as tk
+ from tkinter import filedialog, messagebox, simpledialog
+ from tkinter import ttk
+@@ -7,15 +13,12 @@ from PIL import Image, ImageTk, ImageDraw, ImageFile
+ import os
+ import glob
+ import random
+-import threading
+-import time
+ import numpy as np
+ import json
+-import cv2
+ from inference import TFLiteModel
+ import utils
+ 
+-# Enable loading of truncated/corrupted images globally
++# Enable loading of truncated/corrupted images
+ ImageFile.LOAD_TRUNCATED_IMAGES = True
+ 
+ CONFIG_FILE = "config.json"
+@@ -58,10 +61,6 @@ class AnnotatorApp:
+         # --- Interaction State ---
+         self.selected_class_id = 0
+         self.filter_mode = "All"        # Filter mode string
+-        self.custom_query_paths = None  # Set of paths matching last custom query
+-        self.last_query_conditions = [] # Saved query conditions for re-opening dialog
+-        self.suspicious_include_tiny = False  # Whether to flag tiny annotations as suspicious
+-        self.suspicious_tiny_exclude_classes = set()  # Classes to ignore for tiny check
+         
+         self.drag_mode = None          # None, "create", "move", "resize"
+         self.start_x = 0
+@@ -85,6 +84,7 @@ class AnnotatorApp:
+         # Clipboard for repeat function
+         self.repeat_clipboard = []  # Annotations to paste on next Y press (from Ctrl+Click selection)
+         self.last_drawn_box = None  # Last box drawn: [class_id, cx, cy, w, h] for R to repeat
++        self.annotation_clipboard = []  # Ctrl+C / Ctrl+V clipboard
+         
+         # Click-to-annotate mode
+         self.click_mode = tk.BooleanVar(value=False)  # Toggle for click-to-annotate mode
+@@ -107,12 +107,42 @@ class AnnotatorApp:
+         # Draw-only mode: skip annotation selection/movement on click
+         self.draw_only_mode = tk.BooleanVar(value=False)
+         
++        # Annotation mode: "Detection" (bounding boxes) or "Segmentation" (polygons)
++        self.annotation_mode = tk.StringVar(value="Detection")
++        
++        # Segmentation polygon drawing state
++        self.seg_points = []          # List of (norm_x, norm_y) for polygon being drawn
++        self.seg_preview_ids = []     # Canvas item IDs for polygon preview lines/dots
++        self.seg_drawing = False      # True while actively drawing a polygon
++        
++        # Edit Mode: enables vertex dragging and bbox handle resizing
++        self.edit_mode = tk.BooleanVar(value=False)
++        self.dragging_vertex_idx = -1  # Index of polygon vertex being dragged
++        self.dragging_handle = None    # Bbox handle being dragged (e.g. "tl", "tr", "t", etc.)
++        self.drag_ann_idx = -1         # Annotation index being edited
++        
++        # Zoom & Pan state
++        self.zoom_level = 1.0         # 1.0 = fit-to-canvas, up to 10.0
++        self.zoom_center_nx = 0.5     # Normalized X center of zoom (in image coords)
++        self.zoom_center_ny = 0.5     # Normalized Y center of zoom (in image coords)
++        
+         # Auto-annotation settings
+         self.default_confidence_threshold = 0.50  # Default confidence for all classes
+         self.class_confidence_thresholds = {}  # Per-class confidence thresholds
+         self.iou_threshold = 0.50  # IOU threshold for NMS
+ 
+         # --- UI Setup ---
++        self.last_mouse_x = 0
++        self.last_mouse_y = 0
++        
++        # Debounced Autosave
++        self.autosave_timer = None
++        self.autosave_delay = 1000 # ms
++        
++        # High-quality redraw timers for zoom/pan
++        self._zoom_hq_timer = None
++        self._pan_hq_timer = None
++        
+         self._setup_ui()
+         self._bind_events()
+         
+@@ -139,21 +169,10 @@ class AnnotatorApp:
+                 
+             # Restore Model
+             if "model_path" in cfg and os.path.exists(cfg["model_path"]):
+-                model_path = cfg["model_path"]
+                 try:
+-                    if model_path.lower().endswith('.pt'):
+-                        from inference import PyTorchYOLOModel
+-                        imgsz_str = self.imgsz_combo.get()
+-                        imgsz = None if imgsz_str == "Auto" else int(imgsz_str)
+-                        self.model = PyTorchYOLOModel(model_path, imgsz=imgsz)
+-                        self.model_path_str = model_path
+-                        self.status_var.set(f"Restored PyTorch model: {os.path.basename(model_path)}")
+-                    elif model_path.lower().endswith('.tflite'):
+-                        self.model = TFLiteModel(model_path)
+-                        self.model_path_str = model_path
+-                        self.status_var.set(f"Restored TFLite model: {os.path.basename(model_path)}")
+-                except Exception as e:
+-                    print(f"Failed to restore model: {e}")
++                    self.model = TFLiteModel(cfg["model_path"])
++                    self.status_var.set(f"Restored model: {os.path.basename(cfg['model_path'])}")
++                except: pass
+                 
+             if "model_version" in cfg:
+                 self.model_ver_combo.set(cfg["model_version"])
+@@ -343,16 +362,32 @@ class AnnotatorApp:
+         
+         tb.Label(c_toolbar, text="  |  Shortcuts: A/D, 1-9, R, G, Ctrl+Click", font=("Arial", 9)).pack(side=LEFT, padx=10)
+         
++        # Annotation Mode Selector
++        mode_frame = tb.Frame(c_toolbar)
++        mode_frame.pack(side=LEFT, padx=10)
++        tb.Label(mode_frame, text="Mode:", font=("Arial", 9)).pack(side=LEFT)
++        self.mode_combo = tb.Combobox(mode_frame, textvariable=self.annotation_mode, 
++                                      values=["Detection", "Segmentation"], state="readonly", width=12)
++        self.mode_combo.pack(side=LEFT, padx=(3,0))
++        self.mode_combo.bind("<<ComboboxSelected>>", self._on_mode_changed)
++        
+         # Crosshair Toggle
+         tb.Checkbutton(c_toolbar, text="Crosshair", variable=self.show_crosshair, bootstyle="round-toggle").pack(side=LEFT, padx=10)
+         
+-        # Click Mode Toggle
+-        tb.Checkbutton(c_toolbar, text="Click Mode", variable=self.click_mode, 
+-                      command=self._on_click_mode_toggle, bootstyle="round-toggle").pack(side=LEFT, padx=10)
++        # Click Mode Toggle (only visible in Detection mode)
++        self.click_mode_cb = tb.Checkbutton(c_toolbar, text="Click Mode", variable=self.click_mode, 
++                      command=self._on_click_mode_toggle, bootstyle="round-toggle")
++        self.click_mode_cb.pack(side=LEFT, padx=10)
+         
+         # Draw Only Mode Toggle
+-        tb.Checkbutton(c_toolbar, text="Draw Only (T)", variable=self.draw_only_mode, 
+-                      bootstyle="round-toggle").pack(side=LEFT, padx=10)
++        self.draw_only_cb = tb.Checkbutton(c_toolbar, text="Draw Only (T)", variable=self.draw_only_mode, 
++                      bootstyle="round-toggle")
++        self.draw_only_cb.pack(side=LEFT, padx=10)
++        
++        # Edit Mode Toggle
++        self.edit_mode_cb = tb.Checkbutton(c_toolbar, text="Edit (E)", variable=self.edit_mode, 
++                      command=self.redraw, bootstyle="round-toggle")
++        self.edit_mode_cb.pack(side=LEFT, padx=5)
+         
+         # Show only selected class toggle
+         tb.Checkbutton(c_toolbar, text="Show Only Selected Class (F)", variable=self.show_only_selected_class, 
+@@ -400,15 +435,6 @@ class AnnotatorApp:
+         tb.Label(stats_frame, textvariable=self.stats_annotated_var, font=("Consolas", 9)).pack(anchor=W)
+         tb.Label(stats_frame, textvariable=self.stats_boxes_var, font=("Consolas", 9)).pack(anchor=W)
+         tb.Label(stats_frame, textvariable=self.stats_classes_var, font=("Consolas", 9)).pack(anchor=W)
+-        
+-        # Current image annotation stats
+-        ttk.Separator(stats_frame, orient=HORIZONTAL).pack(fill=X, pady=5)
+-        self.stats_current_img_var = tk.StringVar(value="This Image: ΓÇö")
+-        tb.Label(stats_frame, textvariable=self.stats_current_img_var, font=("Consolas", 9, "bold")).pack(anchor=W)
+-        self.stats_current_classes_var = tk.StringVar(value="")
+-        self.stats_current_classes_label = tb.Label(stats_frame, textvariable=self.stats_current_classes_var, 
+-                                                      font=("Consolas", 8), foreground="#aaa", wraplength=250, justify=LEFT)
+-        self.stats_current_classes_label.pack(anchor=W)
+ 
+         self.file_list = tk.Listbox(file_frame, selectmode=tk.EXTENDED,
+                                     bg="#222", fg="#eee", bd=0, highlightthickness=0, font=("Consolas", 9),
+@@ -424,23 +450,33 @@ class AnnotatorApp:
+         self.file_list.bind("<Button-3>", self.on_file_list_right_click)
+ 
+     def _bind_events(self):
+-        # Global Keys - use KeyPress/KeyRelease for rapid navigation
+-        self.root.bind("<KeyPress-Left>", self._on_nav_key_press)
+-        self.root.bind("<KeyRelease-Left>", self._on_nav_key_release)
+-        self.root.bind("<KeyPress-Right>", self._on_nav_key_press)
+-        self.root.bind("<KeyRelease-Right>", self._on_nav_key_release)
+-        self.root.bind("<KeyPress-a>", self._on_nav_key_press)
+-        self.root.bind("<KeyRelease-a>", self._on_nav_key_release)
+-        self.root.bind("<KeyPress-d>", self._on_nav_key_press)
+-        self.root.bind("<KeyRelease-d>", self._on_nav_key_release)
++        # Global Keys - use bind_all for robust navigation regardless of focus
++        # Guard against typing in Entry widgets is handled in _on_nav_key_press
++        self.root.bind_all("<KeyPress-Left>", self._on_nav_key_press)
++        self.root.bind_all("<KeyRelease-Left>", self._on_nav_key_release)
++        self.root.bind_all("<KeyPress-Right>", self._on_nav_key_press)
++        self.root.bind_all("<KeyRelease-Right>", self._on_nav_key_release)
++        self.root.bind_all("<KeyPress-a>", self._on_nav_key_press)
++        self.root.bind_all("<KeyRelease-a>", self._on_nav_key_release)
++        self.root.bind_all("<KeyPress-A>", self._on_nav_key_press)
++        self.root.bind_all("<KeyRelease-A>", self._on_nav_key_release)
++        self.root.bind_all("<KeyPress-d>", self._on_nav_key_press)
++        self.root.bind_all("<KeyRelease-d>", self._on_nav_key_release)
++        self.root.bind_all("<KeyPress-D>", self._on_nav_key_press)
++        self.root.bind_all("<KeyRelease-D>", self._on_nav_key_release)
++        
++        # Ensure focus is reclaimed when window gets focus (fixes shortcuts after Alt-Tab)
++        self.root.bind("<FocusIn>", lambda e: self.canvas.focus_set())
+         
+         self.root.bind("s", lambda e: self.save_annotations())
++        # Space to reset zoom (global)
++        self.root.bind_all("<space>", self._reset_zoom)
+         
+         # Del = quick delete image (no prompt, undoable)
+         self.root.bind("<Delete>", lambda e: self.delete_current_image_quick())
+         
+-        # Backspace = clear annotations of selected class
+-        self.root.bind("<BackSpace>", lambda e: self.clear_class_annotations_quick())
++        # Backspace = clear annotations of selected class OR undo seg point
++        self.root.bind("<BackSpace>", self._on_backspace)
+         
+         # Ctrl+Backspace = clear ALL annotations
+         self.root.bind("<Control-BackSpace>", lambda e: self.clear_all_annotations_quick())
+@@ -477,6 +513,12 @@ class AnnotatorApp:
+         self.root.bind_all("<Control-y>", lambda e: self.redo_action())
+         self.root.bind_all("<Control-Y>", lambda e: self.redo_action())
+         
++        # Ctrl+C / Ctrl+V for copy/paste annotations
++        self.root.bind_all("<Control-c>", lambda e: self.copy_annotation())
++        self.root.bind_all("<Control-C>", lambda e: self.copy_annotation())
++        self.root.bind_all("<Control-v>", lambda e: self.paste_annotation())
++        self.root.bind_all("<Control-V>", lambda e: self.paste_annotation())
++        
+         # Ctrl+G for go to image number
+         self.root.bind_all("<Control-g>", lambda e: self.go_to_image_dialog())
+         self.root.bind_all("<Control-G>", lambda e: self.go_to_image_dialog())
+@@ -490,8 +532,14 @@ class AnnotatorApp:
+         # T to toggle draw-only mode
+         self.root.bind("t", lambda e: self.draw_only_mode.set(not self.draw_only_mode.get()))
+         
++        # E to toggle edit mode
++        self.root.bind("e", lambda e: self._toggle_edit_mode())
++        
+         # F5 to refresh workspace
+         self.root.bind("<F5>", lambda e: self.refresh_workspace())
++        
++        # Space to reset zoom
++        self.root.bind("<space>", self._reset_zoom)
+             
+         # Canvas Mouse - Ctrl+Click for multi-selection
+         self.canvas.bind("<Control-ButtonPress-1>", self.on_ctrl_click)
+@@ -499,8 +547,18 @@ class AnnotatorApp:
+         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+         self.canvas.bind("<Motion>", self.on_mouse_move)
+         self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
+-        # Right click to delete under cursor
++        # Right click to delete under cursor / cancel seg polygon
+         self.canvas.bind("<Button-3>", self.on_right_click)
++        # Ctrl+Right-click to change annotation class
++        self.canvas.bind("<Control-Button-3>", self.change_annotation_class)
++        # Double-click to close segmentation polygon
++        self.canvas.bind("<Double-ButtonPress-1>", self._seg_on_double_click)
++        
++        # Scroll wheel for zoom
++        self.canvas.bind("<MouseWheel>", self._on_scroll_zoom)
++        # Middle mouse button for pan
++        self.canvas.bind("<ButtonPress-2>", self._on_pan_start)
++        self.canvas.bind("<B2-Motion>", self._on_pan_drag)
+         
+         # Resize event
+         self.canvas.bind("<Configure>", self.on_canvas_resize)
+@@ -632,7 +690,6 @@ class AnnotatorApp:
+         # Reset filter to "All" when reloading to prevent stale filters
+         self.filter_mode = "All"
+         self.filter_combo.set("All")
+-        self.custom_query_paths = None
+         
+         self._refresh_file_list()
+         if self.image_paths:
+@@ -778,21 +835,18 @@ class AnnotatorApp:
+         self.cls_list.delete(0, tk.END)
+         self.class_colors = {}
+         
++        # Custom Bright & Friendly Palette (Pastel/Neon)
++        palette = [
++            "#00FFFF", "#FF00FF", "#FFFF00", "#00FF00", "#FF6600",
++            "#CC99FF", "#33CCFF", "#FF3399", "#99FF33", "#FFCC00",
++            "#33FFCC", "#FF99CC", "#CCFF00", "#00CCFF", "#FF5050",
++            "#66FF66", "#FF66FF", "#66FFFF", "#FFFF66", "#FFB366"
++        ]
++        
+         for i, c in enumerate(self.classes):
+             self.cls_list.insert(tk.END, f"{i}: {c}")
+-            # Generate vibrant color
+-            random.seed(i+55) # Salt
+-            
+-            # Simple HSL gen
+-            h = random.random()
+-            s = 0.7 + random.random()*0.3
+-            v = 0.8 + random.random()*0.2
+-            
+-            # Convert to RGB hex
+-            import colorsys
+-            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+-            hex_col = "#%02x%02x%02x" % (int(r*255), int(g*255), int(b*255))
+-            self.class_colors[i] = hex_col
++            # Use palette, cycle if needed
++            self.class_colors[i] = palette[i % len(palette)]
+             
+         # Update filter list with advanced options
+         base_vals = ["All", "Unannotated", "Overlapping", "Suspicious"]
+@@ -912,26 +966,46 @@ class AnnotatorApp:
+         
+         result_var = tk.StringVar()
+         
++        # Export Mode
++        mode_frame = tb.Labelframe(dialog, text="Export Mode", padding=10)
++        mode_frame.pack(fill="x", padx=20, pady=5)
++        
++        mode_var = tk.StringVar(value="All Annotations")
++        modes = ["All Annotations", "Detection Only (BBox)", "Segmentation Only (Polygon)"]
++        cb_mode = tb.Combobox(mode_frame, textvariable=mode_var, values=modes, state="readonly")
++        cb_mode.pack(fill="x")
++        
+         def do_export():
+             # Get split ratios
+             if preset_var.get() == "custom":
+                 try:
+-                    train = float(train_var.get())
+-                    val = float(val_var.get())
+-                    test = float(test_var.get())
++                    parts = [float(val) for val in [train_var.get(), val_var.get(), test_var.get()]]
++                    train, val, test = parts
+                 except:
+                     messagebox.showerror("Error", "Invalid split values")
+                     return
+             else:
+-                parts = preset_var.get().split("/")
+-                train, val, test = [float(p) for p in parts]
++                try:
++                    # Handle preset values like "80/20" or "70/20/10"
++                    parts = [float(p) for p in preset_var.get().split("/")]
++                    if len(parts) == 2: parts.append(0)
++                    train, val, test = parts
++                except:
++                    train, val, test = 0.7, 0.2, 0.1
+             
+             # Normalize to ratios
+             total = train + val + test
++            if total == 0: total = 1
+             train_ratio = train / total
+             val_ratio = val / total
+             test_ratio = test / total
+             
++            # Get annotation type
++            mode_str = mode_var.get()
++            ann_type = "all"
++            if "Detection" in mode_str: ann_type = "detect"
++            elif "Segmentation" in mode_str: ann_type = "segment"
++            
+             # Get output file
+             f = filedialog.asksaveasfilename(
+                 defaultextension=".zip", 
+@@ -944,7 +1018,7 @@ class AnnotatorApp:
+             dialog.destroy()
+             
+             # Show progress
+-            self.status_var.set("Exporting dataset...")
++            self.status_var.set(f"Exporting dataset ({ann_type})...")
+             self.root.update()
+             
+             # Export
+@@ -952,7 +1026,9 @@ class AnnotatorApp:
+                 self.workspace_path, f, 
+                 train_ratio=train_ratio, 
+                 val_ratio=val_ratio, 
+-                test_ratio=test_ratio
++                test_ratio=test_ratio,
++                class_list=self.classes,
++                annotation_type=ann_type
+             )
+             
+             if success:
+@@ -1317,16 +1393,15 @@ class AnnotatorApp:
+         class_name = self.classes[self.selected_class_id] if self.selected_class_id < len(self.classes) else str(self.selected_class_id)
+         count_before = len(self.annotations)
+         new_annotations = [a for a in self.annotations if a[0] != self.selected_class_id]
+-        count_removed = count_before - len(new_annotations)
+         
+-        if count_removed > 0:
++        if count_before - len(new_annotations) > 0: # Only push undo if something was actually removed
+             # Save for undo BEFORE modifying
+             self._push_annotation_undo()
+             
+             self.annotations = new_annotations
+             self.save_annotations()
+             self.redraw()
+-            self._flash_notification(f"Removed {count_removed} '{class_name}' annotations (Ctrl+Z to undo)")
++            self._flash_notification(f"Removed {count_before - len(new_annotations)} '{class_name}' annotations (Ctrl+Z to undo)")
+         else:
+             self.status_var.set(f"No '{class_name}' annotations to remove")
+ 
+@@ -1387,9 +1462,6 @@ class AnnotatorApp:
+         norm_path = os.path.normpath(img_path)
+         if norm_path in self.image_to_classes_cache:
+             del self.image_to_classes_cache[norm_path]
+-        # Remove from custom query paths if active
+-        if self.custom_query_paths and img_path in self.custom_query_paths:
+-            self.custom_query_paths.discard(img_path)
+         
+         # Clear state to prevent 'save_annotations' from resurrecting the labels
+         self.current_image = None
+@@ -1437,32 +1509,58 @@ class AnnotatorApp:
+   G           Open gallery view
+   Ctrl+G      Go to image by number
+ 
+-≡ƒÄ¿ ANNOTATION
++≡ƒÄ¿ ANNOTATION (Detection)
+   1-9         Select class 1-9 (maps to 0-8)
+   0           Select class 10 (maps to 9)
+   Click+Drag  Draw bounding box
+   Right-click Delete annotation under cursor
++  Ctrl+Right  Change annotation class
+   R           Repeat last drawn box
+   Ctrl+Click  Multi-select annotations
+   Y           Repeat selected annotations & next
+ 
++Γ£é SEGMENTATION MODE
++  Click       Add polygon point
++  Close click Click near green circle (1st point)
++  Double-click Close polygon immediately
++  Right-click Cancel current polygon
++  Backspace   Undo last polygon point
++  Esc         Cancel polygon in progress
++
++Γ£Å EDIT MODE (E to toggle)
++  Drag vertex Move polygon vertex
++  Right-click Delete polygon vertex (min 3)
++  Drag handle Resize bbox (corners/edges)
++  Drag body   Move entire annotation
++
++≡ƒöì ZOOM & PAN
++  Scroll Up   Zoom in toward cursor
++  Scroll Down Zoom out from cursor
++  Space       Reset zoom to fit
++  Middle-drag Pan when zoomed in
++
+ ≡ƒùæ DELETE / CLEAR
+   Del         Delete current image (undoable)
+   Backspace   Clear annotations of selected class
+   Ctrl+Back   Clear ALL annotations on image
+   Ctrl+Z      Undo (moves, clears, deletions)
+   Ctrl+Y      Redo
++  Ctrl+C      Copy annotation(s)
++  Ctrl+V      Paste annotation(s)
+ 
+ ΓÜÖ OTHER
+   S           Save annotations
+   Q           Quick auto-annotate (all classes)
++  T           Toggle draw-only mode
++  E           Toggle edit mode
+   F           Toggle show only selected class
+   H           Show this help
+   Esc         Clear selection / Unlock class
++  F5          Refresh workspace
+ """
+         dlg = tb.Toplevel(self.root)
+         dlg.title("Keyboard Shortcuts")
+-        dlg.geometry("420x520")
++        dlg.geometry("450x800")
+         dlg.transient(self.root)
+         
+         text = tk.Text(dlg, wrap="word", font=("Consolas", 10), bg="#1e1e1e", fg="#e0e0e0", 
+@@ -1583,6 +1681,58 @@ class AnnotatorApp:
+         # Limit stack size
+         if len(self.annotation_undo_stack) > self.max_undo_size:
+             self.annotation_undo_stack.pop(0)
++    
++    def copy_annotation(self):
++        """Copy selected annotations (or annotation under cursor) to clipboard."""
++        if not self.current_image:
++            return
++        
++        copied = []
++        if self.selected_annotations:
++            # Copy all selected annotations
++            for idx in self.selected_annotations:
++                if 0 <= idx < len(self.annotations):
++                    copied.append(list(self.annotations[idx]))
++        elif self.active_annotation_index != -1:
++            copied.append(list(self.annotations[self.active_annotation_index]))
++        else:
++            # Try to find annotation under the last known cursor position
++            # Fallback: copy nothing
++            self._flash_notification("No annotation selected to copy")
++            return
++        
++        self.annotation_clipboard = copied
++        count = len(copied)
++        self._flash_notification(f"Copied {count} annotation{'s' if count > 1 else ''}")
++    
++    def paste_annotation(self):
++        """Paste annotations from clipboard with a slight offset."""
++        if not self.current_image or not self.annotation_clipboard:
++            self._flash_notification("Nothing to paste")
++            return
++        
++        self._push_annotation_undo()
++        
++        offset = 0.02  # 2% offset so paste is visible
++        for ann in self.annotation_clipboard:
++            new_ann = list(ann)
++            if len(new_ann) > 5:
++                # Polygon: offset all coordinates
++                for j in range(1, len(new_ann), 2):
++                    new_ann[j] = min(1.0, new_ann[j] + offset)      # x coords
++                for j in range(2, len(new_ann), 2):
++                    new_ann[j] = min(1.0, new_ann[j] + offset)      # y coords
++            else:
++                # Bbox: offset center
++                new_ann[1] = min(1.0, new_ann[1] + offset)
++                new_ann[2] = min(1.0, new_ann[2] + offset)
++            self.annotations.append(new_ann)
++        
++        count = len(self.annotation_clipboard)
++        self.annotations_dirty = True
++        self.save_annotations()
++        self.redraw()
++        self._flash_notification(f"Pasted {count} annotation{'s' if count > 1 else ''}")
+ 
+     def show_class_distribution(self):
+         """Show a popup with class distribution across all images."""
+@@ -1643,10 +1793,6 @@ class AnnotatorApp:
+             # Filter logic based on mode
+             if self.filter_mode == "All":
+                 pass  # No filter
+-            elif self.filter_mode in ("Custom Query", "≡ƒöì Query Active"):
+-                # Custom query - use saved path set
+-                if self.custom_query_paths and p not in self.custom_query_paths:
+-                    continue
+             elif self.filter_mode == "Unannotated":
+                 if cache:  # Has annotations, skip
+                     continue
+@@ -1761,47 +1907,6 @@ class AnnotatorApp:
+                 return True
+         return False
+ 
+-    def _is_duplicate_or_overlapping(self, new_ann, existing_annotations, iou_threshold=0.3, coord_tolerance=0.02):
+-        """Check if a new annotation duplicates or significantly overlaps any existing one.
+-        
+-        Uses two checks:
+-        1. Near-exact coordinate match (catches subtle duplicates)
+-        2. IoU overlap check (catches overlapping boxes of same class)
+-        
+-        Returns True if the annotation should be skipped.
+-        """
+-        new_box = (new_ann[1], new_ann[2], new_ann[3], new_ann[4])
+-        for ann in existing_annotations:
+-            if ann[0] != new_ann[0]:  # Different class - allow overlap
+-                continue
+-            # Check 1: Near-exact coordinate match
+-            if (abs(ann[1] - new_ann[1]) < coord_tolerance and
+-                abs(ann[2] - new_ann[2]) < coord_tolerance and
+-                abs(ann[3] - new_ann[3]) < coord_tolerance and
+-                abs(ann[4] - new_ann[4]) < coord_tolerance):
+-                return True
+-            # Check 2: Significant IoU overlap
+-            existing_box = (ann[1], ann[2], ann[3], ann[4])
+-            if self._boxes_overlap(new_box, existing_box, threshold=iou_threshold):
+-                return True
+-        return False
+-
+-    def _load_annotations_from_file(self, label_path):
+-        """Load annotations from a label file. Returns list of [cid, cx, cy, w, h]."""
+-        annotations = []
+-        if os.path.exists(label_path):
+-            with open(label_path, 'r') as f:
+-                for line in f:
+-                    parts = line.strip().split()
+-                    if len(parts) >= 5:
+-                        try:
+-                            cid = int(parts[0])
+-                            coords = [float(p) for p in parts[1:]]
+-                            annotations.append([cid] + coords)
+-                        except:
+-                            pass
+-        return annotations
+-
+     def on_filter_changed(self, event):
+         # Save before list changes/invalidation
+         if self.current_image:
+@@ -1818,10 +1923,6 @@ class AnnotatorApp:
+         val = self.filter_combo.get()
+         self.filter_mode = val
+         
+-        # Clear custom query paths when switching to a normal filter
+-        if val != "≡ƒöì Query Active":
+-            self.custom_query_paths = None
+-        
+         # Rebuild cache to ensure filter uses fresh annotation data
+         # This is crucial for filters like "Unannotated" and "Missing: X" to work correctly
+         self._build_annotation_cache_and_stats()
+@@ -2050,6 +2151,11 @@ class AnnotatorApp:
+ 
+     def _on_nav_key_press(self, event):
+         """Handle navigation key press - start rapid navigation timer if in rapid mode."""
++        # CRITICAL: Ignore navigation if user is typing in an Entry/Text widget
++        if isinstance(event.widget, (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox)) or \
++           "entry" in str(event.widget).lower() or "text" in str(event.widget).lower():
++            return
++
+         key = event.keysym.lower()
+         direction = None
+         if key in ('left', 'a'):
+@@ -2386,8 +2492,6 @@ class AnnotatorApp:
+         pasted = 0
+         removed = 0
+         if self.repeat_clipboard:
+-            # Save state for undo BEFORE pasting
+-            self._push_annotation_undo()
+             for new_ann in self.repeat_clipboard:
+                 # Find and remove any overlapping annotations of the same class
+                 new_box = (new_ann[1], new_ann[2], new_ann[3], new_ann[4])
+@@ -2465,8 +2569,8 @@ class AnnotatorApp:
+                 self.temp_box_id = None
+             self.first_click_point = None
+         
+-        # ALWAYS save annotations before navigating away - never lose data
+-        if self.current_image and self.current_file_path:
++        # Save annotations only if they were modified
++        if self.current_image and self.current_file_path and self.annotations_dirty:
+             self.save_annotations(force=True)
+ 
+         self.current_index = index
+@@ -2526,27 +2630,32 @@ class AnnotatorApp:
+                     if len(parts) >= 5:
+                         try:
+                             cid = int(parts[0])
+-                            cx = float(parts[1])
+-                            cy = float(parts[2])
+-                            w = float(parts[3])
+-                            h = float(parts[4])
+-                            self.annotations.append([cid, cx, cy, w, h])
++                            coords = [float(p) for p in parts[1:]]
++                            # Both detection (4 coords) and segmentation (>4 coords)
++                            self.annotations.append([cid] + coords)
+                         except: pass
+         
+         # Auto-normalize and clamp annotations to [0, 1] on load
+         needs_resave = False
+         sanitized = []
+         for ann in self.annotations:
+-            cid, cx, cy, w, h = ann
+-            # Clamp center to [0, 1]
+-            new_cx = max(0.0, min(1.0, cx))
+-            new_cy = max(0.0, min(1.0, cy))
+-            # Clamp dimensions so box stays within [0, 1]
+-            new_w = max(0.001, min(abs(w), 2*new_cx, 2*(1-new_cx)))
+-            new_h = max(0.001, min(abs(h), 2*new_cy, 2*(1-new_cy)))
+-            if cx != new_cx or cy != new_cy or w != new_w or h != new_h:
+-                needs_resave = True
+-            sanitized.append([cid, new_cx, new_cy, new_w, new_h])
++            if len(ann) > 5:
++                # Segmentation polygon - clamp all coordinates to [0, 1]
++                cid = ann[0]
++                new_coords = [max(0.0, min(1.0, v)) for v in ann[1:]]
++                if new_coords != ann[1:]:
++                    needs_resave = True
++                sanitized.append([cid] + new_coords)
++            else:
++                # Detection bbox
++                cid, cx, cy, w, h = ann
++                new_cx = max(0.0, min(1.0, cx))
++                new_cy = max(0.0, min(1.0, cy))
++                new_w = max(0.001, min(abs(w), 2*new_cx, 2*(1-new_cx)))
++                new_h = max(0.001, min(abs(h), 2*new_cy, 2*(1-new_cy)))
++                if cx != new_cx or cy != new_cy or w != new_w or h != new_h:
++                    needs_resave = True
++                sanitized.append([cid, new_cx, new_cy, new_w, new_h])
+         self.annotations = sanitized
+         
+         # If any values were clamped, save the corrected file immediately
+@@ -2554,6 +2663,9 @@ class AnnotatorApp:
+             self.current_file_path = path  # Ensure path is set for save
+             self.save_annotations(force=True)
+         
++        # Reset dirty flag since we just loaded (or saved corrected values)
++        self.annotations_dirty = False
++        
+         # Maintain class selection when switching images
+         if self.classes and 0 <= self.selected_class_id < len(self.classes):
+             self.cls_list.selection_clear(0, tk.END)
+@@ -2566,12 +2678,23 @@ class AnnotatorApp:
+         # (Listbox widgets steal letter/number key events for type-to-search)
+         self.canvas.focus_set()
+ 
++    def trigger_autosave(self):
++        """Schedule a save in the near future (debounce). Prevents UI lag."""
++        if self.autosave_timer:
++            self.root.after_cancel(self.autosave_timer)
++        self.autosave_timer = self.root.after(self.autosave_delay, lambda: self.save_annotations(force=False))
++
+     def save_annotations(self, force=False):
+         """Save annotations to disk. Optimized for speed.
+         
+         Args:
+             force: If True, save even if annotations_dirty is False (for critical saves like closing)
+         """
++        # Cancel any pending autosave since we are saving now
++        if self.autosave_timer:
++            self.root.after_cancel(self.autosave_timer)
++            self.autosave_timer = None
++            
+         if not self.current_image: 
+             return
+             
+@@ -2589,18 +2712,25 @@ class AnnotatorApp:
+         with open(lbl_path, 'w') as f:
+             for ann in self.annotations:
+                 cid = ann[0]
+-                cx = max(0.0, min(1.0, ann[1]))
+-                cy = max(0.0, min(1.0, ann[2]))
+-                w = ann[3]
+-                h = ann[4]
+-                
+-                # Clamp dimensions
+-                w = min(w, 2*cx, 2*(1-cx))
+-                h = min(h, 2*cy, 2*(1-cy))
+-                w = max(0.001, w)
+-                h = max(0.001, h)
+-                
+-                f.write(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
++                if len(ann) > 5:
++                    # Segmentation polygon: class_id x1 y1 x2 y2 ... xn yn
++                    coords = [max(0.0, min(1.0, v)) for v in ann[1:]]
++                    coord_str = ' '.join(f"{v:.6f}" for v in coords)
++                    f.write(f"{cid} {coord_str}\n")
++                else:
++                    # Detection bbox: class_id cx cy w h
++                    cx = max(0.0, min(1.0, ann[1]))
++                    cy = max(0.0, min(1.0, ann[2]))
++                    w = ann[3]
++                    h = ann[4]
++                    
++                    # Clamp dimensions
++                    w = min(w, 2*cx, 2*(1-cx))
++                    h = min(h, 2*cy, 2*(1-cy))
++                    w = max(0.001, w)
++                    h = max(0.001, h)
++                    
++                    f.write(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
+         
+         # Update cache
+         cids = set(a[0] for a in self.annotations)
+@@ -2615,6 +2745,16 @@ class AnnotatorApp:
+     def on_canvas_resize(self, event):
+         if self.current_image:
+             self.redraw()
++    
++    def _img_to_canvas(self, ix, iy):
++        """Convert image pixel coordinates to canvas coordinates (zoom-aware)."""
++        return ix * self.scale + self.offset_x, iy * self.scale + self.offset_y
++    
++    def _norm_to_canvas(self, nx, ny):
++        """Convert normalized image coordinates to canvas coordinates (zoom-aware)."""
++        if not self.current_image: return 0, 0
++        iw, ih = self.current_image.size
++        return self._img_to_canvas(nx * iw, ny * ih)
+ 
+     def show_image_info(self):
+         """Show debug info about current image and label mapping."""
+@@ -2652,34 +2792,11 @@ class AnnotatorApp:
+ 
+         messagebox.showinfo("Image Info", msg)
+ 
+-    def _update_current_image_stats(self):
+-        """Update the per-image annotation count and per-class breakdown in the stats panel."""
+-        total = len(self.annotations)
+-        if total == 0:
+-            self.stats_current_img_var.set("This Image: 0 annotations")
+-            self.stats_current_classes_var.set("")
+-            return
+-        
+-        self.stats_current_img_var.set(f"This Image: {total} annotation{'s' if total != 1 else ''}")
+-        
+-        # Per-class breakdown
+-        class_counts = {}
+-        for ann in self.annotations:
+-            cid = ann[0]
+-            class_counts[cid] = class_counts.get(cid, 0) + 1
+-        
+-        breakdown_parts = []
+-        for cid in sorted(class_counts.keys()):
+-            name = self.classes[cid] if 0 <= cid < len(self.classes) else str(cid)
+-            breakdown_parts.append(f"  {name}: {class_counts[cid]}")
+-        
+-        self.stats_current_classes_var.set("\n".join(breakdown_parts))
+-
+-    def redraw(self):
++    def redraw(self, high_quality=True):
+         if not self.current_image: return
+ 
+         self.canvas.delete("all")
+-        self.crosshair_lines = [] # Reset crosshair IDs since they were deleted
++        self.crosshair_lines = [] # Reset crosshair IDs
+         
+         # Calculate scaling to fit
+         cw = self.canvas.winfo_width()
+@@ -2687,96 +2804,223 @@ class AnnotatorApp:
+         if cw < 10 or ch < 10: return
+         
+         iw, ih = self.current_image.size
+-        scale_w = cw / iw
+-        scale_h = ch / ih
+-        self.scale = min(scale_w, scale_h) * 0.95 # 95% to leave margin
++        
++        # Base scale to fit image in canvas (with 95% margin)
++        base_scale = min(cw / iw, ch / ih) * 0.95
++        # Ensure zoom level is reasonable
++        self.zoom_level = max(0.1, min(self.zoom_level, 50.0))
++        self.scale = base_scale * self.zoom_level
+         
+         nw = int(iw * self.scale)
+         nh = int(ih * self.scale)
+         
+-        self.offset_x = (cw - nw) // 2
+-        self.offset_y = (ch - nh) // 2
+-        
+-        # Resample
+-        disp = self.current_image.resize((nw, nh), Image.Resampling.LANCZOS)
++        # When zoomed, offset so zoom_center stays at canvas center
++        zcx = self.zoom_center_nx * nw
++        zcy = self.zoom_center_ny * nh
++        ccx = cw / 2
++        ccy = ch / 2
++        self.offset_x = int(ccx - zcx)
++        self.offset_y = int(ccy - zcy)
++        
++        # Resample - Use NEAREST for speed during interaction, LANCZOS for quality
++        resample_mode = Image.Resampling.LANCZOS if high_quality else Image.Resampling.NEAREST
++        
++        # Resize full image (simpler and more consistent)
++        disp = self.current_image.resize((nw, nh), resample_mode)
++        disp_x = self.offset_x
++        disp_y = self.offset_y
++        
++        # Draw semi-transparent polygon fills directly on the display image
++        has_polygons = any(len(ann) > 5 for ann in self.annotations)
++        if has_polygons:
++            try:
++                if disp.mode != 'RGBA':
++                    disp = disp.convert('RGBA')
++                
++                # Create overlay for polygon fills
++                overlay = Image.new('RGBA', disp.size, (0, 0, 0, 0))
++                draw = ImageDraw.Draw(overlay)
++                
++                for ann in self.annotations:
++                    if len(ann) <= 5:
++                        continue  # Skip bboxes
++                    
++                    if self.show_only_selected_class.get() and ann[0] != self.selected_class_id:
++                        continue
++                    
++                    hex_col = self.class_colors.get(ann[0], "#FFFFFF")
++                    try:
++                        r = int(hex_col[1:3], 16)
++                        g = int(hex_col[3:5], 16)
++                        b = int(hex_col[5:7], 16)
++                    except:
++                        r, g, b = 255, 255, 255
++                    
++                    # Semi-transparent fill
++                    fill_color = (r, g, b, 50)  # ~20% opacity
++                    
++                    # Convert normalized coords directly to display image coords
++                    coords = ann[1:]
++                    poly_pts = []
++                    for j in range(0, len(coords), 2):
++                        # Normalized -> display image pixel
++                        px = coords[j] * nw
++                        py = coords[j+1] * nh
++                        poly_pts.append((px, py))
++                    
++                    if len(poly_pts) >= 3:
++                        draw.polygon(poly_pts, fill=fill_color)
++                
++                # Composite overlay onto display image
++                disp = Image.alpha_composite(disp, overlay)
++            except Exception as e:
++                print(f"Error drawing polygon fills: {e}")
++
+         self.photo_image = ImageTk.PhotoImage(disp)
+-        
+-        self.canvas.create_image(self.offset_x, self.offset_y, anchor=NW, image=self.photo_image)
++        self.canvas.create_image(disp_x, disp_y, anchor=NW, image=self.photo_image)
+         
+         # Update image size display
+-        self.image_size_var.set(f"{iw} ├ù {ih}")
++        zoom_str = f"  [{self.zoom_level:.1f}x]" if self.zoom_level > 1.0 else ""
++        self.image_size_var.set(f"{iw} x {ih}{zoom_str}")
+         
+-        # Draw Annotations
++        # Draw Annotation Outlines on canvas (faster than PIL for lines)
+         for i, ann in enumerate(self.annotations):
+-            # Filter by selected class if toggle is enabled
+-            if self.show_only_selected_class.get():
+-                if ann[0] != self.selected_class_id:
+-                    continue  # Skip annotations that don't match selected class
+-            self.draw_box(i, ann)
++            if self.show_only_selected_class.get() and ann[0] != self.selected_class_id:
++                continue
++            self.draw_annotation(i, ann)
++        
++        # Draw segmentation preview if actively drawing
++        if self.seg_drawing and self.seg_points:
++            self._draw_seg_preview()
+             
+-        # Ensure Crosshair stays on top if it exists
+         if self.crosshair_lines:
+             self.canvas.tag_raise("crosshair")
+-        
+-        # Update current image annotation stats
+-        self._update_current_image_stats()
+ 
+-    def draw_box(self, index, ann):
+-        cid, n_cx, n_cy, n_w, n_h = ann
+-        iw, ih = self.current_image.size
+-        
+-        # Normalized Center -> Pixel TopLeft
+-        w_px = n_w * iw
+-        h_px = n_h * ih
+-        cx_px = n_cx * iw
+-        cy_px = n_cy * ih
+-        
+-        x1_px = cx_px - w_px/2
+-        y1_px = cy_px - h_px/2
+-        x2_px = cx_px + w_px/2
+-        y2_px = cy_px + h_px/2
+-        
+-        # Transform to Canvas
+-        sx1 = x1_px * self.scale + self.offset_x
+-        sy1 = y1_px * self.scale + self.offset_y
+-        sx2 = x2_px * self.scale + self.offset_x
+-        sy2 = y2_px * self.scale + self.offset_y
++    def draw_annotation(self, index, ann):
++        """Draw a single annotation - either bounding box or segmentation polygon."""
++        cid = ann[0]
++        is_polygon = len(ann) > 5  # Segmentation: [cid, x1, y1, x2, y2, ..., xn, yn]
+         
+         color = self.class_colors.get(cid, "#FFFFFF")
+-        
+-        # Determine outline width/style (highlight if selected or moving)
+         width = 2
+-        dash = None
+         is_selected = index in self.selected_annotations
++        is_active = index == self.active_annotation_index
++        in_edit = self.edit_mode.get()
+         
+-        if index == self.active_annotation_index:
++        if is_active:
+              width = 3
+              color = "#FFFF00"  # Yellow for actively being dragged
+         elif is_selected:
+              width = 3
+              color = self.SELECTED_COLOR  # Cyan for multi-selected
+         
+-        rect = self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline=color, width=width, dash=dash, tags=f"ann_{index}")
+-        
+-        # Label - show checkmark for selected annotations
++        # Label text
+         label = str(cid)
+         if 0 <= cid < len(self.classes):
+             label = self.classes[cid]
+         if is_selected:
+-            label = "Γ£ô " + label  # Add checkmark to indicate selection
++            label = "Γ£ô " + label
++        
++        if is_polygon:
++            # Segmentation polygon
++            coords = ann[1:]  # [x1, y1, x2, y2, ..., xn, yn]
++            canvas_points = []
++            for j in range(0, len(coords), 2):
++                nx, ny = coords[j], coords[j+1]
++                cx, cy = self._norm_to_canvas(nx, ny)
++                canvas_points.extend([cx, cy])
++            
++            if len(canvas_points) >= 6:  # At least 3 points
++                # Semi-transparent fill is now handled in redraw() for true alpha blending
++                # Solid outline on top for crisp edges
++                self.canvas.create_polygon(canvas_points, outline=color, fill='', 
++                                          width=width, tags=f"ann_{index}")
++                
++                # Draw vertex dots
++                dot_r = 7 if in_edit else 5
++                for j in range(0, len(canvas_points), 2):
++                    px, py = canvas_points[j], canvas_points[j+1]
++                    self.canvas.create_oval(px-dot_r, py-dot_r, px+dot_r, py+dot_r, 
++                                           fill=color, outline="white", width=2, 
++                                           tags=f"ann_{index}")
++                
++                # Label at first vertex
++                self.canvas.create_text(canvas_points[0], canvas_points[1]-12, 
++                                       text=label, fill=color, anchor=SW, 
++                                       font=("Arial", 11, "bold"))
++        else:
++            # Detection bounding box: [cid, cx, cy, w, h]
++            n_cx, n_cy, n_w, n_h = ann[1], ann[2], ann[3], ann[4]
++            iw, ih = self.current_image.size
++            
++            x1_px = (n_cx - n_w/2) * iw
++            y1_px = (n_cy - n_h/2) * ih
++            x2_px = (n_cx + n_w/2) * iw
++            y2_px = (n_cy + n_h/2) * ih
++            
++            sx1, sy1 = self._img_to_canvas(x1_px, y1_px)
++            sx2, sy2 = self._img_to_canvas(x2_px, y2_px)
++            
++            self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline=color, 
++                                        width=width, tags=f"ann_{index}")
++            self.canvas.create_text(sx1, sy1-10, text=label, fill=color, 
++                                   anchor=SW, font=("Arial", 11, "bold"))
++            
++            # Edit mode: draw 8 resize handles
++            if in_edit:
++                mx, my = (sx1 + sx2) / 2, (sy1 + sy2) / 2
++                hr = 5  # handle radius
++                handles = [
++                    (sx1, sy1), (sx2, sy1), (sx1, sy2), (sx2, sy2),  # corners
++                    (mx, sy1), (mx, sy2), (sx1, my), (sx2, my),      # midpoints
++                ]
++                for hx, hy in handles:
++                    self.canvas.create_rectangle(hx-hr, hy-hr, hx+hr, hy+hr,
++                                               fill="white", outline=color, width=2,
++                                               tags=f"ann_{index}_handle")
++    
++    def _draw_seg_preview(self):
++        """Draw the in-progress segmentation polygon on the canvas."""
++        # Clear previous preview items
++        self.canvas.delete("seg_preview")
+         
+-        self.canvas.create_text(sx1, sy1-10, text=label, fill=color, anchor=SW, font=("Arial", 11, "bold"))
++        if not self.seg_points or not self.current_image:
++            return
++        
++        color = self.class_colors.get(self.selected_class_id, "#FFFFFF")
++        
++        # Draw lines between points first (so dots appear on top)
++        if len(self.seg_points) >= 2:
++            for j in range(len(self.seg_points) - 1):
++                x1, y1 = self._norm_to_canvas(*self.seg_points[j])
++                x2, y2 = self._norm_to_canvas(*self.seg_points[j+1])
++                self.canvas.create_line(x1, y1, x2, y2, fill=color, width=2, 
++                                       dash=(4, 2), tags="seg_preview")
++        
++        # Highlight first point (close target) - draw before dots so it's behind
++        if len(self.seg_points) >= 3:
++            fx, fy = self._norm_to_canvas(*self.seg_points[0])
++            r = 9
++            self.canvas.create_oval(fx-r, fy-r, fx+r, fy+r, fill='', 
++                                   outline="#00FF00", width=3, tags="seg_preview")
++        
++        # Draw dots at each point (on top)
++        for idx, (nx, ny) in enumerate(self.seg_points):
++            cx, cy = self._norm_to_canvas(nx, ny)
++            r = 6  # dot radius
++            self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill=color, 
++                                   outline="white", width=2, tags="seg_preview")
+ 
+     # --- MOUSE INTERACTION ---
+ 
+     def _get_img_coords(self, ex, ey):
+-        # Canvas -> Image Pixels
++        """Canvas -> Image Pixels (zoom-aware)."""
+         ix = (ex - self.offset_x) / self.scale
+         iy = (ey - self.offset_y) / self.scale
+         return ix, iy
+ 
+     def _get_norm_coords(self, ex, ey):
+-        # Canvas -> Normalized
++        """Canvas -> Normalized (zoom-aware)."""
+         if not self.current_image: return 0,0
+         ix, iy = self._get_img_coords(ex, ey)
+         nx = ix / self.current_image.width
+@@ -2790,6 +3034,7 @@ class AnnotatorApp:
+         
+         ix, iy = self._get_img_coords(event_x, event_y)
+         iw, ih = self.current_image.width, self.current_image.height
++        nx_pt, ny_pt = ix / iw, iy / ih
+         
+         # Iterate reverse to pick topmost
+         for i in range(len(self.annotations)-1, -1, -1):
+@@ -2800,16 +3045,322 @@ class AnnotatorApp:
+                 if ann[0] != self.selected_class_id:
+                     continue  # Skip annotations that are currently hidden
+             
+-            n_cx, n_cy, n_w, n_h = ann[1:]
++            if len(ann) > 5:
++                # Polygon: point-in-polygon test (ray casting)
++                coords = ann[1:]
++                n = len(coords) // 2
++                inside = False
++                j = n - 1
++                for k in range(n):
++                    xi, yi = coords[k*2], coords[k*2+1]
++                    xj, yj = coords[j*2], coords[j*2+1]
++                    if ((yi > ny_pt) != (yj > ny_pt)) and \
++                       (nx_pt < (xj - xi) * (ny_pt - yi) / (yj - yi) + xi):
++                        inside = not inside
++                    j = k
++                if inside:
++                    return i
++            else:
++                # Bounding box
++                n_cx, n_cy, n_w, n_h = ann[1:]
++                l = (n_cx - n_w/2) * iw
++                r = (n_cx + n_w/2) * iw
++                t = (n_cy - n_h/2) * ih
++                b = (n_cy + n_h/2) * ih
++                if l <= ix <= r and t <= iy <= b:
++                    return i
++        return -1
++    
++    # --- EDIT MODE HELPERS ---
++    
++    def _toggle_edit_mode(self):
++        """Toggle edit mode on/off."""
++        self.edit_mode.set(not self.edit_mode.get())
++        self.redraw()
++    
++    def _find_vertex_near(self, ex, ey, threshold=10):
++        """Find the closest polygon vertex near canvas coordinates.
++        Returns (annotation_index, vertex_index) or (-1, -1)."""
++        if not self.current_image:
++            return -1, -1
++        
++        best_dist = threshold
++        best_ann = -1
++        best_vert = -1
++        
++        for i in range(len(self.annotations)-1, -1, -1):
++            ann = self.annotations[i]
++            if len(ann) <= 5:
++                continue  # Only polygons
+             
+-            l = (n_cx - n_w/2) * iw
+-            r = (n_cx + n_w/2) * iw
+-            t = (n_cy - n_h/2) * ih
+-            b = (n_cy + n_h/2) * ih
++            # Respect filter
++            if self.show_only_selected_class.get() and ann[0] != self.selected_class_id:
++                continue
+             
+-            if l <= ix <= r and t <= iy <= b:
+-                return i
+-        return -1
++            coords = ann[1:]
++            for j in range(0, len(coords), 2):
++                vx, vy = self._norm_to_canvas(coords[j], coords[j+1])
++                dist = ((ex - vx)**2 + (ey - vy)**2)**0.5
++                if dist < best_dist:
++                    best_dist = dist
++                    best_ann = i
++                    best_vert = j // 2  # vertex index (0-based)
++        
++        return best_ann, best_vert
++    
++    def _get_bbox_handles(self, ann):
++        """Get the 8 resize handle positions for a bbox annotation.
++        Returns list of (handle_name, canvas_x, canvas_y)."""
++        if not self.current_image:
++            return []
++        
++        n_cx, n_cy, n_w, n_h = ann[1], ann[2], ann[3], ann[4]
++        iw, ih = self.current_image.size
++        
++        x1_px = (n_cx - n_w/2) * iw
++        y1_px = (n_cy - n_h/2) * ih
++        x2_px = (n_cx + n_w/2) * iw
++        y2_px = (n_cy + n_h/2) * ih
++        
++        sx1, sy1 = self._img_to_canvas(x1_px, y1_px)
++        sx2, sy2 = self._img_to_canvas(x2_px, y2_px)
++        mx, my = (sx1 + sx2) / 2, (sy1 + sy2) / 2
++        
++        return [
++            ("tl", sx1, sy1), ("tr", sx2, sy1),
++            ("bl", sx1, sy2), ("br", sx2, sy2),
++            ("t", mx, sy1), ("b", mx, sy2),
++            ("l", sx1, my), ("r", sx2, my),
++        ]
++    
++    def _find_bbox_handle_near(self, ex, ey, threshold=10):
++        """Find the closest bbox resize handle near canvas coordinates.
++        Returns (annotation_index, handle_name) or (-1, None)."""
++        if not self.current_image:
++            return -1, None
++        
++        best_dist = threshold
++        best_ann = -1
++        best_handle = None
++        
++        for i in range(len(self.annotations)-1, -1, -1):
++            ann = self.annotations[i]
++            if len(ann) > 5:
++                continue  # Only bboxes
++            
++            # Respect filter
++            if self.show_only_selected_class.get() and ann[0] != self.selected_class_id:
++                continue
++            
++            for handle_name, hx, hy in self._get_bbox_handles(ann):
++                dist = ((ex - hx)**2 + (ey - hy)**2)**0.5
++                if dist < best_dist:
++                    best_dist = dist
++                    best_ann = i
++                    best_handle = handle_name
++        
++        return best_ann, best_handle
++    
++    # --- ZOOM & PAN ---
++    
++    def _on_scroll_zoom(self, event):
++        """Zoom in/out centered on cursor position."""
++        if not self.current_image:
++            return
++        
++        # Get cursor position in normalized image coords BEFORE zoom
++        nx, ny = self._get_norm_coords(event.x, event.y)
++        
++        # Determine zoom direction
++        if event.delta > 0:
++            new_zoom = min(self.zoom_level * 1.2, 10.0)
++        else:
++            new_zoom = max(self.zoom_level / 1.2, 1.0)
++        
++        if new_zoom != self.zoom_level:
++            # Set zoom center to cursor position (clamped to image bounds)
++            self.zoom_center_nx = max(0.0, min(1.0, nx))
++            self.zoom_center_ny = max(0.0, min(1.0, ny))
++            self.zoom_level = new_zoom
++            self.redraw(high_quality=False) # Fast redraw during scroll
++            
++            # Schedule high-quality redraw after scrolling stops
++            if hasattr(self, '_zoom_hq_timer') and self._zoom_hq_timer:
++                self.root.after_cancel(self._zoom_hq_timer)
++            self._zoom_hq_timer = self.root.after(150, self._zoom_hq_redraw)
++    
++    def _zoom_hq_redraw(self):
++        """Perform high-quality redraw after zoom interaction ends."""
++        self._zoom_hq_timer = None
++        self.redraw(high_quality=True)
++    
++    def _reset_zoom(self, event=None):
++        """Reset zoom and recenter image (spacebar)."""
++        self.zoom_level = 1.0
++        self.zoom_center_nx = 0.5
++        self.zoom_center_ny = 0.5
++        self.redraw()
++        self.canvas.focus_set()
++    
++    def _on_pan_start(self, event):
++        """Start panning with middle mouse button."""
++        self._pan_last_x = event.x
++        self._pan_last_y = event.y
++    
++    def _on_pan_drag(self, event):
++        """Pan the view by dragging with middle mouse button."""
++        if not self.current_image or self.zoom_level <= 1.0:
++            return
++        
++        dx = event.x - self._pan_last_x
++        dy = event.y - self._pan_last_y
++        self._pan_last_x = event.x
++        self._pan_last_y = event.y
++        
++        # Convert canvas pixel delta to normalized image delta
++        iw, ih = self.current_image.size
++        dnx = dx / (iw * self.scale)
++        dny = dy / (ih * self.scale)
++        
++        self.zoom_center_nx = max(0.0, min(1.0, self.zoom_center_nx - dnx))
++        self.zoom_center_ny = max(0.0, min(1.0, self.zoom_center_ny - dny))
++        self.redraw(high_quality=False)  # Fast redraw during pan
++        
++        # Schedule high-quality redraw after panning stops
++        if hasattr(self, '_pan_hq_timer') and self._pan_hq_timer:
++            self.root.after_cancel(self._pan_hq_timer)
++        self._pan_hq_timer = self.root.after(150, self._pan_hq_redraw)
++    
++    def _pan_hq_redraw(self):
++        """Perform high-quality redraw after pan interaction ends."""
++        self._pan_hq_timer = None
++        self.redraw(high_quality=True)
++    
++    # --- ANNOTATION MODE ---
++    
++    def _on_mode_changed(self, event=None):
++        """Handle annotation mode change between Detection and Segmentation."""
++        mode = self.annotation_mode.get()
++        
++        # Cancel any in-progress segmentation
++        self._seg_cancel()
++        
++        # Cancel any in-progress click mode annotation
++        if self.click_mode.get() and self.first_click_point:
++            if self.temp_box_id:
++                self.canvas.delete(self.temp_box_id)
++                self.temp_box_id = None
++            self.first_click_point = None
++        
++        # Check for mixed format warnings
++        if self.annotations:
++            has_bbox = any(len(a) == 5 for a in self.annotations)
++            has_seg = any(len(a) > 5 for a in self.annotations)
++            if mode == "Segmentation" and has_bbox:
++                messagebox.showwarning("Mixed Format", 
++                    "This image has bounding box annotations.\n\n"
++                    "New annotations will be polygons. Existing bboxes are preserved.\n"
++                    "YOLO training typically expects uniform format per dataset.")
++            elif mode == "Detection" and has_seg:
++                messagebox.showwarning("Mixed Format",
++                    "This image has polygon segmentation annotations.\n\n"
++                    "New annotations will be bounding boxes. Existing polygons are preserved.\n"
++                    "YOLO training typically expects uniform format per dataset.")
++        
++        self.status_var.set(f"Mode: {mode}")
++        # Return focus to canvas for keyboard shortcuts
++        self.canvas.focus_set()
++    
++    # --- SEGMENTATION DRAWING ---
++    
++    def _seg_on_click(self, event):
++        """Handle click to add a point in segmentation polygon drawing."""
++        if not self.current_image:
++            return
++        
++        nx, ny = self._get_norm_coords(event.x, event.y)
++        # Clamp to image bounds
++        nx = max(0.0, min(1.0, nx))
++        ny = max(0.0, min(1.0, ny))
++        
++        if not self.seg_drawing:
++            # Start new polygon
++            self._push_annotation_undo()
++            self.seg_drawing = True
++            self.seg_points = [(nx, ny)]
++            # Draw first point immediately (no full redraw needed)
++            self._draw_seg_preview()
++            self.status_var.set("Segmentation: click to add points, click near green circle or double-click to close, right-click to cancel")
++            return
++        
++        # Check if clicking near the first point to close (within 10 canvas pixels)
++        if len(self.seg_points) >= 3:
++            fx, fy = self._norm_to_canvas(*self.seg_points[0])
++            dist = ((event.x - fx)**2 + (event.y - fy)**2)**0.5
++            if dist < 12:
++                self._seg_finalize()
++                return
++        
++        # Add point and draw incrementally (no full redraw)
++        self.seg_points.append((nx, ny))
++        self._draw_seg_preview()  # Just update the preview, much faster
++        self.status_var.set(f"Segmentation: {len(self.seg_points)} points (need ΓëÑ3 to close)")
++    
++    def _seg_on_double_click(self, event):
++        """Handle double-click to close segmentation polygon."""
++        if self.annotation_mode.get() != "Segmentation" or not self.seg_drawing:
++            return
++        
++        if len(self.seg_points) >= 3:
++            self._seg_finalize()
++        else:
++            self.status_var.set("Need at least 3 points to close polygon")
++    
++    def _seg_finalize(self):
++        """Finalize the current segmentation polygon as an annotation."""
++        if len(self.seg_points) < 3:
++            self.status_var.set("Need at least 3 points for polygon")
++            return
++        
++        # Build annotation: [class_id, x1, y1, x2, y2, ..., xn, yn]
++        ann = [self.selected_class_id]
++        for nx, ny in self.seg_points:
++            ann.append(round(nx, 6))
++            ann.append(round(ny, 6))
++        
++        self.annotations.append(ann)
++        self.annotations_dirty = True
++        self.save_annotations()
++        
++        # Reset seg state
++        self.seg_points = []
++        self.seg_drawing = False
++        self.seg_preview_ids = []
++        
++        self.redraw(high_quality=True)  # High quality redraw after finalizing
++        self.status_var.set(f"Polygon added (class {self.selected_class_id}, {len(ann)//2} points)")
++    
++    def _seg_cancel(self):
++        """Cancel the current in-progress segmentation polygon."""
++        if self.seg_drawing:
++            self.seg_points = []
++            self.seg_drawing = False
++            self.seg_preview_ids = []
++            # Pop the undo state we pushed when starting
++            if self.annotation_undo_stack:
++                self.annotation_undo_stack.pop()
++            self.redraw(high_quality=True)  # Clean redraw after cancel
++            self.status_var.set("Segmentation cancelled")
++    
++    def _seg_undo_last_point(self):
++        """Remove the last point from the in-progress segmentation polygon."""
++        if self.seg_drawing and self.seg_points:
++            self.seg_points.pop()
++            if not self.seg_points:
++                self._seg_cancel()
++            else:
++                self.redraw()
++                self.status_var.set(f"Removed point ({len(self.seg_points)} remaining)")
+ 
+     def on_ctrl_click(self, event):
+         """Handle Ctrl+Click to toggle annotation selection for repeat function."""
+@@ -2838,7 +3389,12 @@ class AnnotatorApp:
+             self.status_var.set("Selection cleared")
+ 
+     def escape_action(self):
+-        """Handle Escape key - clear selection and unlock class."""
++        """Handle Escape key - cancel seg polygon, clear selection, unlock class."""
++        # Cancel in-progress segmentation polygon
++        if self.seg_drawing:
++            self._seg_cancel()
++            return
++        
+         # Cancel partial click annotation if in click mode
+         if self.click_mode.get() and self.first_click_point:
+             if self.temp_box_id:
+@@ -2860,6 +3416,73 @@ class AnnotatorApp:
+     def on_mouse_down(self, event):
+         if not self.current_image: return
+         
++        # EDIT MODE: vertex drag / bbox handle resize take priority
++        if self.edit_mode.get() and not self.seg_drawing:
++            # 1. Check polygon vertex hit
++            v_ann, v_idx = self._find_vertex_near(event.x, event.y)
++            if v_ann != -1:
++                self._push_annotation_undo()
++                self.drag_mode = "vertex_drag"
++                self.drag_ann_idx = v_ann
++                self.dragging_vertex_idx = v_idx
++                self.active_annotation_index = v_ann
++                self.start_x = event.x
++                self.start_y = event.y
++                self.redraw(high_quality=False)
++                return
++            
++            # 2. Check bbox handle hit
++            h_ann, h_name = self._find_bbox_handle_near(event.x, event.y)
++            if h_ann != -1:
++                self._push_annotation_undo()
++                self.drag_mode = "resize"
++                self.drag_ann_idx = h_ann
++                self.dragging_handle = h_name
++                self.active_annotation_index = h_ann
++                self.start_x = event.x
++                self.start_y = event.y
++                # Get initial bounds for ratio calc if needed
++                self.drag_start_norm_bbox = list(self.annotations[h_ann][1:]) # [cx, cy, w, h]
++                self.redraw(high_quality=False)
++                return
++            
++            # 3. Check annotation body hit for move
++            hit_index = self._find_annotation_at_point(event.x, event.y)
++            if hit_index != -1:
++                self._push_annotation_undo()
++                self.drag_mode = "move"
++                self.active_annotation_index = hit_index
++                self.start_x = event.x
++                self.start_y = event.y
++                ann = self.annotations[hit_index]
++                self.drag_start_norm_bbox = list(ann[1:])
++                self.redraw()
++                return
++        
++        # SEGMENTATION MODE: click to add polygon points
++        if self.annotation_mode.get() == "Segmentation":
++            # If not currently drawing, check if we hit an existing annotation to move it
++            if not self.seg_drawing and not self.draw_only_mode.get() and not self.edit_mode.get():
++                hit_index = self._find_annotation_at_point(event.x, event.y)
++                if hit_index != -1:
++                    # Allow selecting/moving existing annotations
++                    self._push_annotation_undo()
++                    self.drag_mode = "move"
++                    self.active_annotation_index = hit_index
++                    self.start_x = event.x
++                    self.start_y = event.y
++                    # Store only coordinates (without class ID) for consistency
++                    self.drag_start_norm_bbox = list(self.annotations[hit_index][1:]) # Copy coordinates only
++                    # Force focus to canvas to ensure shortcuts work
++                    self.canvas.focus_set()
++                    self.redraw(high_quality=False)
++                    return
++            # Add a segmentation point
++            self._seg_on_click(event)
++            # Force focus on click to fix shortcuts
++            self.canvas.focus_set()
++            return
++        
+         # CLICK MODE: Two-click annotation
+         if self.click_mode.get():
+             if self.first_click_point is None:
+@@ -2908,11 +3531,13 @@ class AnnotatorApp:
+                 
+                 new_ann = [self.selected_class_id, ncx, ncy, nw, nh]
+                 self.annotations.append(new_ann)
+-                self.last_drawn_box = list(new_ann)  # Save for R to repeat
++                self.last_drawn_box = list(new_ann)
++                self.current_rect_id = None
+                 self.annotations_dirty = True
+-                self.save_annotations()  # IMMEDIATELY save after creating
+                 self.redraw()
+                 self.status_var.set(f"Annotation added (class {self.selected_class_id})")
++            # Force focus on click to fix shortcuts
++            self.canvas.focus_set()
+             return
+         
+         # DRAG MODE: Original behavior
+@@ -2934,19 +3559,37 @@ class AnnotatorApp:
+                 # If class is locked, only consider annotations of that class
+                 if class_locked and ann[0] != self.selected_class_id:
+                     continue
+-                    
+-                # ann is [class_id, cx, cy, w, h] norm
+-                n_cx, n_cy, n_w, n_h = ann[1:]
+-                
+-                # Convert to pixel bbox
+-                l = (n_cx - n_w/2) * iw
+-                r = (n_cx + n_w/2) * iw
+-                t = (n_cy - n_h/2) * ih
+-                b = (n_cy + n_h/2) * ih
+                 
+-                if l <= ix <= r and t <= iy <= b:
+-                    hit_index = i
+-                    break
++                if len(ann) > 5:
++                    # Polygon: use point-in-polygon check
++                    coords = ann[1:]
++                    n = len(coords) // 2
++                    inside = False
++                    j_idx = n - 1
++                    nx_pt, ny_pt = ix / iw, iy / ih
++                    for k in range(n):
++                        xi, yi = coords[k*2], coords[k*2+1]
++                        xj, yj = coords[j_idx*2], coords[j_idx*2+1]
++                        if ((yi > ny_pt) != (yj > ny_pt)) and \
++                           (nx_pt < (xj - xi) * (ny_pt - yi) / (yj - yi) + xi):
++                            inside = not inside
++                        j_idx = k
++                    if inside:
++                        hit_index = i
++                        break
++                else:
++                    # ann is [class_id, cx, cy, w, h] norm
++                    n_cx, n_cy, n_w, n_h = ann[1:]
++                    
++                    # Convert to pixel bbox
++                    l = (n_cx - n_w/2) * iw
++                    r = (n_cx + n_w/2) * iw
++                    t = (n_cy - n_h/2) * ih
++                    b = (n_cy + n_h/2) * ih
++                    
++                    if l <= ix <= r and t <= iy <= b:
++                        hit_index = i
++                        break
+         
+         if hit_index != -1:
+             # Save state for undo BEFORE moving
+@@ -2960,6 +3603,8 @@ class AnnotatorApp:
+             # Save original state
+             self.drag_start_norm_bbox = list(self.annotations[hit_index][1:]) # copy [cx, cy, w, h]
+             self.redraw() # To show highlight
++            # Force focus on click to fix shortcuts
++            self.canvas.focus_set()
+             return
+             
+         # 2. Else loop: Create Mode
+@@ -2968,6 +3613,8 @@ class AnnotatorApp:
+         self.start_x = event.x
+         self.start_y = event.y
+         self.current_rect_id = self.canvas.create_rectangle(self.start_x, self.start_y, self.start_x, self.start_y, outline="white", width=2, dash=(2,2))
++        # Force focus on click to fix shortcuts
++        self.canvas.focus_set()
+ 
+     def on_mouse_drag(self, event):
+         self.on_mouse_move(event) # Update crosshair
+@@ -2975,14 +3622,78 @@ class AnnotatorApp:
+              # Update current rect
+              cur_x, cur_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+              self.canvas.coords(self.current_rect_id, self.start_x, self.start_y, cur_x, cur_y)
++        elif self.drag_mode == "vertex_drag" and self.drag_ann_idx != -1:
++             # Move a single polygon vertex
++             nx, ny = self._get_norm_coords(event.x, event.y)
++             nx = max(0.0, min(1.0, nx))
++             ny = max(0.0, min(1.0, ny))
++             ann = self.annotations[self.drag_ann_idx]
++             vi = self.dragging_vertex_idx
++             ann[1 + vi * 2] = nx
++             ann[2 + vi * 2] = ny
++             # Throttled redraw for vertex dragging
++             if not hasattr(self, '_last_drag_redraw_pos'):
++                 self._last_drag_redraw_pos = (event.x, event.y)
++                 self.redraw(high_quality=False)
++             else:
++                 last_x, last_y = self._last_drag_redraw_pos
++                 if abs(event.x - last_x) > 3 or abs(event.y - last_y) > 3:
++                     self._last_drag_redraw_pos = (event.x, event.y)
++                     self.redraw(high_quality=False)
++        elif self.drag_mode == "resize" and self.drag_ann_idx != -1:
++             # Resize bbox by dragging a handle
++             ann = self.annotations[self.drag_ann_idx]
++             orig = self.drag_start_norm_bbox  # [cx, cy, w, h]
++             if not orig: return
++             
++             o_cx, o_cy, o_w, o_h = orig[0], orig[1], orig[2], orig[3]
++             # Original edges in normalized coords
++             o_left = o_cx - o_w / 2
++             o_right = o_cx + o_w / 2
++             o_top = o_cy - o_h / 2
++             o_bottom = o_cy + o_h / 2
++             
++             # Current cursor in normalized coords
++             cnx, cny = self._get_norm_coords(event.x, event.y)
++             cnx = max(0.0, min(1.0, cnx))
++             cny = max(0.0, min(1.0, cny))
++             
++             handle = self.dragging_handle
++             new_left, new_right = o_left, o_right
++             new_top, new_bottom = o_top, o_bottom
++             
++             # Update edges based on handle
++             if handle in ("tl", "l", "bl"):
++                 new_left = min(cnx, o_right - 0.001)
++             if handle in ("tr", "r", "br"):
++                 new_right = max(cnx, o_left + 0.001)
++             if handle in ("tl", "t", "tr"):
++                 new_top = min(cny, o_bottom - 0.001)
++             if handle in ("bl", "b", "br"):
++                 new_bottom = max(cny, o_top + 0.001)
++             
++             # Convert back to cx, cy, w, h
++             ann[3] = new_right - new_left
++             ann[4] = new_bottom - new_top
++             ann[1] = new_left + ann[3] / 2
++             ann[2] = new_top + ann[4] / 2
++             
++             # Throttled redraw
++             if not hasattr(self, '_last_resize_redraw_pos'):
++                 self._last_resize_redraw_pos = (event.x, event.y)
++                 self.redraw(high_quality=False)
++             else:
++                 last_x, last_y = self._last_resize_redraw_pos
++                 if abs(event.x - last_x) > 3 or abs(event.y - last_y) > 3:
++                     self._last_resize_redraw_pos = (event.x, event.y)
++                     self.redraw(high_quality=False)
+         elif self.drag_mode == "move" and self.active_annotation_index != -1:
+              # Calculate delta
+              cur_x, cur_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+              dx = cur_x - self.start_x
+              dy = cur_y - self.start_y
+              
+-             # Get original bbox
+-             # [cx, cy, w, h]
++             # Get original data
+              orig = self.drag_start_norm_bbox
+              if not orig: return
+              
+@@ -2993,10 +3704,28 @@ class AnnotatorApp:
+              
+              # Update annotation
+              ann = self.annotations[self.active_annotation_index]
+-             ann[1] = self.drag_start_norm_bbox[0] + dnx
+-             ann[2] = self.drag_start_norm_bbox[1] + dny
++             if len(ann) > 5:
++                 # Polygon: translate all points
++                 # orig contains coordinates only (no class ID), same length as ann[1:]
++                 for j in range(0, len(orig), 2):
++                     if 1 + j < len(ann) and 2 + j < len(ann):
++                         ann[1 + j] = orig[j] + dnx
++                         ann[2 + j] = orig[j + 1] + dny
++             else:
++                 # Bbox: translate center
++                 ann[1] = orig[0] + dnx
++                 ann[2] = orig[1] + dny
+              
+-             self.redraw()
++             # Throttled redraw - only redraw every few pixels of movement to reduce lag
++             if not hasattr(self, '_last_drag_redraw_pos'):
++                 self._last_drag_redraw_pos = (cur_x, cur_y)
++                 self.redraw(high_quality=False)
++             else:
++                 last_x, last_y = self._last_drag_redraw_pos
++                 # Only redraw if moved more than 3 pixels
++                 if abs(cur_x - last_x) > 3 or abs(cur_y - last_y) > 3:
++                     self._last_drag_redraw_pos = (cur_x, cur_y)
++                     self.redraw(high_quality=False)
+              
+              # Only save on mouse up to avoid disk spam
+              
+@@ -3009,6 +3738,14 @@ class AnnotatorApp:
+                              self.first_click_point[0], self.first_click_point[1], 
+                              cur_x, cur_y)
+         
++        # Segmentation: draw preview line from last point to cursor
++        if self.seg_drawing and self.seg_points and self.current_image:
++            self.canvas.delete("seg_cursor_line")
++            lx, ly = self._norm_to_canvas(*self.seg_points[-1])
++            color = self.class_colors.get(self.selected_class_id, "#FFFFFF")
++            self.canvas.create_line(lx, ly, event.x, event.y, fill=color, 
++                                   width=1, dash=(3, 3), tags="seg_cursor_line")
++        
+         if self.show_crosshair.get():
+             # Hide cursor when crosshair is active (cache check to avoid repeated calls)
+             if self.canvas.cget('cursor') != 'none':
+@@ -3036,10 +3773,40 @@ class AnnotatorApp:
+                 self.crosshair_lines = []
+ 
+     def on_mouse_up(self, event):
++        if self.drag_mode == "vertex_drag":
++            self.drag_mode = None
++            self.drag_ann_idx = -1
++            self.dragging_vertex_idx = -1
++            self.active_annotation_index = -1
++            self.annotations_dirty = True
++            # Clean up throttle tracking
++            if hasattr(self, '_last_drag_redraw_pos'):
++                delattr(self, '_last_drag_redraw_pos')
++            self.trigger_autosave()
++            self.redraw(high_quality=True)  # High quality redraw on release
++            return
++        
++        if self.drag_mode == "resize":
++            self.drag_mode = None
++            self.drag_ann_idx = -1
++            self.dragging_handle = None
++            self.active_annotation_index = -1
++            self.annotations_dirty = True
++            # Clean up throttle tracking
++            if hasattr(self, '_last_resize_redraw_pos'):
++                delattr(self, '_last_resize_redraw_pos')
++            self.trigger_autosave()
++            self.redraw(high_quality=True)  # High quality redraw on release
++            return
++        
+         if self.drag_mode == "move":
+             self.drag_mode = None
+             self.annotations_dirty = True
+-            self.save_annotations()  # IMMEDIATELY save after moving
++            # Clean up throttle tracking
++            if hasattr(self, '_last_drag_redraw_pos'):
++                delattr(self, '_last_drag_redraw_pos')
++            self.trigger_autosave()
++            self.redraw(high_quality=True)  # High quality redraw on release
+             return
+             
+         if self.drag_mode == "create":
+@@ -3075,24 +3842,79 @@ class AnnotatorApp:
+             
+             new_ann = [self.selected_class_id, ncx, ncy, nw, nh]
+             self.annotations.append(new_ann)
+-            self.last_drawn_box = list(new_ann)  # Save for R to repeat
++            self.last_drawn_box = list(new_ann)
+             self.annotations_dirty = True
+-            self.save_annotations()  # IMMEDIATELY save after creating
++            self.trigger_autosave()
+             self.redraw()
+ 
+     def on_right_click(self, event):
+-        # Delete detection under cursor
++        # Cancel in-progress segmentation polygon first
++        if self.seg_drawing:
++            self._seg_cancel()
++            return
++        
++        # Edit mode: right-click near a polygon vertex to delete it
++        if self.edit_mode.get():
++            v_ann, v_idx = self._find_vertex_near(event.x, event.y)
++            if v_ann != -1:
++                ann = self.annotations[v_ann]
++                num_vertices = (len(ann) - 1) // 2
++                if num_vertices > 3:
++                    # Remove the vertex (2 values: x and y)
++                    self._push_annotation_undo()
++                    del ann[1 + v_idx * 2 : 1 + v_idx * 2 + 2]
++                    self.annotations_dirty = True
++                    self.save_annotations()
++                    self.redraw()
++                    self._flash_notification(f"Deleted vertex {v_idx+1} ({num_vertices-1} remaining)")
++                else:
++                    self._flash_notification("Cannot delete: polygon needs at least 3 vertices")
++                return
++        
++        # Delete annotation under cursor
+         hit_index = self._find_annotation_at_point(event.x, event.y)
+         if hit_index != -1:
+-            # Save for undo BEFORE deleting
+             self._push_annotation_undo()
+-            
+             del self.annotations[hit_index]
+             self.active_annotation_index = -1
+             self.annotations_dirty = True
+-            self.save_annotations()  # IMMEDIATELY save after deleting
++            self.trigger_autosave()
+             self.redraw()
+             self._flash_notification("Deleted annotation (Ctrl+Z to undo)")
++    
++    def change_annotation_class(self, event):
++        """Ctrl+Right-click: change the class of the annotation under cursor to the selected class."""
++        if not self.current_image:
++            return
++        
++        hit_index = self._find_annotation_at_point(event.x, event.y)
++        if hit_index != -1:
++            ann = self.annotations[hit_index]
++            old_cid = ann[0]
++            new_cid = self.selected_class_id
++            
++            if old_cid == new_cid:
++                self._flash_notification(f"Already class {new_cid}")
++                return
++            
++            self._push_annotation_undo()
++            ann[0] = new_cid
++            self.annotations_dirty = True
++            self.save_annotations()
++            self.redraw()
++            
++            old_name = self.classes[old_cid] if 0 <= old_cid < len(self.classes) else str(old_cid)
++            new_name = self.classes[new_cid] if 0 <= new_cid < len(self.classes) else str(new_cid)
++            self._flash_notification(f"Changed class: {old_name} ΓåÆ {new_name}")
++        else:
++            self._flash_notification("No annotation under cursor")
++    
++    def _on_backspace(self, event):
++        """Handle Backspace - undo seg point if drawing, else clear class annotations."""
++        if self.seg_drawing:
++            self._seg_undo_last_point()
++        else:
++            self.clear_class_annotations_quick()
+             
+     def delete_selected_annotation(self, event=None):
+         if self.active_annotation_index != -1:
+@@ -3361,60 +4183,51 @@ class AnnotatorApp:
+                  bootstyle="primary", width=12).pack(side=RIGHT, padx=5)
+ 
+     def auto_annotate_current(self):
+-        """Auto-annotate the current image with class selection dialog."""
+         if not self.model or not self.current_image:
+              messagebox.showerror("Error", "Load Model and Image first.")
+              return
+         
++        # Ask for classes
+         allowed_classes = self._select_classes_dialog()
+-        if allowed_classes is None: return
+-        
+-        self._push_annotation_undo()
++        if allowed_classes is None: return # Cancelled
+         
+         ver = self.model_ver_combo.get()
++        # Run inference with default confidence (we'll filter per-class later)
+         try:
+             boxes, classes, scores = self.model.predict(
+                 np.array(self.current_image), 
+-                confidence_threshold=0.01,
++                confidence_threshold=0.01,  # Use low threshold, filter later
+                 iou_threshold=self.iou_threshold,
+                 version=ver
+             )
+             
+             added = 0
+-            skipped_dupes = 0
+             for b, c, s in zip(boxes, classes, scores):
+                 class_id = int(c)
+                 
++                # Check if class is allowed
+                 if class_id not in allowed_classes: 
+                     continue
+                 
++                # Get confidence threshold for this class
+                 threshold = self.class_confidence_thresholds.get(class_id, self.default_confidence_threshold)
+-                if s < threshold:
+-                    continue
+                 
+-                new_ann = [class_id, b[0], b[1], b[2], b[3]]
+-                
+-                # Skip if duplicate or overlapping existing annotation
+-                if self._is_duplicate_or_overlapping(new_ann, self.annotations):
+-                    skipped_dupes += 1
++                # Filter by per-class confidence
++                if s < threshold:
+                     continue
+                 
+-                self.annotations.append(new_ann)
++                # b is [cx, cy, w, h] norm
++                self.annotations.append([class_id, b[0], b[1], b[2], b[3]])
+                 added += 1
+-            
+-            if added > 0:
+-                self.annotations_dirty = True
+-                self.save_annotations()
++                
++            self.save_annotations()
+             self.redraw()
+-            msg = f"Auto-Annotate: Added {added} boxes"
+-            if skipped_dupes > 0:
+-                msg += f" (skipped {skipped_dupes} duplicates)"
+-            self.status_var.set(msg)
++            self.status_var.set(f"Auto-Annotate: Added {added} boxes.")
+         except Exception as e:
+             messagebox.showerror("Inference Error", str(e))
+ 
+     def auto_annotate_quick(self):
+-        """Quick auto-annotate current image with ALL classes - no dialog."""
++        """Quick auto-annotate current image with ALL classes - no dialog, single keypress."""
+         if not self.model:
+             self.status_var.set("No model loaded - press Load Model first")
+             return
+@@ -3422,312 +4235,87 @@ class AnnotatorApp:
+             self.status_var.set("No image loaded")
+             return
+         
++        # Use all defined classes
+         allowed_classes = set(range(len(self.classes))) if self.classes else set(range(100))
+         
+-        self._push_annotation_undo()
+-        
+         ver = self.model_ver_combo.get()
+         try:
+             boxes, classes, scores = self.model.predict(
+                 np.array(self.current_image), 
+-                confidence_threshold=0.01,
++                confidence_threshold=0.01,  # Use low threshold, filter later
+                 iou_threshold=self.iou_threshold,
+                 version=ver
+             )
+             
+             added = 0
+-            skipped_dupes = 0
+             for b, c, s in zip(boxes, classes, scores):
+                 class_id = int(c)
+                 
+                 if class_id not in allowed_classes:
+                     continue
+                 
++                # Get confidence threshold for this class
+                 threshold = self.class_confidence_thresholds.get(class_id, self.default_confidence_threshold)
+-                if s < threshold:
+-                    continue
+-                
+-                new_ann = [class_id, b[0], b[1], b[2], b[3]]
+                 
+-                # Skip if duplicate or overlapping existing annotation
+-                if self._is_duplicate_or_overlapping(new_ann, self.annotations):
+-                    skipped_dupes += 1
++                # Filter by per-class confidence
++                if s < threshold:
+                     continue
+                 
+-                self.annotations.append(new_ann)
++                # b is [cx, cy, w, h] norm
++                self.annotations.append([class_id, b[0], b[1], b[2], b[3]])
+                 added += 1
+-            
+-            if added > 0:
+-                self.annotations_dirty = True
+-                self.save_annotations()
++                
++            self.save_annotations()
+             self.redraw()
+-            msg = f"Quick Auto-Annotate: Added {added} boxes"
+-            if skipped_dupes > 0:
+-                msg += f" (skipped {skipped_dupes} duplicates)"
+-            self.status_var.set(msg)
++            self.status_var.set(f"Quick Auto-Annotate: Added {added} boxes")
+         except Exception as e:
+             self.status_var.set(f"Auto-annotate error: {e}")
+ 
+     def auto_annotate_all(self):
+-        """Auto-annotate all images in the workspace with mode selection (threaded)."""
+         if not self.model: return
++        if not messagebox.askyesno("Process All", f"Process {len(self.image_paths)} images?"): return
+         
++        # Ask for classes
+         allowed_classes = self._select_classes_dialog()
+-        if allowed_classes is None: return
+-        
+-        # --- Mode Selection Dialog ---
+-        mode_dlg = tb.Toplevel(self.root)
+-        mode_dlg.title("Auto-Annotate All Images")
+-        mode_dlg.geometry("420x280")
+-        mode_dlg.transient(self.root)
+-        mode_dlg.grab_set()
+-        
+-        tb.Label(mode_dlg, text="Auto-Annotate Mode", font=("Arial", 13, "bold")).pack(pady=(15, 10))
+-        tb.Label(mode_dlg, text=f"{len(self.image_paths)} images in workspace", 
+-                font=("Arial", 10), foreground="#888").pack(pady=(0, 10))
+-        
+-        mode_var = tk.StringVar(value="add_missing")
+-        
+-        modes = [
+-            ("add_missing", "Add Missing (skip duplicates)", 
+-             "Detect new objects and add them, skipping any that overlap existing annotations."),
+-            ("unannotated_only", "Only Unannotated Images", 
+-             "Only process images that have no existing annotations at all."),
+-            ("overwrite", "Overwrite Selected Classes", 
+-             "Replace annotations of selected classes with new detections. Other classes are preserved."),
+-        ]
+-        
+-        for value, label, desc in modes:
+-            frame = tb.Frame(mode_dlg)
+-            frame.pack(fill=X, padx=20, pady=2)
+-            tb.Radiobutton(frame, text=label, variable=mode_var, value=value).pack(anchor=W)
+-            tb.Label(frame, text=desc, font=("Arial", 8), foreground="#888", wraplength=360).pack(anchor=W, padx=20)
+-        
+-        result = {'mode': None}
+-        
+-        def on_start():
+-            result['mode'] = mode_var.get()
+-            mode_dlg.destroy()
+-        
+-        def on_cancel():
+-            mode_dlg.destroy()
+-        
+-        btn_frame = tb.Frame(mode_dlg)
+-        btn_frame.pack(fill=X, padx=20, pady=15)
+-        tb.Button(btn_frame, text="Start", command=on_start, bootstyle="primary", width=12).pack(side=RIGHT, padx=5)
+-        tb.Button(btn_frame, text="Cancel", command=on_cancel, bootstyle="secondary-outline", width=12).pack(side=RIGHT, padx=5)
+-        
+-        self.root.wait_window(mode_dlg)
+-        
+-        mode = result['mode']
+-        if mode is None:
+-            return  # Cancelled
+-        
+-        # Save current image first if dirty
+-        if self.current_image and self.current_file_path and self.annotations_dirty:
+-            self.save_annotations(force=True)
++        if allowed_classes is None: return # Cancelled
+         
+-        # --- Snapshot settings for the worker thread ---
+         ver = self.model_ver_combo.get()
+-        iou_thresh = self.iou_threshold
+-        conf_thresholds = dict(self.class_confidence_thresholds)
+-        default_conf = self.default_confidence_threshold
+-        image_paths = list(self.image_paths)
+-        model = self.model
+-        
+-        # --- Progress dialog with cancel ---
++        cnt = 0
+         top = tb.Toplevel(self.root)
+         top.title("Auto Annotating...")
+-        top.geometry("480x160")
+-        top.transient(self.root)
+-        top.protocol("WM_DELETE_WINDOW", lambda: None)  # Prevent close via X
+-        
+-        pb = tb.Progressbar(top, maximum=len(image_paths))
+-        pb.pack(fill=X, padx=20, pady=(20, 5))
+-        lbl_status = tb.Label(top, text="Starting...", font=("Consolas", 9))
+-        lbl_status.pack(pady=2)
+-        lbl_speed = tb.Label(top, text="", font=("Arial", 8), foreground="#888")
+-        lbl_speed.pack(pady=0)
+-        
+-        cancel_flag = {'cancelled': False}
+-        
+-        def on_cancel_batch():
+-            cancel_flag['cancelled'] = True
+-            cancel_btn.config(state="disabled", text="Cancelling...")
+-        
+-        cancel_btn = tb.Button(top, text="Cancel", command=on_cancel_batch, bootstyle="danger-outline", width=14)
+-        cancel_btn.pack(pady=8)
+-        
+-        # --- Shared state between worker and UI ---
+-        progress = {'i': 0, 'cnt': 0, 'skipped_images': 0, 'skipped_dupes': 0, 
+-                     'done': False, 'error': None, 'start_time': time.time()}
+-        
+-        def worker():
+-            """Background thread: runs inference and writes label files."""
+-            cnt = 0
+-            skipped_images = 0
+-            skipped_dupes = 0
+-            
+-            for i, p in enumerate(image_paths):
+-                if cancel_flag['cancelled']:
+-                    break
+-                
+-                try:
+-                    lbl = self._get_label_path(p)
+-                    
+-                    # Load existing annotations for this image
+-                    existing_anns = self._load_annotations_from_file(lbl)
+-                    
+-                    # Mode: unannotated_only - skip if already has annotations
+-                    if mode == "unannotated_only" and existing_anns:
+-                        skipped_images += 1
+-                        progress['i'] = i + 1
+-                        progress['skipped_images'] = skipped_images
+-                        continue
+-                    
+-                    # Use cv2 for faster image loading (reads as BGR)
+-                    img_bgr = cv2.imread(p)
+-                    if img_bgr is None:
+-                        # Fallback to PIL for unusual formats
+-                        pil_img = Image.open(p)
+-                        img_arr = np.array(pil_img)
+-                    else:
+-                        img_arr = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+-                    
+-                    boxes, classes, scores = model.predict(
+-                        img_arr,
+-                        confidence_threshold=0.01,
+-                        iou_threshold=iou_thresh,
+-                        version=ver
+-                    )
+-                    
+-                    # Filter and collect valid detections
+-                    new_lines = []
+-                    for b, c, s in zip(boxes, classes, scores):
+-                        class_id = int(c)
+-                        if class_id not in allowed_classes:
+-                            continue
+-                        threshold = conf_thresholds.get(class_id, default_conf)
+-                        if s < threshold:
+-                            continue
+-                        
+-                        new_ann = [class_id, b[0], b[1], b[2], b[3]]
+-                        
+-                        # Mode: add_missing - check against existing annotations
+-                        if mode == "add_missing":
+-                            if self._is_duplicate_or_overlapping(new_ann, existing_anns):
+-                                skipped_dupes += 1
+-                                continue
+-                            # Also check against annotations we're about to add
+-                            new_anns_so_far = [[int(l.split()[0])] + [float(x) for x in l.split()[1:]] for l in new_lines]
+-                            if self._is_duplicate_or_overlapping(new_ann, new_anns_so_far):
+-                                skipped_dupes += 1
+-                                continue
+-                        
+-                        new_lines.append(f"{class_id} {b[0]:.6f} {b[1]:.6f} {b[2]:.6f} {b[3]:.6f}\n")
+-                    
+-                    if mode == "overwrite":
+-                        preserved_lines = []
+-                        if os.path.exists(lbl):
+-                            with open(lbl, 'r') as f:
+-                                for line in f:
+-                                    parts = line.strip().split()
+-                                    if len(parts) >= 5:
+-                                        try:
+-                                            cid = int(parts[0])
+-                                            if cid not in allowed_classes:
+-                                                preserved_lines.append(line if line.endswith('\n') else line + '\n')
+-                                        except ValueError:
+-                                            preserved_lines.append(line if line.endswith('\n') else line + '\n')
+-                        all_lines = preserved_lines + new_lines
+-                        if all_lines:
+-                            os.makedirs(os.path.dirname(lbl), exist_ok=True)
+-                            with open(lbl, 'w') as f:
+-                                f.writelines(all_lines)
+-                            cnt += len(new_lines)
+-                        elif os.path.exists(lbl) and not preserved_lines:
+-                            with open(lbl, 'w') as f:
+-                                pass
+-                        else:
+-                            skipped_images += 1
+-                    elif new_lines:
+-                        os.makedirs(os.path.dirname(lbl), exist_ok=True)
+-                        with open(lbl, 'a') as f:
+-                            f.writelines(new_lines)
+-                        cnt += len(new_lines)
+-                    else:
+-                        skipped_images += 1
+-                        
+-                except Exception as e: 
+-                    print(f"Error on {p}: {e}")
+-                
+-                # Update shared progress
+-                progress['i'] = i + 1
+-                progress['cnt'] = cnt
+-                progress['skipped_images'] = skipped_images
+-                progress['skipped_dupes'] = skipped_dupes
+-            
+-            progress['cnt'] = cnt
+-            progress['skipped_images'] = skipped_images
+-            progress['skipped_dupes'] = skipped_dupes
+-            progress['done'] = True
+-        
+-        # Start worker thread
+-        thread = threading.Thread(target=worker, daemon=True)
+-        thread.start()
+-        
+-        # --- UI poll loop (runs on main thread) ---
+-        def poll_progress():
+-            i = progress['i']
+-            cnt = progress['cnt']
+-            total = len(image_paths)
+-            
+-            pb['value'] = i
+-            lbl_status.config(text=f"Processed {i}/{total}  ΓÇó  {cnt} annotations added")
+-            
+-            # Speed estimate
+-            elapsed = time.time() - progress['start_time']
+-            if i > 0 and elapsed > 0:
+-                ips = i / elapsed
+-                remaining = (total - i) / ips if ips > 0 else 0
+-                mins, secs = divmod(int(remaining), 60)
+-                lbl_speed.config(text=f"{ips:.1f} img/sec  ΓÇó  ~{mins}m {secs}s remaining")
+-            
+-            if progress['done'] or cancel_flag['cancelled']:
+-                # Worker finished ΓÇö finalize
+-                thread.join(timeout=2)
+-                top.destroy()
+-                
+-                self._build_annotation_cache()
+-                
+-                cnt = progress['cnt']
+-                skipped_dupes = progress['skipped_dupes']
+-                skipped_images = progress['skipped_images']
+-                
+-                if cancel_flag['cancelled']:
+-                    msg = f"Cancelled: Added {cnt} annotations ({progress['i']}/{total} processed)"
+-                else:
+-                    msg = f"Batch Done: Added {cnt} annotations"
+-                if skipped_dupes > 0:
+-                    msg += f", skipped {skipped_dupes} duplicates"
+-                if skipped_images > 0:
+-                    msg += f", {skipped_images} images unchanged"
+-                self.status_var.set(msg)
++        pb = tb.Progressbar(top, maximum=len(self.image_paths))
++        pb.pack(fill=X, padx=20, pady=20)
++        lbl_status = tb.Label(top, text="Starting...")
++        lbl_status.pack(pady=5)
++        
++
++        for i, p in enumerate(self.image_paths):
++            try:
++                img = Image.open(p)
++                lbl = self._get_label_path(p)
+                 
+-                # Clear current image state so load_image doesn't save stale
+-                # in-memory annotations back to disk (overwriting worker's results)
+-                self.current_image = None
+-                self.current_file_path = None
+-                self.annotations = []
+-                self.annotations_dirty = False
++                # Inference
++                boxes, classes, scores = self.model.predict(np.array(img), version=ver)
+                 
+-                self.load_image(self.current_index)
+-                return
+-            
+-            # Poll again in 100ms
+-            top.after(100, poll_progress)
+-        
+-        poll_progress()
++                # Append detections to label file
++                os.makedirs(os.path.dirname(lbl), exist_ok=True)
++                with open(lbl, 'a') as f: 
++                     for b, c, s in zip(boxes, classes, scores):
++                         if int(c) in allowed_classes:
++                             f.write(f"{int(c)} {b[0]:.6f} {b[1]:.6f} {b[2]:.6f} {b[3]:.6f}\n")
++                             cnt += 1
++            except Exception as e: 
++                print(f"Error on {p}: {e}")
++            
++            if i % 5 == 0:
++                pb['value'] = i
++                lbl_status.config(text=f"Processed {i+1}/{len(self.image_paths)}")
++                top.update()
++            
++        top.destroy()
++        self.status_var.set(f"Batch Done: Added {cnt} annotations.")
++        # Reload current to show changes
++        self.load_image(self.current_index)
+ 
+     def reduce_dataset_dialog(self):
+         if not self.workspace_path:
+@@ -4003,16 +4591,8 @@ class AnnotatorApp:
+             self._build_annotation_cache()  # Rebuild cache after cleanup
+         self.load_image(self.current_index)
+ 
+-    def _image_has_suspicious_annotations(self, img_path, include_tiny=None, tiny_exclude_classes=None):
+-        """Check if an image has suspicious annotations (optionally tiny boxes, and extreme overlapping).
+-        
+-        Args:
+-            include_tiny: Override self.suspicious_include_tiny if provided.
+-            tiny_exclude_classes: Override self.suspicious_tiny_exclude_classes if provided.
+-        """
+-        check_tiny = include_tiny if include_tiny is not None else self.suspicious_include_tiny
+-        exclude_classes = tiny_exclude_classes if tiny_exclude_classes is not None else self.suspicious_tiny_exclude_classes
+-        
++    def _image_has_suspicious_annotations(self, img_path):
++        """Check if an image has suspicious annotations (tiny boxes or extreme overlapping)."""
+         lbl_path = self._get_label_path(img_path)
+         if not os.path.exists(lbl_path):
+             return False
+@@ -4033,13 +4613,10 @@ class AnnotatorApp:
+             return False
+         
+         # Check for tiny annotations (area < 0.1% of image = 0.001 normalized)
+-        if check_tiny:
+-            for cid, cx, cy, w, h in annotations:
+-                if cid in exclude_classes:
+-                    continue
+-                area = w * h
+-                if area < 0.001:
+-                    return True
++        for cid, cx, cy, w, h in annotations:
++            area = w * h
++            if area < 0.001:
++                return True
+         
+         # Check for extreme overlapping (IoU > 0.8 = nearly identical boxes)
+         for i in range(len(annotations)):
+@@ -4057,93 +4634,6 @@ class AnnotatorApp:
+             messagebox.showerror("Error", "No workspace loaded.")
+             return
+         
+-        # --- Options dialog before scanning ---
+-        opts_dlg = tb.Toplevel(self.root)
+-        opts_dlg.title("Suspicious Scan Options")
+-        opts_dlg.geometry("400x360")
+-        opts_dlg.transient(self.root)
+-        opts_dlg.grab_set()
+-        
+-        tb.Label(opts_dlg, text="Suspicious Scan Options", font=("Arial", 13, "bold")).pack(pady=(15, 5))
+-        tb.Label(opts_dlg, text="Choose what to look for:", font=("Arial", 9), foreground="#888").pack(pady=(0, 10))
+-        
+-        # Always-on: extreme overlaps
+-        always_frame = tb.Frame(opts_dlg)
+-        always_frame.pack(fill=X, padx=20, pady=2)
+-        tb.Label(always_frame, text="Γ£ô  Extreme overlaps (IoU > 0.8)", font=("Arial", 10)).pack(anchor=W)
+-        tb.Label(always_frame, text="Always checked ΓÇö nearly duplicate boxes", font=("Arial", 8), foreground="#888").pack(anchor=W, padx=18)
+-        
+-        # Tiny toggle
+-        tiny_var = tk.BooleanVar(value=self.suspicious_include_tiny)
+-        tiny_frame = tb.Frame(opts_dlg)
+-        tiny_frame.pack(fill=X, padx=20, pady=(8, 2))
+-        tb.Checkbutton(tiny_frame, text="Include tiny annotations (area < 0.1%)", variable=tiny_var,
+-                       bootstyle="round-toggle").pack(anchor=W)
+-        tb.Label(tiny_frame, text="Flag annotations with extremely small area", font=("Arial", 8), foreground="#888").pack(anchor=W, padx=18)
+-        
+-        # Class exclusion for tiny ΓÇö only relevant when tiny is on
+-        exclude_frame = tb.Labelframe(opts_dlg, text="Exclude classes from tiny check", padding=8)
+-        exclude_frame.pack(fill=BOTH, expand=True, padx=20, pady=(8, 5))
+-        
+-        # Scrollable class list with checkbuttons
+-        exclude_canvas = tk.Canvas(exclude_frame, bg="#1e1e1e", highlightthickness=0, height=100)
+-        exclude_scroll = tb.Scrollbar(exclude_frame, orient=VERTICAL, command=exclude_canvas.yview)
+-        exclude_inner = tb.Frame(exclude_canvas)
+-        exclude_canvas.create_window((0, 0), window=exclude_inner, anchor=NW)
+-        exclude_canvas.config(yscrollcommand=exclude_scroll.set)
+-        exclude_scroll.pack(side=RIGHT, fill=Y)
+-        exclude_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+-        
+-        class_vars = {}
+-        for i, cls_name in enumerate(self.classes):
+-            var = tk.BooleanVar(value=(i in self.suspicious_tiny_exclude_classes))
+-            class_vars[i] = var
+-            cb = tb.Checkbutton(exclude_inner, text=f"{i}: {cls_name}", variable=var, bootstyle="danger")
+-            cb.pack(anchor=W, padx=5, pady=1)
+-        
+-        def update_scroll(event=None):
+-            exclude_canvas.configure(scrollregion=exclude_canvas.bbox("all"))
+-        exclude_inner.bind("<Configure>", update_scroll)
+-        
+-        # Toggle tiny enables/disables the exclude frame
+-        def on_tiny_toggle(*_):
+-            state = "normal" if tiny_var.get() else "disabled"
+-            for child in exclude_inner.winfo_children():
+-                try:
+-                    child.configure(state=state)
+-                except:
+-                    pass
+-        tiny_var.trace_add("write", on_tiny_toggle)
+-        on_tiny_toggle()  # Set initial state
+-        
+-        result = {'go': False}
+-        
+-        def on_scan():
+-            result['go'] = True
+-            opts_dlg.destroy()
+-        
+-        def on_cancel():
+-            opts_dlg.destroy()
+-        
+-        btn_frame = tb.Frame(opts_dlg)
+-        btn_frame.pack(fill=X, padx=20, pady=10)
+-        tb.Button(btn_frame, text="Scan", command=on_scan, bootstyle="primary", width=12).pack(side=RIGHT, padx=5)
+-        tb.Button(btn_frame, text="Cancel", command=on_cancel, bootstyle="secondary-outline", width=12).pack(side=RIGHT, padx=5)
+-        
+-        self.root.wait_window(opts_dlg)
+-        
+-        if not result['go']:
+-            return
+-        
+-        # Save settings for future use (filter mode, re-opening dialog)
+-        include_tiny = tiny_var.get()
+-        self.suspicious_include_tiny = include_tiny
+-        tiny_exclude = set()
+-        for cid, var in class_vars.items():
+-            if var.get():
+-                tiny_exclude.add(cid)
+-        self.suspicious_tiny_exclude_classes = tiny_exclude
+-        
+         self.status_var.set("Scanning for suspicious annotations...")
+         self.root.update()
+         
+@@ -4178,14 +4668,11 @@ class AnnotatorApp:
+             tiny_indices = set()
+             overlap_pairs = []
+             
+-            # Check tiny (only if toggled on, respecting excluded classes)
+-            if include_tiny:
+-                for idx, (cid, cx, cy, w, h) in enumerate(annotations):
+-                    if cid in tiny_exclude:
+-                        continue
+-                    area = w * h
+-                    if area < 0.001:
+-                        tiny_indices.add(idx)
++            # Check tiny
++            for idx, (cid, cx, cy, w, h) in enumerate(annotations):
++                area = w * h
++                if area < 0.001:
++                    tiny_indices.add(idx)
+             
+             # Check extreme overlap
+             for i in range(len(annotations)):
+@@ -4216,33 +4703,16 @@ class AnnotatorApp:
+         
+         if not suspicious_images:
+             tb.Label(summary_frame, text="Γ£à No suspicious annotations found!", font=("Arial", 12, "bold"), bootstyle="success").pack(anchor=W)
+-            checked = "overlaps"
+-            if include_tiny:
+-                checked += " + tiny"
+-            tb.Label(summary_frame, text=f"Checked: {checked}", font=("Arial", 9), foreground="#888").pack(anchor=W)
+             tb.Button(summary_frame, text="Close", command=dlg.destroy, bootstyle="secondary").pack(anchor=E, pady=5)
+             self.status_var.set("Suspicious scan complete: all clean!")
+             return
+         
+         tb.Label(summary_frame, text=f"ΓÜá∩╕Å {len(suspicious_images)} image(s) with suspicious annotations", font=("Arial", 12, "bold"), bootstyle="danger").pack(anchor=W)
+         
+-        # Settings note
+-        settings_parts = ["Overlaps: on"]
+-        if include_tiny:
+-            if tiny_exclude:
+-                excl_names = [self.classes[c] if c < len(self.classes) else f"cls{c}" for c in sorted(tiny_exclude)]
+-                settings_parts.append(f"Tiny: on (excluding {', '.join(excl_names)})")
+-            else:
+-                settings_parts.append("Tiny: on")
+-        else:
+-            settings_parts.append("Tiny: off")
+-        tb.Label(summary_frame, text="  |  ".join(settings_parts), font=("Arial", 8), foreground="#888").pack(anchor=W, pady=(0, 2))
+-        
+         legend_frame = tb.Frame(summary_frame)
+         legend_frame.pack(fill=X, pady=(2, 0))
+-        if include_tiny:
+-            tb.Label(legend_frame, text="Γûá", foreground="#FF00FF", font=("Arial", 10, "bold")).pack(side=LEFT)
+-            tb.Label(legend_frame, text="Tiny (< 0.1% area)  ", font=("Consolas", 9)).pack(side=LEFT)
++        tb.Label(legend_frame, text="Γûá", foreground="#FF00FF", font=("Arial", 10, "bold")).pack(side=LEFT)
++        tb.Label(legend_frame, text="Tiny (< 0.1% area)  ", font=("Consolas", 9)).pack(side=LEFT)
+         tb.Label(legend_frame, text="Γûá", foreground="#FF3333", font=("Arial", 10, "bold")).pack(side=LEFT)
+         tb.Label(legend_frame, text="Extreme overlap (IoU > 0.8)  ", font=("Consolas", 9)).pack(side=LEFT)
+         tb.Label(legend_frame, text="Γûá", foreground="#66FF66", font=("Arial", 10, "bold")).pack(side=LEFT)
+@@ -4503,11 +4973,7 @@ class AnnotatorApp:
+             # Defer the preview to after dialog is fully laid out
+             dlg.after(100, lambda: show_suspicious_image(0))
+         
+-        status_parts = []
+-        if include_tiny:
+-            status_parts.append(f"{total_tiny} tiny")
+-        status_parts.append(f"{total_overlaps} overlapping")
+-        self.status_var.set(f"Suspicious scan complete: {', '.join(status_parts)} in {len(suspicious_images)} images")
++        self.status_var.set(f"Suspicious scan complete: {total_tiny} tiny, {total_overlaps} overlapping in {len(suspicious_images)} images")
+ 
+     def yolo_format_check_dialog(self):
+         """Validate all YOLO label files, clamp out-of-range values, and report issues."""
+@@ -4537,6 +5003,10 @@ class AnnotatorApp:
+         widths_clamped = 0
+         heights_clamped = 0
+         centers_clamped = 0
++        seg_coords_clamped = 0
++        seg_lines_count = 0
++        bbox_lines_count = 0
++        mixed_format_files = 0
+         issues_detail = []  # List of (filename, issue_description)
+         
+         for lbl_file in lbl_files:
+@@ -4544,6 +5014,8 @@ class AnnotatorApp:
+             basename = os.path.basename(lbl_file)
+             file_modified = False
+             new_lines = []
++            file_has_bbox = False
++            file_has_seg = False
+             
+             try:
+                 with open(lbl_file, 'r') as f:
+@@ -4563,16 +5035,13 @@ class AnnotatorApp:
+                 if len(parts) < 5:
+                     malformed_lines_removed += 1
+                     file_modified = True
+-                    issues_detail.append((basename, f"Line {line_num}: removed (only {len(parts)} values, need 5)"))
++                    issues_detail.append((basename, f"Line {line_num}: removed (only {len(parts)} values, need ΓëÑ5)"))
+                     continue
+                 
+-                # Parse values
++                # Parse class ID and coordinates
+                 try:
+                     class_id = int(parts[0])
+-                    cx = float(parts[1])
+-                    cy = float(parts[2])
+-                    w = float(parts[3])
+-                    h = float(parts[4])
++                    coords = [float(p) for p in parts[1:]]
+                 except ValueError:
+                     malformed_lines_removed += 1
+                     file_modified = True
+@@ -4590,66 +5059,112 @@ class AnnotatorApp:
+                     bad_class_ids += 1
+                     issues_detail.append((basename, f"Line {line_num}: class ID {class_id} exceeds max {max_class} (kept, but may be wrong)"))
+                 
+-                # Clamp center coordinates to [0, 1]
+-                orig_cx, orig_cy = cx, cy
+-                cx = max(0.0, min(1.0, cx))
+-                cy = max(0.0, min(1.0, cy))
+-                if cx != orig_cx or cy != orig_cy:
+-                    centers_clamped += 1
+-                    values_clamped += 1
+-                    file_modified = True
+-                    issues_detail.append((basename, f"Line {line_num}: center clamped ({orig_cx:.6f},{orig_cy:.6f}) ΓåÆ ({cx:.6f},{cy:.6f})"))
++                is_segmentation = len(coords) > 4
+                 
+-                # Clamp width and height to [0, 1]
+-                orig_w, orig_h = w, h
+-                w = max(0.0, min(1.0, w))
+-                h = max(0.0, min(1.0, h))
+-                if w != orig_w:
+-                    widths_clamped += 1
+-                    values_clamped += 1
+-                    file_modified = True
+-                    issues_detail.append((basename, f"Line {line_num}: width clamped {orig_w:.6f} ΓåÆ {w:.6f}"))
+-                if h != orig_h:
+-                    heights_clamped += 1
+-                    values_clamped += 1
+-                    file_modified = True
+-                    issues_detail.append((basename, f"Line {line_num}: height clamped {orig_h:.6f} ΓåÆ {h:.6f}"))
++                if is_segmentation:
++                    # Segmentation polygon validation
++                    seg_lines_count += 1
++                    file_has_seg = True
++                    
++                    # Check even number of coordinates (pairs of x, y)
++                    if len(coords) % 2 != 0:
++                        malformed_lines_removed += 1
++                        file_modified = True
++                        issues_detail.append((basename, f"Line {line_num}: removed (odd number of polygon coords: {len(coords)})"))
++                        continue
++                    
++                    # Check minimum 3 points (6 coordinate values)
++                    if len(coords) < 6:
++                        malformed_lines_removed += 1
++                        file_modified = True
++                        issues_detail.append((basename, f"Line {line_num}: removed (polygon needs ΓëÑ3 points, has {len(coords)//2})"))
++                        continue
++                    
++                    # Clamp all coordinates to [0, 1]
++                    new_coords = []
++                    for c in coords:
++                        clamped = max(0.0, min(1.0, c))
++                        if clamped != c:
++                            seg_coords_clamped += 1
++                            values_clamped += 1
++                            file_modified = True
++                        new_coords.append(clamped)
++                    
++                    if new_coords != coords:
++                        issues_detail.append((basename, f"Line {line_num}: polygon coords clamped to [0,1]"))
++                    
++                    coord_str = ' '.join(f"{v:.6f}" for v in new_coords)
++                    new_lines.append(f"{class_id} {coord_str}")
++                else:
++                    # Detection bbox validation
++                    bbox_lines_count += 1
++                    file_has_bbox = True
++                    cx, cy, w, h = coords[0], coords[1], coords[2], coords[3]
+                 
+-                # Clamp so box doesn't extend past image boundary
+-                # Ensure cx - w/2 >= 0 and cx + w/2 <= 1 (same for y)
+-                if cx - w / 2 < 0:
+-                    w = cx * 2
+-                    if w != orig_w:
++                    # Clamp center coordinates to [0, 1]
++                    orig_cx, orig_cy = cx, cy
++                    cx = max(0.0, min(1.0, cx))
++                    cy = max(0.0, min(1.0, cy))
++                    if cx != orig_cx or cy != orig_cy:
++                        centers_clamped += 1
+                         values_clamped += 1
+                         file_modified = True
+-                        issues_detail.append((basename, f"Line {line_num}: width reduced to keep box in bounds"))
+-                if cx + w / 2 > 1:
+-                    w = (1.0 - cx) * 2
++                        issues_detail.append((basename, f"Line {line_num}: center clamped ({orig_cx:.6f},{orig_cy:.6f}) ΓåÆ ({cx:.6f},{cy:.6f})"))
++                    
++                    # Clamp width and height to [0, 1]
++                    orig_w, orig_h = w, h
++                    w = max(0.0, min(1.0, w))
++                    h = max(0.0, min(1.0, h))
+                     if w != orig_w:
++                        widths_clamped += 1
+                         values_clamped += 1
+                         file_modified = True
+-                        issues_detail.append((basename, f"Line {line_num}: width reduced to keep box in bounds"))
+-                if cy - h / 2 < 0:
+-                    h = cy * 2
++                        issues_detail.append((basename, f"Line {line_num}: width clamped {orig_w:.6f} ΓåÆ {w:.6f}"))
+                     if h != orig_h:
++                        heights_clamped += 1
+                         values_clamped += 1
+                         file_modified = True
+-                        issues_detail.append((basename, f"Line {line_num}: height reduced to keep box in bounds"))
+-                if cy + h / 2 > 1:
+-                    h = (1.0 - cy) * 2
+-                    if h != orig_h:
+-                        values_clamped += 1
++                        issues_detail.append((basename, f"Line {line_num}: height clamped {orig_h:.6f} ΓåÆ {h:.6f}"))
++                    
++                    # Clamp so box doesn't extend past image boundary
++                    if cx - w / 2 < 0:
++                        w = cx * 2
++                        if w != orig_w:
++                            values_clamped += 1
++                            file_modified = True
++                            issues_detail.append((basename, f"Line {line_num}: width reduced to keep box in bounds"))
++                    if cx + w / 2 > 1:
++                        w = (1.0 - cx) * 2
++                        if w != orig_w:
++                            values_clamped += 1
++                            file_modified = True
++                            issues_detail.append((basename, f"Line {line_num}: width reduced to keep box in bounds"))
++                    if cy - h / 2 < 0:
++                        h = cy * 2
++                        if h != orig_h:
++                            values_clamped += 1
++                            file_modified = True
++                            issues_detail.append((basename, f"Line {line_num}: height reduced to keep box in bounds"))
++                    if cy + h / 2 > 1:
++                        h = (1.0 - cy) * 2
++                        if h != orig_h:
++                            values_clamped += 1
++                            file_modified = True
++                            issues_detail.append((basename, f"Line {line_num}: height reduced to keep box in bounds"))
++                    
++                    # Check for zero-size annotations
++                    if w <= 0 or h <= 0:
++                        malformed_lines_removed += 1
+                         file_modified = True
+-                        issues_detail.append((basename, f"Line {line_num}: height reduced to keep box in bounds"))
+-                
+-                # Check for zero-size annotations
+-                if w <= 0 or h <= 0:
+-                    malformed_lines_removed += 1
+-                    file_modified = True
+-                    issues_detail.append((basename, f"Line {line_num}: removed (zero-sized box after clamping)"))
+-                    continue
+-                
+-                new_lines.append(f"{class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
++                        issues_detail.append((basename, f"Line {line_num}: removed (zero-sized box after clamping)"))
++                        continue
++                    
++                    new_lines.append(f"{class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
++            
++            # Detect mixed format files
++            if file_has_bbox and file_has_seg:
++                mixed_format_files += 1
++                issues_detail.append((basename, "ΓÜá Mixed format: contains both bbox and polygon annotations"))
+             
+             # Write back if modified
+             if file_modified:
+@@ -4682,7 +5197,8 @@ class AnnotatorApp:
+         summary_frame.pack(fill=X)
+         
+         all_good = (values_clamped == 0 and malformed_lines_removed == 0 and 
+-                    negative_class_ids == 0 and empty_files_removed == 0)
++                    negative_class_ids == 0 and empty_files_removed == 0 and
++                    mixed_format_files == 0)
+         
+         if all_good:
+             tb.Label(summary_frame, text="Γ£à All YOLO labels are valid!", font=("Arial", 12, "bold"), bootstyle="success").pack(anchor=W)
+@@ -4692,10 +5208,14 @@ class AnnotatorApp:
+         stats_text = (
+             f"Files checked: {files_checked}\n"
+             f"Files modified: {files_fixed}\n"
++            f"Detection (bbox) lines: {bbox_lines_count}\n"
++            f"Segmentation (polygon) lines: {seg_lines_count}\n"
++            f"Mixed-format files: {mixed_format_files}\n"
+             f"Values clamped to [0,1]: {values_clamped}\n"
+             f"  Γö£ Centers clamped: {centers_clamped}\n"
+             f"  Γö£ Widths clamped: {widths_clamped}\n"
+-            f"  Γöö Heights clamped: {heights_clamped}\n"
++            f"  Γö£ Heights clamped: {heights_clamped}\n"
++            f"  Γöö Seg coords clamped: {seg_coords_clamped}\n"
+             f"Malformed lines removed: {malformed_lines_removed}\n"
+             f"Negative class IDs removed: {negative_class_ids}\n"
+             f"Out-of-range class IDs (kept): {bad_class_ids}\n"
+@@ -4999,15 +5519,8 @@ class AnnotatorApp:
+             conditions.append(cond_data)
+             update_scroll_region()
+         
+-        # Restore last query conditions or add a blank one
+-        if self.last_query_conditions:
+-            for saved in self.last_query_conditions:
+-                add_condition(saved.get('logic', 'AND'))
+-                conditions[-1]['class'].set(saved.get('class', self.classes[0] if self.classes else ''))
+-                conditions[-1]['op'].set(saved.get('op', '='))
+-                conditions[-1]['count'].set(saved.get('count', '1'))
+-        else:
+-            add_condition()
++        # Add initial condition
++        add_condition()
+         
+         # Add condition buttons
+         btn_frame = tb.Frame(cond_container)
+@@ -5132,25 +5645,19 @@ class AnnotatorApp:
+                 messagebox.showinfo("No Matches", "No images match the query.")
+                 return
+             
+-            # Save query conditions for re-opening dialog later
+-            self.last_query_conditions = []
+-            for cond in conditions:
+-                self.last_query_conditions.append({
+-                    'logic': cond['logic'].get(),
+-                    'class': cond['class'].get(),
+-                    'op': cond['op'].get(),
+-                    'count': cond['count'].get()
+-                })
++            # Apply as custom filter
++            self.filtered_image_paths = matches
+             
+-            # Save matching paths so _refresh_file_list can reapply the filter
+-            self.custom_query_paths = set(matches)
++            # Update UI
++            self.file_list.delete(0, tk.END)
++            for p in self.filtered_image_paths:
++                img_id = self.image_id_map.get(p, 0)
++                basename = os.path.basename(p)
++                self.file_list.insert(tk.END, f"#{img_id:04d} - {basename}")
+             
+             # Set filter mode to indicate custom query is active
+             self.filter_mode = "Custom Query"
+-            self.filter_combo.set("≡ƒöì Query Active")
+-            
+-            # Use standard refresh to populate the list
+-            self._refresh_file_list()
++            self.filter_combo.set("All")  # Reset combo but keep custom filter
+             
+             # Load first match
+             if self.filtered_image_paths:

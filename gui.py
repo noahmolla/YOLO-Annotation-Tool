@@ -169,10 +169,21 @@ class AnnotatorApp:
                 
             # Restore Model
             if "model_path" in cfg and os.path.exists(cfg["model_path"]):
+                model_path = cfg["model_path"]
                 try:
-                    self.model = TFLiteModel(cfg["model_path"])
-                    self.status_var.set(f"Restored model: {os.path.basename(cfg['model_path'])}")
-                except: pass
+                    if model_path.lower().endswith('.pt'):
+                        from inference import PyTorchYOLOModel
+                        imgsz_str = self.imgsz_combo.get()
+                        imgsz = None if imgsz_str == "Auto" else int(imgsz_str)
+                        self.model = PyTorchYOLOModel(model_path, imgsz=imgsz)
+                        self.model_path_str = model_path
+                        self.status_var.set(f"Restored PyTorch model: {os.path.basename(model_path)}")
+                    elif model_path.lower().endswith('.tflite'):
+                        self.model = TFLiteModel(model_path)
+                        self.model_path_str = model_path
+                        self.status_var.set(f"Restored TFLite model: {os.path.basename(model_path)}")
+                except Exception as e:
+                    print(f"Failed to restore model: {e}")
                 
             if "model_version" in cfg:
                 self.model_ver_combo.set(cfg["model_version"])
