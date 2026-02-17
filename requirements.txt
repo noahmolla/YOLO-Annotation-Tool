@@ -23,8 +23,8 @@ ultralytics>=8.0.0
 # Uncomment ONE of the lines below if needed:
 # ============================================
 
-# Full TensorFlow (large, ~500MB download):
-# tensorflow>=2.13.0
+# Full TensorFlow (includes TFLite runtime):
+tensorflow>=2.13.0
 
 # OR lightweight tflite-runtime (~5MB, Linux/Mac only):
 # tflite-runtime>=2.5.0
