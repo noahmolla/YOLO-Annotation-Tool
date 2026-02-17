@@ -7,7 +7,7 @@ Pillow>=9.0.0
 numpy>=1.21.0
 opencv-python>=4.5.5
 ttkbootstrap>=1.10.0
-PyYAML>=6.0
+PyYAML>=6.0.1
 
 # ============================================
 # MODEL INFERENCE (at least one required)
@@ -19,20 +19,25 @@ ultralytics>=8.0.0
 
 # ============================================
 # OPTIONAL: TensorFlow Lite (.tflite files)
+# Only needed if you use .tflite models.
 # Uncomment ONE of the lines below if needed:
 # ============================================
 
-# Full TensorFlow (~500MB):
-# tensorflow>=2.8.0,<2.18.0
+# Full TensorFlow (large, ~500MB download):
+# tensorflow>=2.13.0
 
-# OR tflite-runtime only (~5MB, may need manual install on Windows):
+# OR lightweight tflite-runtime (~5MB, Linux/Mac only):
 # tflite-runtime>=2.5.0
 
 # ============================================
-# NOTES
+# INSTALL INSTRUCTIONS
 # ============================================
-# - Most users only need ultralytics (above) for .pt models
-# - TensorFlow/tflite is only needed for .tflite model files
-# - The app auto-detects model type by file extension
-# - On Windows, tflite-runtime may need manual wheel installation
-#   See: https://www.tensorflow.org/lite/guide/python
+# 1. Create a virtual environment:
+#      python -m venv venv
+# 2. Activate it:
+#      Windows:   venv\Scripts\activate
+#      Mac/Linux: source venv/bin/activate
+# 3. Install:
+#      pip install -r requirements.txt
+# 4. Run:
+#      python main.py
