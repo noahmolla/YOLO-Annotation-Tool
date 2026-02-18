@@ -883,13 +883,13 @@ class AnnotatorApp:
         split_frame = tb.Labelframe(dialog, text="Train/Val/Test Split", padding=10)
         split_frame.pack(fill="x", padx=20, pady=10)
         
-        # Preset options - optimized for small datasets (150-600 images)
-        preset_var = tk.StringVar(value="80/20/0")
+        # Preset options
+        preset_var = tk.StringVar(value="85/14/1")
         presets = [
-            ("80% / 20% / 0%  (Small datasets - recommended)", "80/20/0"),
-            ("70% / 30% / 0%  (More validation)", "70/30/0"),
-            ("70% / 20% / 10% (With test set)", "70/20/10"),
-            ("90% / 10% / 0%  (Maximum training)", "90/10/0"),
+            ("85% / 14% / 1%  (Recommended)", "85/14/1"),
+            ("80% / 19% / 1%  (More validation)", "80/19/1"),
+            ("70% / 20% / 10% (Large test set)", "70/20/10"),
+            ("90% / 9% / 1%   (Maximum training)", "90/9/1"),
         ]
         
         for text, value in presets:
@@ -5228,12 +5228,12 @@ class AnnotatorApp:
         split_frame = tb.Labelframe(dialog, text="Train/Val/Test Split", padding=10)
         split_frame.pack(fill="x", padx=20, pady=5)
         
-        preset_var = tk.StringVar(value="80/20/0")
+        preset_var = tk.StringVar(value="85/14/1")
         presets = [
-            ("80% / 20% / 0%  (Small datasets - recommended)", "80/20/0"),
-            ("70% / 30% / 0%  (More validation)", "70/30/0"),
-            ("70% / 20% / 10% (With test set)", "70/20/10"),
-            ("90% / 10% / 0%  (Maximum training)", "90/10/0"),
+            ("85% / 14% / 1%  (Recommended)", "85/14/1"),
+            ("80% / 19% / 1%  (More validation)", "80/19/1"),
+            ("70% / 20% / 10% (Large test set)", "70/20/10"),
+            ("90% / 9% / 1%   (Maximum training)", "90/9/1"),
         ]
         for text, value in presets:
             tb.Radiobutton(split_frame, text=text, variable=preset_var, value=value).pack(anchor="w")
