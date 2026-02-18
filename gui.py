@@ -5178,7 +5178,8 @@ class AnnotatorApp:
                  bootstyle="secondary").pack(side=RIGHT, padx=5)
 
     def show_320_export_dialog(self):
-        """Show dialog for creating a resized, single-class YOLO dataset export."""
+        """Show dialog for creating a resized, single-class YOLO dataset export.
+        Uses the same structure as the regular export_zip_dialog."""
         if not self.workspace_path:
             messagebox.showwarning("No Workspace", "Please load a workspace first.")
             return
@@ -5187,333 +5188,277 @@ class AnnotatorApp:
             return
         
         dialog = tb.Toplevel(self.root)
-        dialog.title("YOLO Dataset Export")
-        dialog.geometry("580x620")
+        dialog.title("Export Resized YOLO Dataset")
+        dialog.geometry("440x520")
         dialog.transient(self.root)
         dialog.grab_set()
         
-        # Header
-        tb.Label(dialog, text="📦 YOLO Dataset Export", font=("Arial", 14, "bold")).pack(pady=10)
-        tb.Label(dialog, text="Resize images and export as a YOLO-format dataset", 
-                font=("Arial", 9)).pack()
+        tb.Label(dialog, text="Export Resized YOLO Dataset", font=("Arial", 14, "bold")).pack(pady=10)
         
-        # Options frame
-        options_frame = tb.Labelframe(dialog, text="Options", padding=15)
-        options_frame.pack(fill=X, padx=20, pady=10)
+        # --- Resize & Class options ---
+        opts = tb.Labelframe(dialog, text="Resize & Class", padding=10)
+        opts.pack(fill="x", padx=20, pady=5)
         
-        # Resolution
-        res_frame = tb.Frame(options_frame)
-        res_frame.pack(fill=X, pady=3)
-        tb.Label(res_frame, text="Output Resolution:").pack(side=LEFT)
+        r1 = tb.Frame(opts)
+        r1.pack(fill="x", pady=2)
+        tb.Label(r1, text="Resolution:", width=14, anchor="w").pack(side=LEFT)
         res_var = tk.StringVar(value="320")
-        res_combo = tb.Combobox(res_frame, values=["320", "416", "512", "640"], 
-                                textvariable=res_var, width=8, state="readonly")
-        res_combo.pack(side=LEFT, padx=10)
-        tb.Label(res_frame, text="x (square)").pack(side=LEFT)
+        tb.Combobox(r1, values=["320","416","512","640"], textvariable=res_var,
+                    width=8, state="readonly").pack(side=LEFT)
+        tb.Label(r1, text=" × (square)").pack(side=LEFT)
         
-        # Class to keep
-        class_frame = tb.Frame(options_frame)
-        class_frame.pack(fill=X, pady=3)
-        tb.Label(class_frame, text="Keep only class:").pack(side=LEFT)
-        class_var = tk.StringVar(value="0")
+        r2 = tb.Frame(opts)
+        r2.pack(fill="x", pady=2)
+        tb.Label(r2, text="Keep class:", width=14, anchor="w").pack(side=LEFT)
+        class_combo = None
         if self.classes:
-            class_values = [f"{i}: {c}" for i, c in enumerate(self.classes)]
-            class_combo = tb.Combobox(class_frame, values=class_values, width=20, state="readonly")
+            class_vals = [f"{i}: {c}" for i, c in enumerate(self.classes)]
+            class_combo = tb.Combobox(r2, values=class_vals, width=20, state="readonly")
             class_combo.current(0)
-            class_combo.pack(side=LEFT, padx=10)
+            class_combo.pack(side=LEFT)
         else:
-            class_entry = tb.Entry(class_frame, textvariable=class_var, width=8)
-            class_entry.pack(side=LEFT, padx=10)
-            class_combo = None
+            class_var = tk.StringVar(value="0")
+            tb.Entry(r2, textvariable=class_var, width=8).pack(side=LEFT)
         
-        # Include negative examples
-        include_negative_var = tk.BooleanVar(value=True)
-        tb.Checkbutton(options_frame, text="Include negative examples (images with no matching class)", 
-                      variable=include_negative_var).pack(anchor=W, pady=3)
+        neg_var = tk.BooleanVar(value=True)
+        tb.Checkbutton(opts, text="Include negatives (no matching class)", 
+                      variable=neg_var).pack(anchor="w", pady=2)
         
-        # --- Format options ---
-        format_frame = tb.Labelframe(dialog, text="Export Format", padding=15)
-        format_frame.pack(fill=X, padx=20, pady=5)
+        # --- Train/Val/Test Split (same as regular export) ---
+        split_frame = tb.Labelframe(dialog, text="Train/Val/Test Split", padding=10)
+        split_frame.pack(fill="x", padx=20, pady=5)
         
-        # Folder structure: flat vs train/val split
-        structure_var = tk.StringVar(value="flat")
-        struct_row1 = tb.Frame(format_frame)
-        struct_row1.pack(fill=X, pady=2)
-        tb.Radiobutton(struct_row1, text="Flat (images/ + labels/)", 
-                       variable=structure_var, value="flat").pack(side=LEFT)
+        preset_var = tk.StringVar(value="80/20/0")
+        presets = [
+            ("80% / 20% / 0%  (Small datasets - recommended)", "80/20/0"),
+            ("70% / 30% / 0%  (More validation)", "70/30/0"),
+            ("70% / 20% / 10% (With test set)", "70/20/10"),
+            ("90% / 10% / 0%  (Maximum training)", "90/10/0"),
+        ]
+        for text, value in presets:
+            tb.Radiobutton(split_frame, text=text, variable=preset_var, value=value).pack(anchor="w")
         
-        struct_row2 = tb.Frame(format_frame)
-        struct_row2.pack(fill=X, pady=2)
-        tb.Radiobutton(struct_row2, text="Train/Val split", 
-                       variable=structure_var, value="split").pack(side=LEFT)
+        # --- Output ---
+        out_frame = tb.Labelframe(dialog, text="Output", padding=10)
+        out_frame.pack(fill="x", padx=20, pady=5)
         
-        # Split ratio
-        split_pct_var = tk.IntVar(value=80)
-        tb.Label(struct_row2, text="   Train %:").pack(side=LEFT, padx=(10, 0))
-        split_spin = tb.Spinbox(struct_row2, from_=50, to=95, increment=5, 
-                                textvariable=split_pct_var, width=5)
-        split_spin.pack(side=LEFT, padx=5)
+        fmt_var = tk.StringVar(value="zip")
+        tb.Radiobutton(out_frame, text="Save as .zip", variable=fmt_var, value="zip").pack(anchor="w")
+        tb.Radiobutton(out_frame, text="Save as folder", variable=fmt_var, value="folder").pack(anchor="w")
         
-        # Zip option  
-        zip_var = tk.BooleanVar(value=False)
-        tb.Checkbutton(format_frame, text="Create .zip file after export", 
-                      variable=zip_var).pack(anchor=W, pady=3)
-        
-        # Output directory
-        out_frame = tb.Labelframe(dialog, text="Output Location", padding=10)
-        out_frame.pack(fill=X, padx=20, pady=5)
-        
-        workspace_name = os.path.basename(self.workspace_path)
-        parent_folder = os.path.dirname(self.workspace_path)
-        default_out = os.path.join(parent_folder, f"{workspace_name}_320")
-        
-        out_path_var = tk.StringVar(value=default_out)
-        out_entry = tb.Entry(out_frame, textvariable=out_path_var, width=50)
-        out_entry.pack(side=LEFT, fill=X, expand=True, padx=(0, 5))
-        
-        def browse_output():
-            d = filedialog.askdirectory(title="Select Output Directory")
-            if d:
-                out_path_var.set(d)
-        
-        tb.Button(out_frame, text="Browse", command=browse_output, 
-                 bootstyle="secondary-outline").pack(side=RIGHT)
-        
-        # Progress
-        progress_var = tk.StringVar(value="Ready to export")
-        progress_label = tb.Label(dialog, textvariable=progress_var, font=("Consolas", 9))
-        progress_label.pack(pady=5)
-        
-        progress_bar = tb.Progressbar(dialog, mode='determinate', length=400)
-        progress_bar.pack(padx=20, pady=3)
+        # Buttons
+        btn_frame = tb.Frame(dialog)
+        btn_frame.pack(fill="x", padx=20, pady=12)
         
         def do_export():
-            import random
-            import shutil
+            import random, shutil, zipfile, yaml
             
-            out_dir = out_path_var.get()
-            if not out_dir:
-                messagebox.showerror("Error", "Please select output directory")
-                return
-            
-            # Get resolution
+            # --- Parse settings ---
             try:
                 resolution = int(res_var.get())
             except:
                 resolution = 320
             
-            # Get class to keep
             keep_class = 0
             keep_class_name = "class_0"
             if class_combo and self.classes:
-                try:
-                    keep_class = class_combo.current()
-                    keep_class_name = self.classes[keep_class]
-                except:
-                    keep_class = 0
-                    keep_class_name = self.classes[0] if self.classes else "class_0"
+                keep_class = class_combo.current()
+                keep_class_name = self.classes[keep_class]
             else:
                 try:
                     keep_class = int(class_var.get())
-                    keep_class_name = self.classes[keep_class] if keep_class < len(self.classes) else f"class_{keep_class}"
                 except:
                     keep_class = 0
-                    keep_class_name = self.classes[0] if self.classes else "class_0"
+                keep_class_name = self.classes[keep_class] if self.classes and keep_class < len(self.classes) else f"class_{keep_class}"
             
-            include_negative = include_negative_var.get()
-            use_split = structure_var.get() == "split"
-            split_pct = split_pct_var.get() / 100.0
-            create_zip = zip_var.get()
+            parts = preset_var.get().split("/")
+            train_r, val_r, test_r = float(parts[0]), float(parts[1]), float(parts[2])
+            total_r = train_r + val_r + test_r
+            train_r /= total_r
+            val_r /= total_r
+            test_r /= total_r
             
-            # Create output directory structure
-            os.makedirs(out_dir, exist_ok=True)
+            as_zip = fmt_var.get() == "zip"
+            include_neg = neg_var.get()
             
-            if use_split:
-                train_img_dir = os.path.join(out_dir, "train", "images")
-                train_lbl_dir = os.path.join(out_dir, "train", "labels")
-                val_img_dir = os.path.join(out_dir, "val", "images")
-                val_lbl_dir = os.path.join(out_dir, "val", "labels")
-                os.makedirs(train_img_dir, exist_ok=True)
-                os.makedirs(train_lbl_dir, exist_ok=True)
-                os.makedirs(val_img_dir, exist_ok=True)
-                os.makedirs(val_lbl_dir, exist_ok=True)
+            # --- Choose output path ---
+            if as_zip:
+                out_zip = filedialog.asksaveasfilename(
+                    defaultextension=".zip",
+                    filetypes=[("Zip File", "*.zip")],
+                    parent=dialog
+                )
+                if not out_zip:
+                    return
             else:
-                out_img_dir = os.path.join(out_dir, "images")
-                out_lbl_dir = os.path.join(out_dir, "labels")
-                os.makedirs(out_img_dir, exist_ok=True)
-                os.makedirs(out_lbl_dir, exist_ok=True)
+                out_folder = filedialog.askdirectory(title="Select Output Folder", parent=dialog)
+                if not out_folder:
+                    return
             
-            # First pass: collect valid images and their labels
-            total = len(self.image_paths)
-            export_items = []  # (img_path, kept_label_lines)
+            dialog.destroy()
+            self.status_var.set("Exporting dataset...")
+            self.root.update()
             
-            progress_bar['maximum'] = total
+            # --- First pass: scan labels, build item list ---
+            items_with_cls = []   # (img_path, [remapped lines])
+            items_negative = []   # (img_path, [])
             
-            for i, img_path in enumerate(self.image_paths):
-                progress_bar['value'] = i + 1
-                progress_var.set(f"Scanning {i+1}/{total}: {os.path.basename(img_path)}")
-                if i % 20 == 0:
-                    dialog.update()
-                
-                # Read and filter labels
+            for img_path in self.image_paths:
                 lbl_path = self._get_label_path(img_path)
-                kept_lines = []
+                kept = []
                 if os.path.exists(lbl_path):
                     with open(lbl_path, 'r') as f:
                         for line in f:
-                            parts = line.strip().split()
-                            if len(parts) >= 5:
+                            p = line.strip().split()
+                            if len(p) >= 5:
                                 try:
-                                    cls_id = int(float(parts[0]))
-                                    if cls_id == keep_class:
-                                        # Remap to class 0, keep coordinates
-                                        coords = " ".join(parts[1:])
-                                        kept_lines.append(f"0 {coords}")
+                                    if int(float(p[0])) == keep_class:
+                                        kept.append("0 " + " ".join(p[1:]))
                                 except:
                                     pass
-                
-                if kept_lines or include_negative:
-                    export_items.append((img_path, kept_lines))
+                if kept:
+                    items_with_cls.append((img_path, kept))
+                elif include_neg:
+                    items_negative.append((img_path, []))
             
-            # Shuffle and split if needed
-            if use_split:
-                random.shuffle(export_items)
-                split_idx = int(len(export_items) * split_pct)
-                train_items = export_items[:split_idx]
-                val_items = export_items[split_idx:]
-                batches = [
-                    (train_items, os.path.join(out_dir, "train", "images"), os.path.join(out_dir, "train", "labels")),
-                    (val_items, os.path.join(out_dir, "val", "images"), os.path.join(out_dir, "val", "labels")),
-                ]
-            else:
-                batches = [
-                    (export_items, os.path.join(out_dir, "images"), os.path.join(out_dir, "labels")),
-                ]
+            if not items_with_cls and not items_negative:
+                messagebox.showinfo("No Data", "No images matched the criteria.")
+                self.status_var.set("Ready")
+                return
             
-            # Second pass: resize and save
+            # --- Shuffle and split (same logic as utils.export_yolo_zip) ---
+            random.shuffle(items_with_cls)
+            random.shuffle(items_negative)
+            
+            n_lbl = len(items_with_cls)
+            n_neg = len(items_negative)
+            
+            n_train_lbl = int(n_lbl * train_r)
+            n_val_lbl = int(n_lbl * val_r)
+            if n_lbl >= 3:
+                if n_train_lbl == 0: n_train_lbl = 1
+                if n_val_lbl == 0: n_val_lbl = 1
+            
+            n_train_neg = int(n_neg * train_r)
+            n_val_neg = int(n_neg * val_r)
+            
+            train_items = items_with_cls[:n_train_lbl] + items_negative[:n_train_neg]
+            val_items = items_with_cls[n_train_lbl:n_train_lbl+n_val_lbl] + items_negative[n_train_neg:n_train_neg+n_val_neg]
+            test_items = items_with_cls[n_train_lbl+n_val_lbl:] + items_negative[n_train_neg+n_val_neg:]
+            
+            splits = {'train': train_items, 'val': val_items, 'test': test_items}
+            
+            # --- Build temp directory ---
+            temp_root = os.path.join(self.workspace_path, "temp_320_export")
+            if os.path.exists(temp_root):
+                shutil.rmtree(temp_root)
+            os.makedirs(temp_root)
+            
             processed = 0
-            with_class = 0
-            negative = 0
             errors = []
-            total_export = len(export_items)
-            progress_bar['maximum'] = total_export
+            total_items = sum(len(v) for v in splits.values())
             
-            for items, img_dir, lbl_dir in batches:
-                for img_path, kept_lines in items:
-                    processed += 1
-                    progress_bar['value'] = processed
-                    progress_var.set(f"Exporting {processed}/{total_export}: {os.path.basename(img_path)}")
-                    if processed % 10 == 0:
-                        dialog.update()
+            try:
+                for split_name, split_items in splits.items():
+                    if not split_items:
+                        continue
+                    img_dir = os.path.join(temp_root, split_name, "images")
+                    lbl_dir = os.path.join(temp_root, split_name, "labels")
+                    os.makedirs(img_dir, exist_ok=True)
+                    os.makedirs(lbl_dir, exist_ok=True)
                     
-                    try:
-                        img = Image.open(img_path)
-                        # Convert to RGB
-                        if img.mode in ('RGBA', 'P', 'LA'):
-                            background = Image.new('RGB', img.size, (255, 255, 255))
-                            if img.mode == 'P':
-                                img = img.convert('RGBA')
-                            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-                            img = background
-                        elif img.mode != 'RGB':
-                            img = img.convert('RGB')
-                        img_resized = img.resize((resolution, resolution), Image.Resampling.LANCZOS)
+                    for img_path, kept_lines in split_items:
+                        processed += 1
+                        if processed % 20 == 0:
+                            self.status_var.set(f"Exporting {processed}/{total_items}...")
+                            self.root.update()
                         
-                        original_filename = os.path.basename(img_path)
-                        name = os.path.splitext(original_filename)[0]
-                        ext = os.path.splitext(original_filename)[1].lower()
-                        
-                        out_img_path = os.path.join(img_dir, original_filename)
-                        out_lbl_path = os.path.join(lbl_dir, f"{name}.txt")
-                        
-                        # Save image
-                        if ext in ('.jpg', '.jpeg'):
-                            img_resized.save(out_img_path, "JPEG", quality=95)
-                        elif ext == '.png':
-                            img_resized.save(out_img_path, "PNG")
-                        else:
-                            img_resized.save(out_img_path)
-                        
-                        # Save label
-                        with open(out_lbl_path, 'w') as f:
-                            if kept_lines:
-                                f.write("\n".join(kept_lines) + "\n")
-                                with_class += 1
+                        try:
+                            img = Image.open(img_path)
+                            if img.mode in ('RGBA', 'P', 'LA'):
+                                bg = Image.new('RGB', img.size, (255, 255, 255))
+                                if img.mode == 'P':
+                                    img = img.convert('RGBA')
+                                bg.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                                img = bg
+                            elif img.mode != 'RGB':
+                                img = img.convert('RGB')
+                            
+                            img = img.resize((resolution, resolution), Image.Resampling.LANCZOS)
+                            
+                            fname = os.path.basename(img_path)
+                            name = os.path.splitext(fname)[0]
+                            ext = os.path.splitext(fname)[1].lower()
+                            
+                            dst_img = os.path.join(img_dir, fname)
+                            if ext in ('.jpg', '.jpeg'):
+                                img.save(dst_img, "JPEG", quality=95)
+                            elif ext == '.png':
+                                img.save(dst_img, "PNG")
                             else:
-                                f.write("")
-                                negative += 1
-                        
-                    except Exception as e:
-                        errors.append(f"{os.path.basename(img_path)}: {str(e)}")
-            
-            # Write data.yaml
-            progress_var.set("Writing data.yaml...")
-            dialog.update()
-            
-            yaml_path = os.path.join(out_dir, "data.yaml")
-            yaml_data = {
-                'nc': 1,
-                'names': {0: keep_class_name},
-            }
-            if use_split:
-                yaml_data['train'] = './train/images'
-                yaml_data['val'] = './val/images'
-            else:
-                yaml_data['train'] = './images'
-                yaml_data['val'] = './images'
-            
-            import yaml
-            with open(yaml_path, 'w') as f:
-                yaml.dump(yaml_data, f, sort_keys=False)
-            
-            # Create zip if requested
-            zip_path = None
-            if create_zip:
-                import zipfile
-                progress_var.set("Creating zip file...")
-                dialog.update()
-                zip_path = out_dir + ".zip"
-                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    for root_dir, dirs, files in os.walk(out_dir):
-                        for file in files:
-                            abs_path = os.path.join(root_dir, file)
-                            arc_name = os.path.relpath(abs_path, out_dir)
-                            zf.write(abs_path, arc_name)
-            
-            # Summary
-            progress_var.set(f"Done! Exported {processed} images")
-            
-            msg = f"✅ Export Complete!\n\n"
-            msg += f"📁 Output: {out_dir}\n"
-            if zip_path:
-                msg += f"📦 Zip: {zip_path}\n"
-            msg += f"\n📊 Statistics:\n"
-            msg += f"   Total exported: {processed}\n"
-            msg += f"   With {keep_class_name} (class {keep_class}): {with_class}\n"
-            msg += f"   Negative examples: {negative}\n"
-            msg += f"   Resolution: {resolution}x{resolution}\n"
-            if use_split:
-                msg += f"   Train: {len(train_items)}  |  Val: {len(val_items)}\n"
-            msg += f"   data.yaml: ✓ (class 0 = {keep_class_name})\n"
-            
-            if errors:
-                msg += f"\n⚠️ Errors: {len(errors)}\n"
-                if len(errors) <= 3:
-                    msg += "\n".join(errors)
+                                img.save(dst_img)
+                            
+                            dst_lbl = os.path.join(lbl_dir, f"{name}.txt")
+                            with open(dst_lbl, 'w') as f:
+                                if kept_lines:
+                                    f.write("\n".join(kept_lines) + "\n")
+                                else:
+                                    pass  # empty file for negatives
+                        except Exception as e:
+                            errors.append(f"{os.path.basename(img_path)}: {e}")
+                
+                # --- Write data.yaml (same format as regular export) ---
+                yaml_lines = ["train: ../train/images", "val: ../val/images"]
+                if test_items:
+                    yaml_lines.append("test: ../test/images")
+                yaml_lines.append(f"nc: 1")
+                yaml_lines.append(f"names: ['{keep_class_name}']")
+                
+                with open(os.path.join(temp_root, "data.yaml"), 'w') as f:
+                    f.write("\n".join(yaml_lines) + "\n")
+                
+                # --- Zip or copy to final location ---
+                if as_zip:
+                    self.status_var.set("Creating zip...")
+                    self.root.update()
+                    with zipfile.ZipFile(out_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        for root_dir, dirs, files in os.walk(temp_root):
+                            for file in files:
+                                abs_path = os.path.join(root_dir, file)
+                                arc_name = os.path.relpath(abs_path, temp_root)
+                                zf.write(abs_path, arc_name)
+                    final_path = out_zip
                 else:
-                    msg += "\n".join(errors[:3]) + f"\n... and {len(errors)-3} more"
+                    # Move temp contents to chosen folder
+                    if os.path.exists(out_folder):
+                        shutil.rmtree(out_folder)
+                    shutil.move(temp_root, out_folder)
+                    temp_root = None  # don't clean up, we moved it
+                    final_path = out_folder
+                
+                # --- Summary ---
+                msg = f"✅ Export Complete!\n\n"
+                msg += f"📁 {final_path}\n\n"
+                msg += f"Train: {len(train_items)}  |  Val: {len(val_items)}  |  Test: {len(test_items)}\n"
+                msg += f"Resolution: {resolution}×{resolution}\n"
+                msg += f"data.yaml: nc=1, names=['{keep_class_name}']\n"
+                if errors:
+                    msg += f"\n⚠️ {len(errors)} errors\n"
+                    msg += "\n".join(errors[:3])
+                
+                messagebox.showinfo("Export Complete", msg)
+                
+            finally:
+                # Clean up temp directory
+                if temp_root and os.path.exists(temp_root):
+                    shutil.rmtree(temp_root)
             
-            messagebox.showinfo("Export Complete", msg)
-            dialog.destroy()
+            self.status_var.set("Ready")
         
-        # Buttons
-        button_frame = tb.Frame(dialog)
-        button_frame.pack(fill=X, padx=20, pady=10)
-        
-        tb.Button(button_frame, text="Export", command=do_export, 
-                 bootstyle="success").pack(side=LEFT, padx=5)
-        tb.Button(button_frame, text="Cancel", command=dialog.destroy, 
-                 bootstyle="secondary").pack(side=RIGHT, padx=5)
+        tb.Button(btn_frame, text="Export", command=do_export, 
+                 bootstyle="success", width=12).pack(side=LEFT, padx=5)
+        tb.Button(btn_frame, text="Cancel", command=dialog.destroy, 
+                 bootstyle="secondary", width=12).pack(side=RIGHT, padx=5)
 
 if __name__ == "__main__":
     app = tb.Window(themename="darkly")
