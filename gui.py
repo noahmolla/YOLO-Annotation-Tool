@@ -1412,12 +1412,17 @@ class AnnotatorApp:
 
     def _flash_notification(self, message, duration=2000):
         """Show a temporary notification in the status bar with highlight."""
-        old_style = self.statusbar.cget('bootstyle')
-        self.statusbar.configure(bootstyle="warning")
+        try:
+            self.statusbar.configure(bootstyle="warning")
+        except Exception:
+            pass
         self.status_var.set(message)
         
         def restore():
-            self.statusbar.configure(bootstyle="inverse-secondary")
+            try:
+                self.statusbar.configure(bootstyle="inverse-secondary")
+            except Exception:
+                pass
         
         self.root.after(duration, restore)
 
@@ -1761,7 +1766,7 @@ class AnnotatorApp:
                 return True
         return False
 
-    def _is_duplicate_or_overlapping(self, new_ann, existing_annotations, iou_threshold=0.3, coord_tolerance=0.02):
+    def _is_duplicate_or_overlapping(self, new_ann, existing_annotations, iou_threshold=None, coord_tolerance=0.02):
         """Check if a new annotation duplicates or significantly overlaps any existing one.
         
         Uses two checks:
@@ -1770,6 +1775,8 @@ class AnnotatorApp:
         
         Returns True if the annotation should be skipped.
         """
+        if iou_threshold is None:
+            iou_threshold = self.iou_threshold
         new_box = (new_ann[1], new_ann[2], new_ann[3], new_ann[4])
         for ann in existing_annotations:
             if ann[0] != new_ann[0]:  # Different class - allow overlap
@@ -3615,12 +3622,12 @@ class AnnotatorApp:
                         
                         # Mode: add_missing - check against existing annotations
                         if mode == "add_missing":
-                            if self._is_duplicate_or_overlapping(new_ann, existing_anns):
+                            if self._is_duplicate_or_overlapping(new_ann, existing_anns, iou_threshold=iou_thresh):
                                 skipped_dupes += 1
                                 continue
                             # Also check against annotations we're about to add
                             new_anns_so_far = [[int(l.split()[0])] + [float(x) for x in l.split()[1:]] for l in new_lines]
-                            if self._is_duplicate_or_overlapping(new_ann, new_anns_so_far):
+                            if self._is_duplicate_or_overlapping(new_ann, new_anns_so_far, iou_threshold=iou_thresh):
                                 skipped_dupes += 1
                                 continue
                         
@@ -5462,10 +5469,16 @@ class AnnotatorApp:
             # Create zip if requested
             zip_path = None
             if create_zip:
+                import zipfile
                 progress_var.set("Creating zip file...")
                 dialog.update()
                 zip_path = out_dir + ".zip"
-                shutil.make_archive(out_dir, 'zip', os.path.dirname(out_dir), os.path.basename(out_dir))
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for root_dir, dirs, files in os.walk(out_dir):
+                        for file in files:
+                            abs_path = os.path.join(root_dir, file)
+                            arc_name = os.path.relpath(abs_path, out_dir)
+                            zf.write(abs_path, arc_name)
             
             # Summary
             progress_var.set(f"Done! Exported {processed} images")

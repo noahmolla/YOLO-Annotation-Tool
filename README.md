@@ -2,7 +2,7 @@
 
 A modern, feature-rich Python application for annotating images using YOLO models. Supports both manual annotation and AI-assisted auto-annotation with TFLite (`.tflite`) and PyTorch (`.pt`) models.
 
-![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)
+![Python 3.10-3.12](https://img.shields.io/badge/python-3.10--3.12-blue.svg)
 ![License AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)
 
 ---
@@ -28,7 +28,7 @@ A modern, feature-rich Python application for annotating images using YOLO model
 
 ### 1. Prerequisites
 
-- **Python 3.8 or higher** - [Download Python](https://www.python.org/downloads/)
+- **Python 3.10, 3.11, or 3.12** - [Download Python](https://www.python.org/downloads/)
 - **Git** (optional) - For cloning the repository
 
 ### 2. Installation
@@ -43,12 +43,14 @@ python -m venv venv
 # Activate virtual environment
 # Windows:
 venv\Scripts\activate
-# Linux/Mac:
+# macOS/Linux:
 source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
 ```
+
+> **Note:** If TensorFlow fails to install (common on Python 3.13+ or Apple Silicon), see [INSTALL.md](INSTALL.md) for workarounds. You can still use `.pt` models without TensorFlow.
 
 ### 3. Run the Application
 
@@ -181,9 +183,9 @@ For PyTorch models, you can configure the inference resolution:
 
 ### "ModuleNotFoundError: No module named 'tflite_runtime'"
 
-Install TensorFlow:
+Install TensorFlow or comment it out in `requirements.txt` if you only use `.pt` models:
 ```bash
-pip install tensorflow>=2.8.0
+pip install tensorflow>=2.13.0,<2.18.0
 ```
 
 ### "No module named 'ultralytics'"
@@ -196,12 +198,15 @@ pip install ultralytics
 ### Application won't start
 
 1. Make sure you're in a virtual environment
-2. Verify Python version: `python --version` (need 3.8+)
+2. Verify Python version: `python --version` (need 3.10-3.12)
 3. Reinstall requirements: `pip install -r requirements.txt --force-reinstall`
+4. **macOS**: You may need to install tkinter: `brew install python-tk@3.12`
 
 ### TFLite slower than PyTorch
 
 This is normal. TFLite is optimized for edge devices. For desktop use, PyTorch (`.pt`) models are recommended.
+
+For detailed installation help, see [INSTALL.md](INSTALL.md).
 
 ---
 
@@ -209,10 +214,10 @@ This is normal. TFLite is optimized for edge devices. For desktop use, PyTorch (
 
 | Requirement | Minimum | Recommended |
 |-------------|---------|-------------|
-| Python | 3.8 | 3.10+ |
+| Python | 3.10 | 3.11 or 3.12 |
 | RAM | 4 GB | 8 GB+ |
 | Storage | 500 MB | 2 GB+ |
-| OS | Windows 10, Linux, macOS | Windows 10/11 |
+| OS | Windows 10, macOS 11, Ubuntu 20.04 | Windows 11, macOS 13+, Ubuntu 22.04 |
 
 ---
 

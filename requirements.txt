@@ -1,43 +1,34 @@
 # ============================================
 # YOLO Annotator - Requirements
 # ============================================
+# Requires Python 3.10, 3.11, or 3.12
+# (Python 3.13+ not yet supported by TensorFlow)
 
-# Core Dependencies (Required)
+# Core Dependencies
 Pillow>=9.0.0
 numpy>=1.21.0
 opencv-python>=4.5.5
 ttkbootstrap>=1.10.0
 PyYAML>=6.0.1
 
-# ============================================
-# MODEL INFERENCE (at least one required)
-# ============================================
-
-# PyTorch YOLO models (.pt files) - RECOMMENDED
-# Supports YOLOv5, YOLOv8, YOLOv11, YOLO26, etc.
+# PyTorch YOLO (.pt models) - RECOMMENDED
 ultralytics>=8.0.0
 
-# ============================================
-# OPTIONAL: TensorFlow Lite (.tflite files)
-# Only needed if you use .tflite models.
-# Uncomment ONE of the lines below if needed:
-# ============================================
-
-# Full TensorFlow (includes TFLite runtime):
-tensorflow>=2.13.0
-
-# OR lightweight tflite-runtime (~5MB, Linux/Mac only):
-# tflite-runtime>=2.5.0
+# TensorFlow Lite (.tflite models)
+# Comment out if you only use .pt models
+tensorflow>=2.13.0,<2.18.0
 
 # ============================================
-# INSTALL INSTRUCTIONS
+# INSTALL
 # ============================================
-# 1. Create a virtual environment:
-#      python -m venv venv
-# 2. Activate it:
-#      Windows:   venv\Scripts\activate
-#      Mac/Linux: source venv/bin/activate
-# 3. Install:
-#      pip install -r requirements.txt
-# 4. Run:
-#      python main.py
+# python -m venv venv
+# Windows:    venv\Scripts\activate
+# Mac/Linux:  source venv/bin/activate
+# pip install -r requirements.txt
+# python main.py
+#
+# NOTES:
+# - If TensorFlow fails, comment it out above.
+#   You can still use .pt models without it.
+# - On macOS with Apple Silicon (M1/M2/M3):
+#   pip install tensorflow-macos  (instead of tensorflow)
