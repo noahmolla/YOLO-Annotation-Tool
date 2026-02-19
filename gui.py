@@ -5377,8 +5377,8 @@ class AnnotatorApp:
             # =============================================
             if not as_zip:
                 # Create images/ and labels/ inside chosen folder
-                img_dir = os.path.join(out_folder, "images")
-                lbl_dir = os.path.join(out_folder, "labels")
+                img_dir = os.path.join(out_folder, f"images_{resolution}p")
+                lbl_dir = os.path.join(out_folder, f"labels_{resolution}p")
                 os.makedirs(img_dir, exist_ok=True)
                 os.makedirs(lbl_dir, exist_ok=True)
                 
@@ -5390,8 +5390,8 @@ class AnnotatorApp:
                 
                 # Write data.yaml
                 yaml_lines = [
-                    "train: ./images",
-                    "val: ./images",
+                    f"train: ./images_{resolution}p",
+                    f"val: ./images_{resolution}p",
                     f"nc: 1",
                     f"names: ['{keep_class_name}']",
                 ]
@@ -5400,6 +5400,7 @@ class AnnotatorApp:
                 
                 msg = f"✅ Export Complete!\n\n"
                 msg += f"📁 {out_folder}\n\n"
+                msg += f"Folders: images_{resolution}p/ + labels_{resolution}p/\n"
                 msg += f"Total images: {len(all_items)}\n"
                 msg += f"  With annotations: {len(items_with_cls)}\n"
                 msg += f"  Negatives: {len(items_negative)}\n"
