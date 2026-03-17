@@ -107,6 +107,13 @@ class AnnotatorApp:
         # Draw-only mode: skip annotation selection/movement on click
         self.draw_only_mode = tk.BooleanVar(value=False)
         
+        # Edit mode: allows resizing annotations by dragging edges/corners
+        self.edit_mode = tk.BooleanVar(value=False)
+        self.resize_handle = None  # Which handle is being dragged: 'n','s','e','w','ne','nw','se','sw'
+        self.resize_orig_norm = None  # Original [cx, cy, w, h] before resize
+        self.EDGE_THRESHOLD = 20  # Pixels from edge to trigger resize handle
+        self.edit_selected_index = -1  # Which annotation is selected for editing (handles shown)
+        
         # Auto-annotation settings
         self.default_confidence_threshold = 0.50  # Default confidence for all classes
         self.class_confidence_thresholds = {}  # Per-class confidence thresholds
@@ -352,7 +359,11 @@ class AnnotatorApp:
         
         # Draw Only Mode Toggle
         tb.Checkbutton(c_toolbar, text="Draw Only (T)", variable=self.draw_only_mode, 
-                      bootstyle="round-toggle").pack(side=LEFT, padx=10)
+                      bootstyle="round-toggle").pack(side=LEFT, padx=5)
+        
+        # Edit Mode Toggle
+        tb.Checkbutton(c_toolbar, text="Edit (E)", variable=self.edit_mode, 
+                      bootstyle="round-toggle").pack(side=LEFT, padx=5)
         
         # Show only selected class toggle
         tb.Checkbutton(c_toolbar, text="Show Only Selected Class (F)", variable=self.show_only_selected_class, 
@@ -489,6 +500,7 @@ class AnnotatorApp:
         
         # T to toggle draw-only mode
         self.root.bind("t", lambda e: self.draw_only_mode.set(not self.draw_only_mode.get()))
+        self.root.bind("e", lambda e: self._toggle_edit_mode())
         
         # F5 to refresh workspace
         self.root.bind("<F5>", lambda e: self.refresh_workspace())
@@ -1450,6 +1462,8 @@ class AnnotatorApp:
   R           Repeat last drawn box
   Ctrl+Click  Multi-select annotations
   Y           Repeat selected annotations & next
+  E           Toggle Edit mode (resize boxes)
+  T           Toggle Draw Only mode
 
 🗑 DELETE / CLEAR
   Del         Delete current image (undoable)
@@ -2055,6 +2069,56 @@ class AnnotatorApp:
             # Switching to click mode
             self.status_var.set("Click mode: Click two corners to create boxes")
 
+    def _toggle_edit_mode(self):
+        """Toggle edit mode for resizing annotations."""
+        self.edit_mode.set(not self.edit_mode.get())
+        if self.edit_mode.get():
+            self.status_var.set("Edit mode ON — click a box to select it, then drag edges to resize")
+        else:
+            self.status_var.set("Edit mode OFF")
+            self.resize_handle = None
+            self.edit_selected_index = -1
+            self.canvas.config(cursor="" if not self.show_crosshair.get() else "none")
+        self.redraw()
+    
+    def _detect_resize_handle(self, event_x, event_y, ann_index):
+        """Detect if click is near an edge or corner of annotation ann_index.
+        Returns handle string ('n','s','e','w','ne','nw','se','sw') or None for center (move).
+        """
+        ann = self.annotations[ann_index]
+        cid, n_cx, n_cy, n_w, n_h = ann
+        iw, ih = self.current_image.size
+        
+        # Annotation pixel coords on canvas
+        x1 = (n_cx - n_w/2) * iw * self.scale + self.offset_x
+        y1 = (n_cy - n_h/2) * ih * self.scale + self.offset_y
+        x2 = (n_cx + n_w/2) * iw * self.scale + self.offset_x
+        y2 = (n_cy + n_h/2) * ih * self.scale + self.offset_y
+        
+        t = self.EDGE_THRESHOLD
+        
+        near_left   = abs(event_x - x1) < t
+        near_right  = abs(event_x - x2) < t
+        near_top    = abs(event_y - y1) < t
+        near_bottom = abs(event_y - y2) < t
+        
+        # Corners first (higher priority)
+        if near_top and near_left:     return 'nw'
+        if near_top and near_right:    return 'ne'
+        if near_bottom and near_left:  return 'sw'
+        if near_bottom and near_right: return 'se'
+        
+        # Edges (must be within the box's extent on the other axis)
+        in_x_range = (x1 - t) < event_x < (x2 + t)
+        in_y_range = (y1 - t) < event_y < (y2 + t)
+        
+        if near_top and in_x_range:    return 'n'
+        if near_bottom and in_x_range: return 's'
+        if near_left and in_y_range:   return 'w'
+        if near_right and in_y_range:  return 'e'
+        
+        return None  # Center area = move
+
     def _on_nav_key_press(self, event):
         """Handle navigation key press - start rapid navigation timer if in rapid mode."""
         key = event.keysym.lower()
@@ -2472,6 +2536,9 @@ class AnnotatorApp:
                 self.temp_box_id = None
             self.first_click_point = None
         
+        # Clear edit selection when navigating
+        self.edit_selected_index = -1
+        
         # ALWAYS save annotations before navigating away - never lose data
         if self.current_image and self.current_file_path:
             self.save_annotations(force=True)
@@ -2773,6 +2840,30 @@ class AnnotatorApp:
             label = "✓ " + label  # Add checkmark to indicate selection
         
         self.canvas.create_text(sx1, sy1-10, text=label, fill=color, anchor=SW, font=("Arial", 11, "bold"))
+        
+        # Draw resize handles on the selected-for-editing annotation
+        if self.edit_mode.get() and not self.draw_only_mode.get():
+            is_edit_selected = (index == self.edit_selected_index)
+            is_resizing = (index == self.active_annotation_index and self.drag_mode == "resize")
+            if is_edit_selected or is_resizing:
+                # Highlight the selected box with a thicker distinctive outline
+                self.canvas.create_rectangle(sx1-1, sy1-1, sx2+1, sy2+1, 
+                    outline="#FF6600", width=2, dash=(4,2), tags=f"edit_sel_{index}")
+                
+                handle_color = "#FFFFFF"
+                handle_outline = "#FF6600"  # Orange outline for visibility
+                mx = (sx1 + sx2) / 2
+                my = (sy1 + sy2) / 2
+                # Corner handles (larger filled squares)
+                hs = 6
+                for hx, hy in [(sx1, sy1), (sx2, sy1), (sx1, sy2), (sx2, sy2)]:
+                    self.canvas.create_rectangle(hx-hs, hy-hs, hx+hs, hy+hs, 
+                        fill=handle_color, outline=handle_outline, width=2, tags=f"handle_{index}")
+                # Edge midpoint handles
+                hs = 5
+                for hx, hy in [(mx, sy1), (mx, sy2), (sx1, my), (sx2, my)]:
+                    self.canvas.create_rectangle(hx-hs, hy-hs, hx+hs, hy+hs, 
+                        fill=handle_color, outline=handle_outline, width=2, tags=f"handle_{index}")
 
     # --- MOUSE INTERACTION ---
 
@@ -2845,7 +2936,21 @@ class AnnotatorApp:
             self.status_var.set("Selection cleared")
 
     def escape_action(self):
-        """Handle Escape key - clear selection and unlock class."""
+        """Handle Escape key - cancel resize, clear selection and unlock class."""
+        # Cancel active resize if in progress
+        if self.drag_mode == "resize":
+            # Revert to original position
+            if self.resize_orig_norm and self.active_annotation_index != -1:
+                ann = self.annotations[self.active_annotation_index]
+                ann[1:] = self.resize_orig_norm
+            self.drag_mode = None
+            self.resize_handle = None
+            self.resize_orig_norm = None
+            self.active_annotation_index = -1
+            self.redraw()
+            self.status_var.set("Resize cancelled")
+            return
+        
         # Cancel partial click annotation if in click mode
         if self.click_mode.get() and self.first_click_point:
             if self.temp_box_id:
@@ -2853,6 +2958,21 @@ class AnnotatorApp:
                 self.temp_box_id = None
             self.first_click_point = None
             self.status_var.set("Click annotation cancelled")
+            return
+        
+        # Clear edit selection first, then turn off edit mode
+        if self.edit_mode.get():
+            if self.edit_selected_index != -1:
+                self.edit_selected_index = -1
+                self.canvas.config(cursor="" if not self.show_crosshair.get() else "none")
+                self.status_var.set("Edit selection cleared")
+                self.redraw()
+                return
+            self.edit_mode.set(False)
+            self.resize_handle = None
+            self.canvas.config(cursor="" if not self.show_crosshair.get() else "none")
+            self.status_var.set("Edit mode OFF")
+            self.redraw()
             return
         
         # First press clears selection, second unlocks class
@@ -2938,6 +3058,11 @@ class AnnotatorApp:
             for i in range(len(self.annotations)-1, -1, -1):
                 ann = self.annotations[i]
                 
+                # Respect "show only selected class" - don't interact with hidden annotations
+                if self.show_only_selected_class.get():
+                    if ann[0] != self.selected_class_id:
+                        continue
+                
                 # If class is locked, only consider annotations of that class
                 if class_locked and ann[0] != self.selected_class_id:
                     continue
@@ -2956,10 +3081,45 @@ class AnnotatorApp:
                     break
         
         if hit_index != -1:
+            # Edit Mode: click-to-select, then drag handles to resize
+            if self.edit_mode.get():
+                if self.edit_selected_index == hit_index:
+                    # Already selected — check if clicking a handle to resize
+                    handle = self._detect_resize_handle(event.x, event.y, hit_index)
+                    if handle is not None:
+                        # Entering Resize Mode
+                        self._push_annotation_undo()
+                        self.drag_mode = "resize"
+                        self.active_annotation_index = hit_index
+                        self.resize_handle = handle
+                        self.start_x = event.x
+                        self.start_y = event.y
+                        self.resize_orig_norm = list(self.annotations[hit_index][1:])  # [cx, cy, w, h]
+                        self.redraw()
+                        return
+                    else:
+                        # Center click on selected box — move it
+                        self._push_annotation_undo()
+                        self.drag_mode = "move"
+                        self.active_annotation_index = hit_index
+                        self.start_x = event.x
+                        self.start_y = event.y
+                        self.drag_start_norm_bbox = list(self.annotations[hit_index][1:])
+                        self.redraw()
+                        return
+                else:
+                    # Clicking a different box — select it (don't start drag)
+                    self.edit_selected_index = hit_index
+                    self.active_annotation_index = -1
+                    self.redraw()
+                    class_name = self.classes[self.annotations[hit_index][0]] if 0 <= self.annotations[hit_index][0] < len(self.classes) else str(self.annotations[hit_index][0])
+                    self.status_var.set(f"Selected box [{class_name}] — drag edges to resize, center to move")
+                    return
+            
             # Save state for undo BEFORE moving
             self._push_annotation_undo()
             
-            # Entering Move Mode
+            # Entering Move Mode (default, non-edit mode)
             self.drag_mode = "move"
             self.active_annotation_index = hit_index
             self.start_x = event.x
@@ -2969,7 +3129,16 @@ class AnnotatorApp:
             self.redraw() # To show highlight
             return
             
-        # 2. Else loop: Create Mode
+        # 2. Clicked empty space
+        # In edit mode: deselect current selection
+        if self.edit_mode.get() and self.edit_selected_index != -1:
+            self.edit_selected_index = -1
+            self.active_annotation_index = -1
+            self.redraw()
+            self.status_var.set("Edit selection cleared")
+            return
+        
+        # Create Mode: draw new box
         self.active_annotation_index = -1
         self.drag_mode = "create"
         self.start_x = event.x
@@ -3006,7 +3175,54 @@ class AnnotatorApp:
              self.redraw()
              
              # Only save on mouse up to avoid disk spam
+        elif self.drag_mode == "resize" and self.active_annotation_index != -1:
+             # Resize annotation based on which handle is being dragged
+             if not self.resize_orig_norm: return
              
+             iw, ih = self.current_image.size
+             orig_cx, orig_cy, orig_w, orig_h = self.resize_orig_norm
+             
+             # Original edges in normalized coords
+             orig_left   = orig_cx - orig_w / 2
+             orig_right  = orig_cx + orig_w / 2
+             orig_top    = orig_cy - orig_h / 2
+             orig_bottom = orig_cy + orig_h / 2
+             
+             # Current mouse position in normalized coords
+             cur_nx, cur_ny = self._get_norm_coords(event.x, event.y)
+             cur_nx = max(0.0, min(1.0, cur_nx))
+             cur_ny = max(0.0, min(1.0, cur_ny))
+             
+             new_left, new_right = orig_left, orig_right
+             new_top, new_bottom = orig_top, orig_bottom
+             
+             handle = self.resize_handle
+             MIN_SIZE = 0.005  # Minimum box dimension (normalized)
+             
+             # Adjust edges based on handle
+             if 'w' in handle:   # Left edge
+                 new_left = min(cur_nx, orig_right - MIN_SIZE)
+             if 'e' in handle:   # Right edge
+                 new_right = max(cur_nx, orig_left + MIN_SIZE)
+             if 'n' in handle:   # Top edge
+                 new_top = min(cur_ny, orig_bottom - MIN_SIZE)
+             if 's' in handle:   # Bottom edge
+                 new_bottom = max(cur_ny, orig_top + MIN_SIZE)
+             
+             # Convert back to center/size format
+             new_w = new_right - new_left
+             new_h = new_bottom - new_top
+             new_cx = new_left + new_w / 2
+             new_cy = new_top + new_h / 2
+             
+             ann = self.annotations[self.active_annotation_index]
+             ann[1] = new_cx
+             ann[2] = new_cy
+             ann[3] = new_w
+             ann[4] = new_h
+             
+             self.redraw()
+
     def on_mouse_move(self, event):
         """Ultra-responsive crosshair update - optimized for 240fps+."""
         # Update click mode preview box if first click is active
@@ -3015,6 +3231,28 @@ class AnnotatorApp:
             self.canvas.coords(self.temp_box_id, 
                              self.first_click_point[0], self.first_click_point[1], 
                              cur_x, cur_y)
+        
+        # Edit mode: update cursor when hovering over the selected annotation's handles
+        if self.edit_mode.get() and not self.draw_only_mode.get() and self.drag_mode is None and not self.show_crosshair.get():
+            cursor = ""
+            if self.edit_selected_index != -1 and self.edit_selected_index < len(self.annotations):
+                # Check if near a handle on the selected annotation
+                handle = self._detect_resize_handle(event.x, event.y, self.edit_selected_index)
+                if handle in ('n', 's'):
+                    cursor = "sb_v_double_arrow"
+                elif handle in ('e', 'w'):
+                    cursor = "sb_h_double_arrow"
+                elif handle in ('nw', 'se'):
+                    cursor = "size_nw_se"
+                elif handle in ('ne', 'sw'):
+                    cursor = "size_ne_sw"
+                elif handle is None:
+                    # Inside selected box center = move
+                    hit = self._find_annotation_at_point(event.x, event.y)
+                    if hit == self.edit_selected_index:
+                        cursor = "fleur"
+            if self.canvas.cget('cursor') != cursor:
+                self.canvas.config(cursor=cursor)
         
         if self.show_crosshair.get():
             # Hide cursor when crosshair is active (cache check to avoid repeated calls)
@@ -3034,15 +3272,24 @@ class AnnotatorApp:
                 self.canvas.coords(self.crosshair_lines[0], 0, y, 10000, y)
                 self.canvas.coords(self.crosshair_lines[1], x, 0, x, 10000)
         else:
-            # Show cursor when crosshair is disabled
-            if self.canvas.cget('cursor') == 'none':
-                self.canvas.config(cursor="")
+            if not (self.edit_mode.get() and not self.draw_only_mode.get()):
+                if self.canvas.cget('cursor') == 'none':
+                    self.canvas.config(cursor="")
             # Remove crosshair if exists
             if self.crosshair_lines:
                 self.canvas.delete("crosshair")
                 self.crosshair_lines = []
 
     def on_mouse_up(self, event):
+        if self.drag_mode == "resize":
+            self.drag_mode = None
+            self.resize_handle = None
+            self.resize_orig_norm = None
+            self.annotations_dirty = True
+            self.save_annotations()  # IMMEDIATELY save after resizing
+            self._flash_notification("Box resized (Ctrl+Z to undo)")
+            return
+        
         if self.drag_mode == "move":
             self.drag_mode = None
             self.annotations_dirty = True

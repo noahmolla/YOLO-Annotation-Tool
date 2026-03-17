@@ -46,6 +46,7 @@ config.json
 *.webp
 *.yaml
 !config.example.json
+datasets/
 
 # Temporary files
 *.tmp
