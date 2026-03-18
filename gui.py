@@ -9,6 +9,7 @@ import glob
 import random
 import threading
 import time
+import math
 import numpy as np
 import json
 import cv2
@@ -119,8 +120,44 @@ class AnnotatorApp:
         self.class_confidence_thresholds = {}  # Per-class confidence thresholds
         self.iou_threshold = 0.50  # IOU threshold for NMS
 
+        # Board clipping constraints
+        self.board_clip_enabled = False
+        self.board_clip_parent_class_id = 0
+        self.board_clip_child_class_id = 1  # Board class
+        self.board_clip_stringer_class_id = 2
+        self.board_clip_board_class_ids = [1, 4]
+        self.board_clip_stringer_class_ids = [2]
+        self.board_clip_target_mode = "all"  # all, boards, stringers
+        self.board_clip_use_guides = True
+        self.board_clip_extend_to_guides = True
+        self.board_clip_apply_to_auto_annotations = False
+        self.board_clip_guides_visible = tk.BooleanVar(value=True)
+        self.board_clip_guides = {}  # Map: image key -> {"edges": [...], "corners": [...]}
+        self.board_clip_draw_mode = None  # None, "edges", or "corners"
+        self.board_clip_draw_slot = None  # Which edge/corner index is waiting to be drawn
+        self.board_clip_draw_start = None
+        self.board_clip_draw_preview_id = None
+        self.board_clip_quick_draw = False
+        self.board_clip_corner_draft = []
+        self.board_clip_dialog = None
+        self.board_clip_dialog_vars = {}
+        self.board_clip_parent_combo = None
+        self.board_clip_target_combo = None
+        self.board_clip_board_btn = None
+        self.board_clip_stringer_btn = None
+        self.board_clip_draw_btn = None
+        self.board_clip_edge_btn = None
+        self.board_clip_draw_toolbar_btn = None
+        self.board_clip_edge_toolbar_btn = None
+        self.board_clip_current_btn = None
+        self.board_clip_extend_parent_btn = None
+        self.board_clip_extend_parent_toolbar_btn = None
+        self.board_clip_all_btn = None
+        self.board_clip_extend_parent_all_btn = None
+
         # --- UI Setup ---
         self._setup_ui()
+        self._refresh_board_clip_parent_ui()
         self._bind_events()
         
         # Initial status
@@ -165,6 +202,46 @@ class AnnotatorApp:
             if "model_version" in cfg:
                 self.model_ver_combo.set(cfg["model_version"])
 
+            self.board_clip_enabled = bool(cfg.get("board_clip_enabled", self.board_clip_enabled))
+            self.board_clip_parent_class_id = int(cfg.get("board_clip_parent_class_id", self.board_clip_parent_class_id))
+            self.board_clip_child_class_id = int(cfg.get("board_clip_child_class_id", self.board_clip_child_class_id))
+            self.board_clip_stringer_class_id = int(cfg.get("board_clip_stringer_class_id", self.board_clip_stringer_class_id))
+            if "board_clip_board_class_ids" in cfg:
+                self.board_clip_board_class_ids = self._normalize_board_clip_class_ids(
+                    cfg.get("board_clip_board_class_ids", self.board_clip_board_class_ids),
+                    fallback=self.board_clip_board_class_ids,
+                )
+            else:
+                legacy_board_ids = [self.board_clip_child_class_id]
+                if self.board_clip_child_class_id == 1:
+                    legacy_board_ids.append(4)
+                self.board_clip_board_class_ids = self._normalize_board_clip_class_ids(
+                    legacy_board_ids,
+                    fallback=self.board_clip_board_class_ids,
+                )
+            if "board_clip_stringer_class_ids" in cfg:
+                self.board_clip_stringer_class_ids = self._normalize_board_clip_class_ids(
+                    cfg.get("board_clip_stringer_class_ids", self.board_clip_stringer_class_ids),
+                    fallback=self.board_clip_stringer_class_ids,
+                )
+            else:
+                self.board_clip_stringer_class_ids = self._normalize_board_clip_class_ids(
+                    [self.board_clip_stringer_class_id],
+                    fallback=self.board_clip_stringer_class_ids,
+                )
+            self.board_clip_child_class_id = self.board_clip_board_class_ids[0]
+            self.board_clip_stringer_class_id = self.board_clip_stringer_class_ids[0]
+            self.board_clip_target_mode = str(cfg.get("board_clip_target_mode", self.board_clip_target_mode)).strip().lower()
+            if self.board_clip_target_mode not in {"all", "boards", "stringers"}:
+                self.board_clip_target_mode = "all"
+            self.board_clip_use_guides = bool(cfg.get("board_clip_use_guides", self.board_clip_use_guides))
+            self.board_clip_extend_to_guides = bool(cfg.get("board_clip_extend_to_guides", self.board_clip_extend_to_guides))
+            self.board_clip_apply_to_auto_annotations = bool(cfg.get("board_clip_apply_to_auto_annotations", self.board_clip_apply_to_auto_annotations))
+            self.board_clip_guides_visible.set(bool(cfg.get("board_clip_guides_visible", self.board_clip_guides_visible.get())))
+            if hasattr(self, "board_clip_auto_apply_var") and self.board_clip_auto_apply_var is not None:
+                self.board_clip_auto_apply_var.set(self.board_clip_apply_to_auto_annotations)
+            self._refresh_board_clip_parent_ui()
+
             # Restore Directory/Workspace
             if "last_workspace" in cfg and os.path.exists(cfg["last_workspace"]):
                 self.load_workspace(cfg["last_workspace"])
@@ -182,6 +259,17 @@ class AnnotatorApp:
             "model_version": self.model_ver_combo.get(),
             "last_workspace": self.workspace_path,
             "last_dir": os.path.dirname(self.image_paths[0]) if self.image_paths else "",
+            "board_clip_enabled": self.board_clip_enabled,
+            "board_clip_parent_class_id": self.board_clip_parent_class_id,
+            "board_clip_child_class_id": self.board_clip_board_class_ids[0],
+            "board_clip_stringer_class_id": self.board_clip_stringer_class_ids[0],
+            "board_clip_board_class_ids": self.board_clip_board_class_ids,
+            "board_clip_stringer_class_ids": self.board_clip_stringer_class_ids,
+            "board_clip_target_mode": self.board_clip_target_mode,
+            "board_clip_use_guides": self.board_clip_use_guides,
+            "board_clip_extend_to_guides": self.board_clip_extend_to_guides,
+            "board_clip_apply_to_auto_annotations": self.board_clip_apply_to_auto_annotations,
+            "board_clip_guides_visible": self.board_clip_guides_visible.get(),
         }
         if hasattr(self, 'model_path_str'):
              cfg["model_path"] = self.model_path_str
@@ -191,6 +279,176 @@ class AnnotatorApp:
                 json.dump(cfg, f, indent=4)
         except Exception as e:
             print(f"Failed to save config: {e}")
+
+    def _board_clip_guides_path(self):
+        if not self.workspace_path:
+            return None
+        return os.path.join(self.workspace_path, ".board_clip_guides.json")
+
+    def _board_clip_image_key(self, img_path):
+        norm_path = os.path.normpath(img_path)
+        if self.workspace_path:
+            try:
+                rel_path = os.path.relpath(norm_path, self.workspace_path)
+                if not rel_path.startswith(".."):
+                    return rel_path.replace("\\", "/")
+            except ValueError:
+                pass
+        return norm_path.replace("\\", "/")
+
+    def _load_board_clip_guides(self):
+        self.board_clip_guides = {}
+        guides_path = self._board_clip_guides_path()
+        if not guides_path or not os.path.exists(guides_path):
+            return
+
+        try:
+            with open(guides_path, "r") as f:
+                raw = json.load(f) or {}
+        except Exception as e:
+            print(f"Failed to load board clip guides: {e}")
+            return
+
+        for key, region in raw.items():
+            entry = {"edges": [], "corners": []}
+
+            if isinstance(region, list):
+                edge_candidates = region
+                corner_candidates = []
+            elif isinstance(region, dict):
+                edge_candidates = region.get("edges", [])
+                corner_candidates = region.get("corners", [])
+            else:
+                continue
+
+            for guide in edge_candidates[:2]:
+                if not isinstance(guide, (list, tuple)) or len(guide) != 4:
+                    continue
+                try:
+                    x1, y1, x2, y2 = [float(v) for v in guide]
+                except (TypeError, ValueError):
+                    continue
+                entry["edges"].append([
+                    max(0.0, min(1.0, x1)),
+                    max(0.0, min(1.0, y1)),
+                    max(0.0, min(1.0, x2)),
+                    max(0.0, min(1.0, y2)),
+                ])
+
+            for point in corner_candidates[:4]:
+                if not isinstance(point, (list, tuple)) or len(point) != 2:
+                    continue
+                try:
+                    px, py = [float(v) for v in point]
+                except (TypeError, ValueError):
+                    continue
+                entry["corners"].append([
+                    max(0.0, min(1.0, px)),
+                    max(0.0, min(1.0, py)),
+                ])
+
+            if entry["edges"] or entry["corners"]:
+                self.board_clip_guides[key] = entry
+
+    def _save_board_clip_guides(self):
+        guides_path = self._board_clip_guides_path()
+        if not guides_path:
+            return
+
+        serializable = {}
+        for key, region in self.board_clip_guides.items():
+            cleaned_edges = []
+            cleaned_corners = []
+            for guide in region.get("edges", [])[:2]:
+                if not isinstance(guide, (list, tuple)) or len(guide) != 4:
+                    continue
+                cleaned_edges.append([float(v) for v in guide])
+            for point in region.get("corners", [])[:4]:
+                if not isinstance(point, (list, tuple)) or len(point) != 2:
+                    continue
+                cleaned_corners.append([float(v) for v in point])
+            if cleaned_edges or cleaned_corners:
+                serializable[key] = {
+                    "edges": cleaned_edges,
+                    "corners": cleaned_corners,
+                }
+
+        try:
+            if serializable:
+                with open(guides_path, "w") as f:
+                    json.dump(serializable, f, indent=2)
+            elif os.path.exists(guides_path):
+                os.remove(guides_path)
+        except Exception as e:
+            print(f"Failed to save board clip guides: {e}")
+
+    def _get_board_clip_guides_for_image(self, img_path=None):
+        img_path = img_path or self.current_file_path
+        if not img_path:
+            return []
+        entry = self.board_clip_guides.get(self._board_clip_image_key(img_path), {})
+        return [list(guide) for guide in entry.get("edges", [])[:2]]
+
+    def _set_board_clip_guides_for_image(self, guides, img_path=None):
+        img_path = img_path or self.current_file_path
+        if not img_path:
+            return
+
+        key = self._board_clip_image_key(img_path)
+        entry = self.board_clip_guides.get(key, {"edges": [], "corners": []})
+        cleaned = []
+        for guide in guides[:2]:
+            if not isinstance(guide, (list, tuple)) or len(guide) != 4:
+                continue
+            x1, y1, x2, y2 = [max(0.0, min(1.0, float(v))) for v in guide]
+            if math.hypot(x2 - x1, y2 - y1) < 0.002:
+                continue
+            cleaned.append([x1, y1, x2, y2])
+
+        entry["edges"] = cleaned
+        if entry["edges"] or entry["corners"]:
+            self.board_clip_guides[key] = entry
+        else:
+            self.board_clip_guides.pop(key, None)
+
+        self._save_board_clip_guides()
+
+    def _get_board_clip_corners_for_image(self, img_path=None):
+        img_path = img_path or self.current_file_path
+        if not img_path:
+            return []
+        entry = self.board_clip_guides.get(self._board_clip_image_key(img_path), {})
+        return [list(point) for point in entry.get("corners", [])[:4]]
+
+    def _set_board_clip_corners_for_image(self, corners, img_path=None):
+        img_path = img_path or self.current_file_path
+        if not img_path:
+            return
+
+        key = self._board_clip_image_key(img_path)
+        entry = self.board_clip_guides.get(key, {"edges": [], "corners": []})
+        cleaned = []
+        for point in corners[:4]:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                continue
+            px, py = [max(0.0, min(1.0, float(v))) for v in point]
+            cleaned.append([px, py])
+
+        entry["corners"] = cleaned
+        if entry["edges"] or entry["corners"]:
+            self.board_clip_guides[key] = entry
+        else:
+            self.board_clip_guides.pop(key, None)
+
+        self._save_board_clip_guides()
+
+    def _clear_board_clip_region_for_image(self, img_path=None):
+        img_path = img_path or self.current_file_path
+        if not img_path:
+            return
+        self.board_clip_guides.pop(self._board_clip_image_key(img_path), None)
+
+        self._save_board_clip_guides()
 
     def on_close(self):
         """Handle window close - ALWAYS save to prevent data loss."""
@@ -283,6 +541,77 @@ class AnnotatorApp:
         # Settings button
         tb.Button(model_frame, text="⚙ Confidence & IOU Settings", command=self.show_annotation_settings, bootstyle="info-outline").pack(fill=X, pady=1)
 
+        tb.Button(model_frame, text="Pallet Fit Settings", command=self.show_board_clip_dialog, bootstyle="secondary-outline").pack(fill=X, pady=1)
+
+        clip_frame = tb.Labelframe(model_frame, text="Fit To Pallet", padding=8)
+        clip_frame.pack(fill=X, pady=(4, 1))
+
+        clip_class_row = tb.Frame(clip_frame)
+        clip_class_row.pack(fill=X, pady=(0, 4))
+        tb.Label(clip_class_row, text="Within class:").pack(side=LEFT)
+        self.board_clip_parent_combo = tb.Combobox(clip_class_row, state="readonly", width=18)
+        self.board_clip_parent_combo.pack(side=RIGHT, fill=X, expand=True)
+        self.board_clip_parent_combo.bind("<<ComboboxSelected>>", self.on_board_clip_parent_changed)
+
+        clip_target_row = tb.Frame(clip_frame)
+        clip_target_row.pack(fill=X, pady=(0, 4))
+        tb.Label(clip_target_row, text="Adjust:").pack(side=LEFT)
+        self.board_clip_target_combo = tb.Combobox(clip_target_row, state="readonly", width=18)
+        self.board_clip_target_combo.pack(side=RIGHT, fill=X, expand=True)
+        self.board_clip_target_combo.bind("<<ComboboxSelected>>", self.on_board_clip_target_changed)
+
+        clip_type_row = tb.Frame(clip_frame)
+        clip_type_row.pack(fill=X, pady=(0, 4))
+        tb.Label(clip_type_row, text="Classes:").pack(side=LEFT)
+        class_pair_frame = tb.Frame(clip_type_row)
+        class_pair_frame.pack(side=RIGHT, fill=X, expand=True)
+        self.board_clip_board_btn = tb.Button(class_pair_frame, text="Boards: 1,4", command=self.choose_board_clip_board_classes, bootstyle="secondary-outline")
+        self.board_clip_board_btn.pack(side=LEFT, fill=X, expand=True, padx=(0, 2))
+        self.board_clip_stringer_btn = tb.Button(class_pair_frame, text="Stringers: 2", command=self.choose_board_clip_stringer_classes, bootstyle="secondary-outline")
+        self.board_clip_stringer_btn.pack(side=LEFT, fill=X, expand=True, padx=(2, 0))
+
+        tb.Label(clip_frame, text="Guides", font=("Arial", 9, "bold"), foreground="#888").pack(anchor=W, pady=(2, 2))
+        clip_guide_row = tb.Frame(clip_frame)
+        clip_guide_row.pack(fill=X, pady=1)
+        self.board_clip_draw_btn = tb.Button(clip_guide_row, text="Draw 4 Corners (B)", command=self.start_quick_board_clip_corners, bootstyle="warning")
+        self.board_clip_draw_btn.pack(side=LEFT, expand=True, fill=X, padx=(0, 1))
+        self.board_clip_edge_btn = tb.Button(clip_guide_row, text="2 Edge Fallback (Shift+B)", command=self.start_quick_board_clip_guides, bootstyle="secondary-outline")
+        self.board_clip_edge_btn.pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
+
+        tb.Label(clip_frame, text="Current Image", font=("Arial", 9, "bold"), foreground="#888").pack(anchor=W, pady=(6, 2))
+        clip_current_row = tb.Frame(clip_frame)
+        clip_current_row.pack(fill=X, pady=1)
+        self.board_clip_current_btn = tb.Button(clip_current_row, text="Fit Current (V)", command=self.apply_board_clip_to_current, bootstyle="success-outline")
+        self.board_clip_current_btn.pack(side=LEFT, expand=True, fill=X, padx=(0, 1))
+        self.board_clip_extend_parent_btn = tb.Button(clip_current_row, text="Extend To Pallet Box", command=self.extend_board_clip_to_parent_current, bootstyle="info-outline")
+        self.board_clip_extend_parent_btn.pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
+
+        tb.Label(clip_frame, text="Dataset", font=("Arial", 9, "bold"), foreground="#888").pack(anchor=W, pady=(6, 2))
+        clip_dataset_row = tb.Frame(clip_frame)
+        clip_dataset_row.pack(fill=X, pady=1)
+        self.board_clip_all_btn = tb.Button(clip_dataset_row, text="Fit All", command=self.apply_board_clip_to_dataset, bootstyle="danger-outline")
+        self.board_clip_all_btn.pack(side=LEFT, expand=True, fill=X, padx=(0, 1))
+        self.board_clip_extend_parent_all_btn = tb.Button(clip_dataset_row, text="Extend All To Box", command=self.extend_board_clip_to_parent_dataset, bootstyle="info-outline")
+        self.board_clip_extend_parent_all_btn.pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
+
+        self.board_clip_auto_apply_var = tk.BooleanVar(value=self.board_clip_apply_to_auto_annotations)
+        tb.Checkbutton(
+            clip_frame,
+            text="Apply pallet fit to auto-annotate",
+            variable=self.board_clip_auto_apply_var,
+            command=self.on_board_clip_auto_apply_changed,
+            bootstyle="round-toggle"
+        ).pack(anchor=W, pady=(4, 0))
+
+        tb.Label(
+            clip_frame,
+            text="Pick all, boards only, or stringers only. Boards default to classes 1 and 4, stringers default to class 2. Use guides for rotated pallets, or Extend To Pallet Box when you only want the class-0 pallet annotation.",
+            wraplength=250,
+            justify=LEFT,
+            font=("Arial", 8),
+            foreground="#888"
+        ).pack(anchor=W, pady=(6, 0))
+
         # Quick Actions Group
         quick_frame = tb.Labelframe(self.left_panel, text="Quick Actions", padding=8)
         quick_frame.pack(fill=X, padx=5, pady=3)
@@ -348,7 +677,7 @@ class AnnotatorApp:
         self.lbl_idx.pack(side=LEFT, padx=5)
         tb.Button(nav_frame, text="Next >", command=self.next_image, bootstyle="outline").pack(side=LEFT, padx=1)
         
-        tb.Label(c_toolbar, text="  |  Shortcuts: A/D, 1-9, R, G, Ctrl+Click", font=("Arial", 9)).pack(side=LEFT, padx=10)
+        tb.Label(c_toolbar, text="  |  Shortcuts: A/D, 1-9, R, B, Shift+B, V, G, Ctrl+Click", font=("Arial", 9)).pack(side=LEFT, padx=10)
         
         # Crosshair Toggle
         tb.Checkbutton(c_toolbar, text="Crosshair", variable=self.show_crosshair, bootstyle="round-toggle").pack(side=LEFT, padx=10)
@@ -376,6 +705,14 @@ class AnnotatorApp:
         tb.Button(c_toolbar, text="Repeat & Next (R)", command=self.repeat_and_next, bootstyle="info").pack(side=RIGHT, padx=5)
         tb.Button(c_toolbar, text="?", command=self.show_shortcuts_dialog, bootstyle="secondary-outline", width=3).pack(side=RIGHT, padx=2)
         tb.Button(c_toolbar, text="Info", command=self.show_image_info, bootstyle="info-outline-sm").pack(side=RIGHT, padx=5)
+        tb.Button(c_toolbar, text="Clip All", command=self.apply_board_clip_to_dataset, bootstyle="danger-outline-sm").pack(side=RIGHT, padx=5)
+        tb.Button(c_toolbar, text="Clip Here", command=self.apply_board_clip_to_current, bootstyle="success-outline-sm").pack(side=RIGHT, padx=5)
+        self.board_clip_extend_parent_toolbar_btn = tb.Button(c_toolbar, text="Extend To Box", command=self.extend_board_clip_to_parent_current, bootstyle="info-outline-sm")
+        self.board_clip_extend_parent_toolbar_btn.pack(side=RIGHT, padx=5)
+        self.board_clip_edge_toolbar_btn = tb.Button(c_toolbar, text="2 Edges (Shift+B)", command=self.start_quick_board_clip_guides, bootstyle="secondary-outline-sm")
+        self.board_clip_edge_toolbar_btn.pack(side=RIGHT, padx=5)
+        self.board_clip_draw_toolbar_btn = tb.Button(c_toolbar, text="4 Corners (B)", command=self.start_quick_board_clip_corners, bootstyle="warning-outline-sm")
+        self.board_clip_draw_toolbar_btn.pack(side=RIGHT, padx=5)
         tb.Button(c_toolbar, text="Reload", command=self.reload_current_image, bootstyle="secondary-outline-sm").pack(side=RIGHT, padx=5)
         tb.Button(c_toolbar, text="Manually Save", command=self.save_annotations, bootstyle="success-sm").pack(side=RIGHT)
 
@@ -479,6 +816,9 @@ class AnnotatorApp:
         
         # Q for quick auto-annotate (all classes, no dialog)
         self.root.bind("q", lambda e: self.auto_annotate_quick())
+        self.root.bind("b", self.start_quick_board_clip_corners)
+        self.root.bind("B", self.start_quick_board_clip_guides)
+        self.root.bind("v", self.apply_board_clip_to_current)
         
         # Ctrl+Z for undo (use bind_all to work regardless of focus)
         self.root.bind_all("<Control-z>", lambda e: self.undo_action())
@@ -601,6 +941,7 @@ class AnnotatorApp:
             # 1. Ensure Structure
             img_dir, lbl_dir, yaml_path = utils.ensure_workspace_structure(d)
             self.workspace_path = d
+            self._load_board_clip_guides()
             
             # 2. Load Classes from YAML
             yaml_classes = utils.load_classes_from_yaml(yaml_path)
@@ -819,6 +1160,77 @@ class AnnotatorApp:
         if self.classes:
             self.selected_class_id = 0
             self.cls_list.selection_set(0)
+        self._refresh_board_clip_parent_ui()
+
+    def _refresh_board_clip_parent_ui(self):
+        choices = self._board_clip_class_choices()
+        if self.board_clip_parent_combo:
+            self.board_clip_parent_combo["values"] = choices
+            self.board_clip_parent_combo.set(self._format_board_clip_class_choice(self.board_clip_parent_class_id))
+        if self.board_clip_target_combo:
+            self.board_clip_target_combo["values"] = self._board_clip_target_choices()
+            self.board_clip_target_combo.set(self._format_board_clip_target_choice(self.board_clip_target_mode))
+        if self.board_clip_board_btn:
+            self.board_clip_board_btn.config(text=f"Boards: {self._format_board_clip_class_id_summary(self.board_clip_board_class_ids)}")
+        if self.board_clip_stringer_btn:
+            self.board_clip_stringer_btn.config(text=f"Stringers: {self._format_board_clip_class_id_summary(self.board_clip_stringer_class_ids)}")
+        if self.board_clip_dialog_vars.get("board_summary"):
+            self.board_clip_dialog_vars["board_summary"].set(self._format_board_clip_class_id_summary(self.board_clip_board_class_ids, include_names=True))
+        if self.board_clip_dialog_vars.get("stringer_summary"):
+            self.board_clip_dialog_vars["stringer_summary"].set(self._format_board_clip_class_id_summary(self.board_clip_stringer_class_ids, include_names=True))
+
+    def on_board_clip_parent_changed(self, event=None):
+        if not self.board_clip_parent_combo:
+            return
+        self.board_clip_parent_class_id = self._parse_board_clip_class_choice(
+            self.board_clip_parent_combo.get(),
+            self.board_clip_parent_class_id,
+        )
+        self.board_clip_enabled = True
+        self.save_config()
+        self.redraw()
+        self._refresh_board_clip_dialog_state()
+
+    def on_board_clip_target_changed(self, event=None):
+        if not self.board_clip_target_combo:
+            return
+        self.board_clip_target_mode = self._parse_board_clip_target_choice(
+            self.board_clip_target_combo.get(),
+            self.board_clip_target_mode,
+        )
+        self.board_clip_enabled = True
+        self.save_config()
+        self.redraw()
+        self._refresh_board_clip_dialog_state()
+
+    def choose_board_clip_board_classes(self):
+        selected = self._choose_board_clip_class_ids("Select Board Classes", self.board_clip_board_class_ids)
+        if selected is None:
+            return
+        self.board_clip_board_class_ids = selected
+        self.board_clip_child_class_id = self.board_clip_board_class_ids[0]
+        self.board_clip_enabled = True
+        self.save_config()
+        self._refresh_board_clip_parent_ui()
+        self.redraw()
+        self._refresh_board_clip_dialog_state()
+
+    def choose_board_clip_stringer_classes(self):
+        selected = self._choose_board_clip_class_ids("Select Stringer Classes", self.board_clip_stringer_class_ids)
+        if selected is None:
+            return
+        self.board_clip_stringer_class_ids = selected
+        self.board_clip_stringer_class_id = self.board_clip_stringer_class_ids[0]
+        self.board_clip_enabled = True
+        self.save_config()
+        self._refresh_board_clip_parent_ui()
+        self.redraw()
+        self._refresh_board_clip_dialog_state()
+
+    def on_board_clip_auto_apply_changed(self):
+        if hasattr(self, "board_clip_auto_apply_var") and self.board_clip_auto_apply_var is not None:
+            self.board_clip_apply_to_auto_annotations = bool(self.board_clip_auto_apply_var.get())
+            self.save_config()
 
     def load_model(self):
         f = filedialog.askopenfilename(
@@ -1454,7 +1866,7 @@ class AnnotatorApp:
   G           Open gallery view
   Ctrl+G      Go to image by number
 
-🎨 ANNOTATION
+ 🎨 ANNOTATION
   1-9         Select class 1-9 (maps to 0-8)
   0           Select class 10 (maps to 9)
   Click+Drag  Draw bounding box
@@ -1464,8 +1876,11 @@ class AnnotatorApp:
   Y           Repeat selected annotations & next
   E           Toggle Edit mode (resize boxes)
   T           Toggle Draw Only mode
+  B           Click 4 pallet corners, then auto-fit boards/stringers
+  Shift+B     Draw 2 pallet edges as a straight-pallet fallback
+  V           Fit current image inside pallet class
 
-🗑 DELETE / CLEAR
+ 🗑 DELETE / CLEAR
   Del         Delete current image (undoable)
   Backspace   Clear annotations of selected class
   Ctrl+Back   Clear ALL annotations on image
@@ -1766,6 +2181,566 @@ class AnnotatorApp:
         
         iou = inter_area / union_area
         return iou > threshold
+
+    def _clamp_annotation(self, ann, min_size=0.001):
+        """Clamp a YOLO annotation to valid normalized bounds."""
+        cid, cx, cy, w, h = ann
+        cx = max(0.0, min(1.0, float(cx)))
+        cy = max(0.0, min(1.0, float(cy)))
+        w = abs(float(w))
+        h = abs(float(h))
+        w = min(w, 2 * cx, 2 * (1 - cx))
+        h = min(h, 2 * cy, 2 * (1 - cy))
+        w = max(min_size, w)
+        h = max(min_size, h)
+        return [int(cid), cx, cy, w, h]
+
+    def _ann_to_bounds(self, ann):
+        _, cx, cy, w, h = ann
+        return (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+
+    def _bounds_to_ann(self, cid, bounds, min_size=0.001):
+        left, top, right, bottom = bounds
+        left = max(0.0, min(1.0, float(left)))
+        top = max(0.0, min(1.0, float(top)))
+        right = max(0.0, min(1.0, float(right)))
+        bottom = max(0.0, min(1.0, float(bottom)))
+        if right - left < min_size or bottom - top < min_size:
+            return None
+        return [
+            int(cid),
+            (left + right) / 2,
+            (top + bottom) / 2,
+            right - left,
+            bottom - top,
+        ]
+
+    def _annotation_differs(self, ann1, ann2, tolerance=1e-6):
+        if ann1 is None or ann2 is None:
+            return ann1 != ann2
+        return any(abs(float(a) - float(b)) > tolerance for a, b in zip(ann1[1:], ann2[1:])) or int(ann1[0]) != int(ann2[0])
+
+    def _intersect_bounds(self, bounds_a, bounds_b):
+        left = max(bounds_a[0], bounds_b[0])
+        top = max(bounds_a[1], bounds_b[1])
+        right = min(bounds_a[2], bounds_b[2])
+        bottom = min(bounds_a[3], bounds_b[3])
+        if right <= left or bottom <= top:
+            return None
+        return (left, top, right, bottom)
+
+    def _line_midpoint(self, guide):
+        return ((guide[0] + guide[2]) / 2, (guide[1] + guide[3]) / 2)
+
+    def _order_polygon_clockwise(self, points):
+        cleaned = []
+        for point in points:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                continue
+            cleaned.append((float(point[0]), float(point[1])))
+        if len(cleaned) < 3:
+            return [list(point) for point in cleaned]
+
+        cx = sum(point[0] for point in cleaned) / len(cleaned)
+        cy = sum(point[1] for point in cleaned) / len(cleaned)
+        ordered = sorted(cleaned, key=lambda point: math.atan2(point[1] - cy, point[0] - cx))
+        start_idx = min(range(len(ordered)), key=lambda idx: (ordered[idx][1], ordered[idx][0]))
+        ordered = ordered[start_idx:] + ordered[:start_idx]
+        return [list(point) for point in ordered]
+
+    def _polygon_signed_area(self, polygon):
+        if len(polygon) < 3:
+            return 0.0
+        area = 0.0
+        for idx, point in enumerate(polygon):
+            next_point = polygon[(idx + 1) % len(polygon)]
+            area += point[0] * next_point[1] - next_point[0] * point[1]
+        return area / 2.0
+
+    def _clip_polygon_with_halfplane(self, polygon, guide, inside_point):
+        """Clip a polygon against the half-plane of a guide that contains inside_point."""
+        if len(polygon) < 3:
+            return []
+
+        x1, y1, x2, y2 = guide
+        dx = x2 - x1
+        dy = y2 - y1
+        if math.hypot(dx, dy) < 1e-9:
+            return polygon
+
+        def cross_value(point):
+            return dx * (point[1] - y1) - dy * (point[0] - x1)
+
+        ref_side = cross_value(inside_point)
+        if abs(ref_side) < 1e-9:
+            return polygon
+        sign = 1.0 if ref_side >= 0 else -1.0
+
+        def signed_distance(point):
+            return cross_value(point) * sign
+
+        def is_inside(point):
+            return signed_distance(point) >= -1e-9
+
+        output = []
+        prev = polygon[-1]
+        prev_inside = is_inside(prev)
+        prev_distance = signed_distance(prev)
+
+        for current in polygon:
+            current_inside = is_inside(current)
+            current_distance = signed_distance(current)
+
+            if current_inside != prev_inside:
+                denom = prev_distance - current_distance
+                if abs(denom) > 1e-9:
+                    t = prev_distance / denom
+                    output.append((
+                        prev[0] + (current[0] - prev[0]) * t,
+                        prev[1] + (current[1] - prev[1]) * t,
+                    ))
+
+            if current_inside:
+                output.append(current)
+
+            prev = current
+            prev_inside = current_inside
+            prev_distance = current_distance
+
+        return output
+
+    def _clip_polygon_with_convex_polygon(self, polygon, clip_polygon):
+        if len(polygon) < 3 or len(clip_polygon) < 3:
+            return []
+
+        ordered_clip = [tuple(point) for point in self._order_polygon_clockwise(clip_polygon)]
+        orientation = 1.0 if self._polygon_signed_area(ordered_clip) >= 0 else -1.0
+        output = list(polygon)
+
+        for idx, start in enumerate(ordered_clip):
+            end = ordered_clip[(idx + 1) % len(ordered_clip)]
+            ax, ay = start
+            bx, by = end
+            dx = bx - ax
+            dy = by - ay
+
+            def signed_distance(point):
+                return orientation * (dx * (point[1] - ay) - dy * (point[0] - ax))
+
+            def is_inside(point):
+                return signed_distance(point) >= -1e-9
+
+            clipped = []
+            prev = output[-1]
+            prev_inside = is_inside(prev)
+            prev_distance = signed_distance(prev)
+
+            for current in output:
+                current_inside = is_inside(current)
+                current_distance = signed_distance(current)
+
+                if current_inside != prev_inside:
+                    denom = prev_distance - current_distance
+                    if abs(denom) > 1e-9:
+                        t = prev_distance / denom
+                        clipped.append((
+                            prev[0] + (current[0] - prev[0]) * t,
+                            prev[1] + (current[1] - prev[1]) * t,
+                        ))
+
+                if current_inside:
+                    clipped.append(current)
+
+                prev = current
+                prev_inside = current_inside
+                prev_distance = current_distance
+
+            output = clipped
+            if len(output) < 3:
+                return []
+
+        return output
+
+    def _clip_bounds_to_guide_strip(self, bounds, guides):
+        if len(guides) < 2:
+            return bounds
+
+        guide_a, guide_b = guides[:2]
+        midpoint_a = self._line_midpoint(guide_a)
+        midpoint_b = self._line_midpoint(guide_b)
+        inside_point = (
+            (midpoint_a[0] + midpoint_b[0]) / 2,
+            (midpoint_a[1] + midpoint_b[1]) / 2,
+        )
+
+        polygon = [
+            (bounds[0], bounds[1]),
+            (bounds[2], bounds[1]),
+            (bounds[2], bounds[3]),
+            (bounds[0], bounds[3]),
+        ]
+        # Clip the rectangle polygon itself so horizontal and vertical boards are handled identically.
+        polygon = self._clip_polygon_with_halfplane(polygon, guide_a, inside_point)
+        polygon = self._clip_polygon_with_halfplane(polygon, guide_b, inside_point)
+
+        if len(polygon) < 3:
+            return None
+
+        xs = [point[0] for point in polygon]
+        ys = [point[1] for point in polygon]
+        clipped = (min(xs), min(ys), max(xs), max(ys))
+        if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
+            return None
+        return clipped
+
+    def _clip_bounds_to_corner_polygon(self, bounds, corners):
+        if len(corners) < 3:
+            return bounds
+
+        polygon = [
+            (bounds[0], bounds[1]),
+            (bounds[2], bounds[1]),
+            (bounds[2], bounds[3]),
+            (bounds[0], bounds[3]),
+        ]
+        polygon = self._clip_polygon_with_convex_polygon(polygon, corners)
+        if len(polygon) < 3:
+            return None
+
+        xs = [point[0] for point in polygon]
+        ys = [point[1] for point in polygon]
+        clipped = (min(xs), min(ys), max(xs), max(ys))
+        if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
+            return None
+        return clipped
+
+    def _extend_bounds_for_guides(self, ann):
+        left, top, right, bottom = self._ann_to_bounds(ann)
+        if ann[3] >= ann[4]:
+            return (0.0, top, 1.0, bottom)
+        return (left, 0.0, right, 1.0)
+
+    def _select_primary_board_clip_parent(self, annotations):
+        parents = [ann for ann in annotations if int(ann[0]) == self.board_clip_parent_class_id]
+        if not parents:
+            return None
+
+        best_parent = None
+        best_distance = float("inf")
+        center_x, center_y = 0.5, 0.5
+
+        for parent in parents:
+            distance = (parent[1] - center_x) ** 2 + (parent[2] - center_y) ** 2
+            if distance < best_distance:
+                best_parent = parent
+                best_distance = distance
+
+        return best_parent
+
+    def _select_board_clip_parent(self, child_ann, annotations):
+        return self._select_primary_board_clip_parent(annotations)
+
+    def _annotation_matches_board_clip_target(self, ann):
+        cid = int(ann[0])
+        if cid == self.board_clip_parent_class_id:
+            return False
+        if self.board_clip_target_mode == "boards":
+            return cid in set(self.board_clip_board_class_ids)
+        if self.board_clip_target_mode == "stringers":
+            return cid in set(self.board_clip_stringer_class_ids)
+        return True
+
+    def _clip_annotation_to_board_region(self, ann, annotations, img_path=None, guides=None, corners=None, ignore_guides=False, force_extend_to_parent=False):
+        ann = self._clamp_annotation(ann)
+        if not self.board_clip_enabled or int(ann[0]) == self.board_clip_parent_class_id:
+            return ann
+        if not self._annotation_matches_board_clip_target(ann):
+            return ann
+
+        parent_ann = self._select_board_clip_parent(ann, annotations)
+        active_guides = guides if guides is not None else self._get_board_clip_guides_for_image(img_path)
+        active_corners = corners if corners is not None else self._get_board_clip_corners_for_image(img_path)
+        has_corner_polygon = (not ignore_guides) and self.board_clip_use_guides and len(active_corners) >= 4
+        has_guides = (not ignore_guides) and self.board_clip_use_guides and len(active_guides) >= 2 and not has_corner_polygon
+
+        if parent_ann is None and not has_guides and not has_corner_polygon:
+            return ann
+
+        bounds = self._ann_to_bounds(ann)
+        if force_extend_to_parent and parent_ann is not None:
+            bounds = self._extend_bounds_for_guides(ann)
+        elif (has_guides or has_corner_polygon) and self.board_clip_extend_to_guides:
+            bounds = self._extend_bounds_for_guides(ann)
+
+        if parent_ann is not None:
+            bounds = self._intersect_bounds(bounds, self._ann_to_bounds(parent_ann))
+            if bounds is None:
+                return None
+
+        if has_corner_polygon:
+            bounds = self._clip_bounds_to_corner_polygon(bounds, active_corners)
+            if bounds is None:
+                return None
+        elif has_guides:
+            bounds = self._clip_bounds_to_guide_strip(bounds, active_guides)
+            if bounds is None:
+                return None
+
+        return self._bounds_to_ann(ann[0], bounds)
+
+    def _apply_board_clip_constraints(self, annotations, img_path=None, ignore_guides=False, force_extend_to_parent=False):
+        sanitized = [self._clamp_annotation(ann) for ann in annotations]
+        if not self.board_clip_enabled:
+            return sanitized, {"clipped": 0, "removed": 0}
+
+        guides = [] if ignore_guides else self._get_board_clip_guides_for_image(img_path)
+        corners = [] if ignore_guides else self._get_board_clip_corners_for_image(img_path)
+        clipped_annotations = []
+        clipped_count = 0
+        removed_count = 0
+        primary_parent = self._select_primary_board_clip_parent(sanitized)
+
+        for ann in sanitized:
+            if int(ann[0]) == self.board_clip_parent_class_id:
+                if primary_parent is not None and ann is not primary_parent:
+                    removed_count += 1
+                    continue
+                clipped_annotations.append(ann)
+                continue
+
+            if not self._annotation_matches_board_clip_target(ann):
+                clipped_annotations.append(ann)
+                continue
+
+            clipped_ann = self._clip_annotation_to_board_region(
+                ann,
+                sanitized,
+                img_path=img_path,
+                guides=guides,
+                corners=corners,
+                ignore_guides=ignore_guides,
+                force_extend_to_parent=force_extend_to_parent,
+            )
+            if clipped_ann is None:
+                removed_count += 1
+                continue
+
+            if self._annotation_differs(ann, clipped_ann):
+                clipped_count += 1
+            clipped_annotations.append(clipped_ann)
+
+        return clipped_annotations, {"clipped": clipped_count, "removed": removed_count}
+
+    def _apply_board_clip_to_current_annotations(self, push_undo=True):
+        if not self.current_image:
+            return
+
+        new_annotations, stats = self._apply_board_clip_constraints(self.annotations, img_path=self.current_file_path)
+        changed = stats["clipped"] > 0 or stats["removed"] > 0 or any(
+            self._annotation_differs(old, new) for old, new in zip(self.annotations, new_annotations)
+        ) or len(new_annotations) != len(self.annotations)
+
+        if not changed:
+            self.status_var.set(f"Pallet fit: nothing changed for {self._board_clip_target_summary()} on this image")
+            return
+
+        if push_undo:
+            self._push_annotation_undo()
+
+        self.annotations = new_annotations
+        self.annotations_dirty = True
+        self.save_annotations()
+        self.redraw()
+
+        msg = f"Pallet fit applied to {self._board_clip_target_summary()}: {stats['clipped']} annotation(s) adjusted"
+        if stats["removed"] > 0:
+            msg += f", {stats['removed']} removed"
+        self.status_var.set(msg)
+
+    def _extend_board_clip_to_parent_current_annotations(self, push_undo=True):
+        if not self.current_image:
+            return
+
+        new_annotations, stats = self._apply_board_clip_constraints(
+            self.annotations,
+            img_path=self.current_file_path,
+            ignore_guides=True,
+            force_extend_to_parent=True,
+        )
+        changed = stats["clipped"] > 0 or stats["removed"] > 0 or any(
+            self._annotation_differs(old, new) for old, new in zip(self.annotations, new_annotations)
+        ) or len(new_annotations) != len(self.annotations)
+
+        if not changed:
+            self.status_var.set(f"Pallet box extend: nothing changed for {self._board_clip_target_summary()} on this image")
+            return
+
+        if push_undo:
+            self._push_annotation_undo()
+
+        self.annotations = new_annotations
+        self.annotations_dirty = True
+        self.save_annotations()
+        self.redraw()
+
+        msg = f"Pallet box extend applied to {self._board_clip_target_summary()}: {stats['clipped']} annotation(s) adjusted"
+        if stats["removed"] > 0:
+            msg += f", {stats['removed']} removed"
+        self.status_var.set(msg)
+
+    def _ensure_board_clip_active(self):
+        changed = False
+        if not self.board_clip_enabled:
+            self.board_clip_enabled = True
+            changed = True
+        if not self.board_clip_use_guides:
+            self.board_clip_use_guides = True
+            changed = True
+        if changed:
+            self.save_config()
+            self._refresh_board_clip_parent_ui()
+            self.redraw()
+            self._refresh_board_clip_dialog_state()
+
+    def apply_board_clip_to_current(self, e=None):
+        if not self.current_image:
+            self.status_var.set("Load an image before running pallet fit")
+            return
+        self._ensure_board_clip_active()
+        self._apply_board_clip_to_current_annotations()
+
+    def extend_board_clip_to_parent_current(self, e=None):
+        if not self.current_image:
+            self.status_var.set("Load an image before extending to the pallet box")
+            return
+        self._ensure_board_clip_active()
+        self._extend_board_clip_to_parent_current_annotations()
+
+    def start_quick_board_clip_guides(self, e=None):
+        if not self.current_image:
+            self.status_var.set("Load an image before drawing quick board clip guides")
+            return
+        self._ensure_board_clip_active()
+        self._start_board_clip_guide_draw(0, mode="edges")
+        self.board_clip_quick_draw = True
+        self.status_var.set("Pallet edge mode ON: annotations hidden. Draw edge 1, then edge 2. Boards/stringers will be fit to those edges after the second line.")
+
+    def start_quick_board_clip_corners(self, e=None):
+        if not self.current_image:
+            self.status_var.set("Load an image before drawing pallet corners")
+            return
+        self._ensure_board_clip_active()
+        self._start_board_clip_guide_draw(0, mode="corners")
+        self.board_clip_quick_draw = True
+        self.status_var.set("Pallet corner mode ON: annotations hidden. Click the 4 pallet corners in order around the pallet. Boards/stringers will be fit after corner 4.")
+
+    def _load_annotations_for_image_path(self, img_path):
+        lbl_path = self._get_label_path(img_path)
+        read_path = lbl_path
+        if not os.path.exists(lbl_path):
+            same_dir = os.path.splitext(img_path)[0] + ".txt"
+            if os.path.exists(same_dir):
+                read_path = same_dir
+        return self._load_annotations_from_file(read_path), lbl_path
+
+    def _write_annotations_to_label_path(self, lbl_path, annotations):
+        os.makedirs(os.path.dirname(lbl_path), exist_ok=True)
+        with open(lbl_path, "w") as f:
+            for ann in annotations:
+                cid, cx, cy, w, h = self._clamp_annotation(ann)
+                f.write(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
+
+    def apply_board_clip_to_dataset(self, e=None):
+        self._run_board_clip_dataset_action(
+            action_label="Fit",
+            progress_title="Pallet Fit Dataset",
+            prompt_title="Fit Annotations In Dataset",
+            prompt_body="This will rewrite label files where the selected targets need fitting.",
+        )
+
+    def extend_board_clip_to_parent_dataset(self, e=None):
+        self._run_board_clip_dataset_action(
+            action_label="Extend to pallet box",
+            progress_title="Extend To Pallet Box",
+            prompt_title="Extend Annotations To Pallet Box",
+            prompt_body="This ignores saved corners/edges and rewrites label files using only the selected pallet annotation.",
+            ignore_guides=True,
+            force_extend_to_parent=True,
+        )
+
+    def _run_board_clip_dataset_action(
+        self,
+        action_label,
+        progress_title,
+        prompt_title,
+        prompt_body,
+        ignore_guides=False,
+        force_extend_to_parent=False,
+    ):
+        if not self.workspace_path or not self.image_paths:
+            self.status_var.set("Load a workspace before running a pallet fit dataset action")
+            return
+
+        self._ensure_board_clip_active()
+
+        if not messagebox.askyesno(
+            prompt_title,
+            f"{action_label} {self._board_clip_target_summary()} to class {self.board_clip_parent_class_id} across {len(self.image_paths)} images?\n\n"
+            f"{prompt_body}"
+        ):
+            return
+
+        current_path = self.current_file_path
+        progress = tb.Toplevel(self.root)
+        progress.title(progress_title)
+        progress.geometry("420x140")
+        progress.transient(self.root)
+        progress.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        pb = tb.Progressbar(progress, maximum=len(self.image_paths))
+        pb.pack(fill=X, padx=20, pady=(20, 8))
+        status_lbl = tb.Label(progress, text="Starting...", font=("Consolas", 9))
+        status_lbl.pack(pady=4)
+
+        changed_images = 0
+        total_clipped = 0
+        total_removed = 0
+
+        for idx, img_path in enumerate(self.image_paths, start=1):
+            annotations, lbl_path = self._load_annotations_for_image_path(img_path)
+            new_annotations, stats = self._apply_board_clip_constraints(
+                annotations,
+                img_path=img_path,
+                ignore_guides=ignore_guides,
+                force_extend_to_parent=force_extend_to_parent,
+            )
+            changed = (
+                len(new_annotations) != len(annotations) or
+                any(self._annotation_differs(old, new) for old, new in zip(annotations, new_annotations))
+            )
+            if changed:
+                self._write_annotations_to_label_path(lbl_path, new_annotations)
+                changed_images += 1
+                total_clipped += stats["clipped"]
+                total_removed += stats["removed"]
+
+            pb["value"] = idx
+            status_lbl.config(text=f"Processed {idx}/{len(self.image_paths)}  |  changed {changed_images}")
+            if idx % 25 == 0 or idx == len(self.image_paths):
+                progress.update_idletasks()
+
+        progress.destroy()
+
+        self._build_annotation_cache_and_stats()
+        if current_path and current_path in self.filtered_image_paths:
+            self.load_image(self.filtered_image_paths.index(current_path))
+        elif self.filtered_image_paths:
+            self.load_image(min(self.current_index, len(self.filtered_image_paths) - 1))
+
+        msg = f"{action_label} dataset run: {changed_images} image(s) updated, {total_clipped} annotation(s) adjusted"
+        if total_removed > 0:
+            msg += f", {total_removed} removed"
+        self.status_var.set(msg)
 
     def _is_duplicate_annotation(self, new_ann, existing_annotations, tolerance=0.02):
         """Check if annotation already exists (within tolerance)."""
@@ -2416,7 +3391,12 @@ class AnnotatorApp:
                    self.last_drawn_box[2], 
                    self.last_drawn_box[3], 
                    self.last_drawn_box[4]]
+        new_ann = self._clip_annotation_to_board_region(new_ann, self.annotations, img_path=self.current_file_path)
+        if new_ann is None:
+            self.status_var.set("Repeated box falls outside the pallet clip region")
+            return
         self.annotations.append(new_ann)
+        self.last_drawn_box = list(new_ann)
         self.annotations_dirty = True
         self.save_annotations()  # IMMEDIATELY save after repeating
         self.redraw()
@@ -2456,15 +3436,21 @@ class AnnotatorApp:
         # Step 3: Paste clipboard if it has content
         pasted = 0
         removed = 0
+        skipped_clip = 0
         if self.repeat_clipboard:
             # Save state for undo BEFORE pasting
             self._push_annotation_undo()
             for new_ann in self.repeat_clipboard:
+                candidate_ann = self._clip_annotation_to_board_region(list(new_ann), self.annotations, img_path=self.current_file_path)
+                if candidate_ann is None:
+                    skipped_clip += 1
+                    continue
+
                 # Find and remove any overlapping annotations of the same class
-                new_box = (new_ann[1], new_ann[2], new_ann[3], new_ann[4])
+                new_box = (candidate_ann[1], candidate_ann[2], candidate_ann[3], candidate_ann[4])
                 to_remove = []
                 for i, existing in enumerate(self.annotations):
-                    if existing[0] == new_ann[0]:  # Same class
+                    if existing[0] == candidate_ann[0]:  # Same class
                         existing_box = (existing[1], existing[2], existing[3], existing[4])
                         if self._boxes_overlap(new_box, existing_box, threshold=0.3):
                             to_remove.append(i)
@@ -2475,7 +3461,7 @@ class AnnotatorApp:
                     removed += 1
                 
                 # Add the new annotation
-                self.annotations.append(list(new_ann))
+                self.annotations.append(candidate_ann)
                 pasted += 1
             
             self.save_annotations()
@@ -2484,18 +3470,18 @@ class AnnotatorApp:
         # Status message
         if copied_count > 0 and pasted > 0:
             if removed > 0:
-                self.status_var.set(f"Copied {copied_count}, pasted {pasted} (replaced {removed})")
+                self.status_var.set(f"Copied {copied_count}, pasted {pasted} (replaced {removed}{', clipped skip ' + str(skipped_clip) if skipped_clip else ''})")
             else:
-                self.status_var.set(f"Copied {copied_count}, pasted {pasted} - Y to continue")
+                self.status_var.set(f"Copied {copied_count}, pasted {pasted}{' (clip skipped ' + str(skipped_clip) + ')' if skipped_clip else ''} - Y to continue")
         elif copied_count > 0:
             self.status_var.set(f"Copied {copied_count} - Y to paste on next images")
         elif pasted > 0:
             if removed > 0:
-                self.status_var.set(f"Pasted {pasted} (replaced {removed}) - Y to repeat")
+                self.status_var.set(f"Pasted {pasted} (replaced {removed}{', clip skipped ' + str(skipped_clip) if skipped_clip else ''}) - Y to repeat")
             else:
-                self.status_var.set(f"Pasted {pasted} annotations - Y to repeat")
+                self.status_var.set(f"Pasted {pasted} annotations{' (clip skipped ' + str(skipped_clip) + ')' if skipped_clip else ''} - Y to repeat")
         elif self.repeat_clipboard:
-            self.status_var.set(f"Clipboard has {len(self.repeat_clipboard)} - Y to paste")
+            self.status_var.set(f"Clipboard has {len(self.repeat_clipboard)}{' - some boxes were outside clip region' if skipped_clip else ''} - Y to paste")
         else:
             self.status_var.set(f"Ctrl+Click to select, then Y to copy & repeat")
         
@@ -2607,25 +3593,19 @@ class AnnotatorApp:
                             self.annotations.append([cid, cx, cy, w, h])
                         except: pass
         
-        # Auto-normalize and clamp annotations to [0, 1] on load
-        needs_resave = False
-        sanitized = []
-        for ann in self.annotations:
-            cid, cx, cy, w, h = ann
-            # Clamp center to [0, 1]
-            new_cx = max(0.0, min(1.0, cx))
-            new_cy = max(0.0, min(1.0, cy))
-            # Clamp dimensions so box stays within [0, 1]
-            new_w = max(0.001, min(abs(w), 2*new_cx, 2*(1-new_cx)))
-            new_h = max(0.001, min(abs(h), 2*new_cy, 2*(1-new_cy)))
-            if cx != new_cx or cy != new_cy or w != new_w or h != new_h:
-                needs_resave = True
-            sanitized.append([cid, new_cx, new_cy, new_w, new_h])
+        # Auto-normalize and apply clipping constraints on load
+        sanitized = [self._clamp_annotation(ann) for ann in self.annotations]
+        needs_resave = (
+            len(sanitized) != len(self.annotations) or
+            any(self._annotation_differs(old, new) for old, new in zip(self.annotations, sanitized))
+        )
         self.annotations = sanitized
         
         # If any values were clamped, save the corrected file immediately
         if needs_resave and self.annotations:
             self.current_file_path = path  # Ensure path is set for save
+            self.save_annotations(force=True)
+        elif needs_resave:
             self.save_annotations(force=True)
         
         # Maintain class selection when switching images
@@ -2635,6 +3615,8 @@ class AnnotatorApp:
             self.cls_list.see(self.selected_class_id)
         
         self.redraw()
+        self._update_board_clip_mode_ui()
+        self._refresh_board_clip_dialog_state()
         
         # Ensure focus stays on canvas so keyboard shortcuts work
         # (Listbox widgets steal letter/number key events for type-to-search)
@@ -2682,7 +3664,8 @@ class AnnotatorApp:
         
         # Mark as saved
         self.annotations_dirty = False
-        self.status_var.set(f"✓ Saved {os.path.basename(lbl_path)} ({len(self.annotations)} annotations)")
+        msg = f"Saved {os.path.basename(lbl_path)} ({len(self.annotations)} annotations)"
+        self.status_var.set(msg)
 
     # --- CANVAS & DRAWING ---
 
@@ -2754,6 +3737,7 @@ class AnnotatorApp:
 
         self.canvas.delete("all")
         self.crosshair_lines = [] # Reset crosshair IDs since they were deleted
+        hide_annotations_for_edge_mode = self.board_clip_draw_mode is not None
         
         # Calculate scaling to fit
         cw = self.canvas.winfo_width()
@@ -2781,12 +3765,16 @@ class AnnotatorApp:
         self.image_size_var.set(f"{iw} × {ih}")
         
         # Draw Annotations
-        for i, ann in enumerate(self.annotations):
-            # Filter by selected class if toggle is enabled
-            if self.show_only_selected_class.get():
-                if ann[0] != self.selected_class_id:
-                    continue  # Skip annotations that don't match selected class
-            self.draw_box(i, ann)
+        if not hide_annotations_for_edge_mode:
+            for i, ann in enumerate(self.annotations):
+                # Filter by selected class if toggle is enabled
+                if self.show_only_selected_class.get():
+                    if ann[0] != self.selected_class_id:
+                        continue  # Skip annotations that don't match selected class
+                self.draw_box(i, ann)
+
+        self._draw_board_clip_guides()
+        self._draw_board_clip_mode_overlay()
             
         # Ensure Crosshair stays on top if it exists
         if self.crosshair_lines:
@@ -2865,6 +3853,103 @@ class AnnotatorApp:
                     self.canvas.create_rectangle(hx-hs, hy-hs, hx+hs, hy+hs, 
                         fill=handle_color, outline=handle_outline, width=2, tags=f"handle_{index}")
 
+    def _guide_to_canvas_coords(self, guide):
+        iw, ih = self.current_image.size
+        return (
+            guide[0] * iw * self.scale + self.offset_x,
+            guide[1] * ih * self.scale + self.offset_y,
+            guide[2] * iw * self.scale + self.offset_x,
+            guide[3] * ih * self.scale + self.offset_y,
+        )
+
+    def _corner_to_canvas_coords(self, point):
+        iw, ih = self.current_image.size
+        return (
+            point[0] * iw * self.scale + self.offset_x,
+            point[1] * ih * self.scale + self.offset_y,
+        )
+
+    def _draw_board_clip_guides(self):
+        if not self.current_image:
+            return
+
+        show_saved_region = self.board_clip_guides_visible.get()
+        guides = self._get_board_clip_guides_for_image()
+        corners = self._get_board_clip_corners_for_image()
+        draft_corners = self.board_clip_corner_draft if self.board_clip_draw_mode == "corners" else []
+
+        if show_saved_region:
+            colors = ["#00D084", "#FFB020"]
+            for idx, guide in enumerate(guides):
+                x1, y1, x2, y2 = self._guide_to_canvas_coords(guide)
+                color = colors[idx % len(colors)]
+                self.canvas.create_line(x1, y1, x2, y2, fill=color, width=3, dash=(6, 4), tags="board_clip_guide")
+                mx = (x1 + x2) / 2
+                my = (y1 + y2) / 2
+                self.canvas.create_text(mx, my - 10, text=f"Edge {idx + 1}", fill=color, font=("Arial", 10, "bold"), tags="board_clip_guide")
+
+            ordered_corners = self._order_polygon_clockwise(corners)
+            if ordered_corners:
+                corner_canvas = [self._corner_to_canvas_coords(point) for point in ordered_corners]
+                if len(corner_canvas) >= 2:
+                    flat_points = [coord for point in corner_canvas for coord in point]
+                    self.canvas.create_line(*flat_points, *corner_canvas[0], fill="#5BC0FF", width=3, dash=(8, 4), tags="board_clip_guide")
+                for idx, point in enumerate(corner_canvas):
+                    self.canvas.create_oval(point[0] - 6, point[1] - 6, point[0] + 6, point[1] + 6, fill="#5BC0FF", outline="#FFFFFF", width=2, tags="board_clip_guide")
+                    self.canvas.create_text(point[0] + 12, point[1] - 12, text=f"C{idx + 1}", fill="#5BC0FF", font=("Arial", 10, "bold"), tags="board_clip_guide")
+
+        if draft_corners:
+            draft_canvas = [self._corner_to_canvas_coords(point) for point in draft_corners]
+            if len(draft_canvas) >= 2:
+                flat_points = [coord for point in draft_canvas for coord in point]
+                self.canvas.create_line(*flat_points, fill="#FFD166", width=3, dash=(4, 3), tags="board_clip_preview")
+            for idx, point in enumerate(draft_canvas):
+                self.canvas.create_oval(point[0] - 7, point[1] - 7, point[0] + 7, point[1] + 7, fill="#FFD166", outline="#FF6600", width=2, tags="board_clip_preview")
+                self.canvas.create_text(point[0] + 12, point[1] - 12, text=str(idx + 1), fill="#FFD166", font=("Arial", 10, "bold"), tags="board_clip_preview")
+        self.canvas.tag_raise("board_clip_guide")
+        self.canvas.tag_raise("board_clip_preview")
+
+    def _draw_board_clip_mode_overlay(self):
+        if not self.current_image or self.board_clip_draw_mode is None or self.board_clip_draw_slot is None:
+            return
+
+        x1 = self.offset_x
+        y1 = self.offset_y
+        x2 = self.offset_x + self.current_image.width * self.scale
+        y2 = self.offset_y + self.current_image.height * self.scale
+
+        self.canvas.create_rectangle(x1, y1, x2, y2, outline="#FF6600", width=4, dash=(10, 6), tags="board_clip_mode")
+        panel_x1 = x1 + 18
+        panel_y1 = y1 + 18
+        panel_x2 = min(x2 - 18, panel_x1 + 430)
+        panel_y2 = panel_y1 + 62
+        self.canvas.create_rectangle(panel_x1, panel_y1, panel_x2, panel_y2, fill="#111111", outline="#FF6600", width=2, tags="board_clip_mode")
+        if self.board_clip_draw_mode == "corners":
+            title = f"PALLET CORNER MODE  *  Click corner {self.board_clip_draw_slot + 1} of 4"
+            subtitle = "Annotations hidden while drawing. Click each corner around the pallet. Esc cancels."
+        else:
+            title = f"PALLET EDGE MODE  *  Draw edge {self.board_clip_draw_slot + 1} of 2"
+            subtitle = "Annotations hidden while drawing. Left-drag along the pallet edge. Esc cancels."
+        self.canvas.create_text(
+            panel_x1 + 14,
+            panel_y1 + 18,
+            text=title,
+            anchor=W,
+            fill="#FFD166",
+            font=("Arial", 13, "bold"),
+            tags="board_clip_mode",
+        )
+        self.canvas.create_text(
+            panel_x1 + 14,
+            panel_y1 + 42,
+            text=subtitle,
+            anchor=W,
+            fill="#FFFFFF",
+            font=("Arial", 10),
+            tags="board_clip_mode",
+        )
+        self.canvas.tag_raise("board_clip_mode")
+
     # --- MOUSE INTERACTION ---
 
     def _get_img_coords(self, ex, ey):
@@ -2935,8 +4020,54 @@ class AnnotatorApp:
             self.redraw()
             self.status_var.set("Selection cleared")
 
+    def _cancel_board_clip_guide_draw(self, message=None):
+        if self.board_clip_draw_preview_id:
+            self.canvas.delete(self.board_clip_draw_preview_id)
+        self.canvas.delete("board_clip_preview")
+        self.board_clip_draw_mode = None
+        self.board_clip_draw_slot = None
+        self.board_clip_draw_start = None
+        self.board_clip_draw_preview_id = None
+        self.board_clip_quick_draw = False
+        self.board_clip_corner_draft = []
+        self._update_board_clip_mode_ui()
+        if self.current_image:
+            self.redraw()
+        self._refresh_board_clip_dialog_state()
+        if message:
+            self.status_var.set(message)
+
+    def _start_board_clip_guide_draw(self, slot, mode="edges"):
+        if not self.current_image:
+            self.status_var.set("Load an image before drawing board clip guides")
+            return
+        self._cancel_board_clip_guide_draw()
+        self.board_clip_draw_mode = mode
+        self.board_clip_draw_slot = slot
+        self.drag_mode = None
+        self.active_annotation_index = -1
+        self.edit_selected_index = -1
+        if self.temp_box_id:
+            self.canvas.delete(self.temp_box_id)
+            self.temp_box_id = None
+        self.first_click_point = None
+        if mode == "corners":
+            self.board_clip_corner_draft = []
+        self._update_board_clip_mode_ui()
+        if self.current_image:
+            self.redraw()
+        if mode == "corners":
+            self.status_var.set("Pallet corner mode: annotations hidden. Click corner 1 of 4.")
+        else:
+            self.status_var.set(f"Pallet edge mode: annotations hidden. Draw edge {slot + 1} by click-dragging along the pallet edge.")
+        self.canvas.focus_set()
+
     def escape_action(self):
         """Handle Escape key - cancel resize, clear selection and unlock class."""
+        if self.board_clip_draw_mode is not None:
+            self._cancel_board_clip_guide_draw("Board clip guide drawing cancelled")
+            return
+
         # Cancel active resize if in progress
         if self.drag_mode == "resize":
             # Revert to original position
@@ -2986,6 +4117,20 @@ class AnnotatorApp:
 
     def on_mouse_down(self, event):
         if not self.current_image: return
+
+        if self.board_clip_draw_mode == "edges" and self.board_clip_draw_slot is not None:
+            self.board_clip_draw_start = (event.x, event.y)
+            if self.board_clip_draw_preview_id:
+                self.canvas.delete(self.board_clip_draw_preview_id)
+            guide_colors = ["#00D084", "#FFB020"]
+            color = guide_colors[self.board_clip_draw_slot % len(guide_colors)]
+            self.board_clip_draw_preview_id = self.canvas.create_line(
+                event.x, event.y, event.x, event.y,
+                fill=color, width=3, dash=(6, 4), tags="board_clip_preview"
+            )
+            return
+        if self.board_clip_draw_mode == "corners":
+            return
         
         # CLICK MODE: Two-click annotation
         if self.click_mode.get():
@@ -3030,10 +4175,15 @@ class AnnotatorApp:
                 ncx = nx1 + nw/2
                 ncy = ny1 + nh/2
                 
+                new_ann = [self.selected_class_id, ncx, ncy, nw, nh]
+                new_ann = self._clip_annotation_to_board_region(new_ann, self.annotations, img_path=self.current_file_path)
+                if new_ann is None:
+                    self.status_var.set("Box is outside the pallet clip region")
+                    return
+
                 # Save for undo BEFORE adding
                 self._push_annotation_undo()
-                
-                new_ann = [self.selected_class_id, ncx, ncy, nw, nh]
+
                 self.annotations.append(new_ann)
                 self.last_drawn_box = list(new_ann)  # Save for R to repeat
                 self.annotations_dirty = True
@@ -3147,6 +4297,9 @@ class AnnotatorApp:
 
     def on_mouse_drag(self, event):
         self.on_mouse_move(event) # Update crosshair
+        if self.board_clip_draw_mode == "edges" and self.board_clip_draw_slot is not None and self.board_clip_draw_start and self.board_clip_draw_preview_id:
+             self.canvas.coords(self.board_clip_draw_preview_id, self.board_clip_draw_start[0], self.board_clip_draw_start[1], event.x, event.y)
+             return
         if self.drag_mode == "create":
              # Update current rect
              cur_x, cur_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
@@ -3169,8 +4322,17 @@ class AnnotatorApp:
              
              # Update annotation
              ann = self.annotations[self.active_annotation_index]
-             ann[1] = self.drag_start_norm_bbox[0] + dnx
-             ann[2] = self.drag_start_norm_bbox[1] + dny
+             candidate_ann = [
+                 ann[0],
+                 self.drag_start_norm_bbox[0] + dnx,
+                 self.drag_start_norm_bbox[1] + dny,
+                 ann[3],
+                 ann[4],
+             ]
+             clipped_ann = self._clip_annotation_to_board_region(candidate_ann, self.annotations, img_path=self.current_file_path)
+             if clipped_ann is None:
+                 return
+             ann[1:] = clipped_ann[1:]
              
              self.redraw()
              
@@ -3216,10 +4378,11 @@ class AnnotatorApp:
              new_cy = new_top + new_h / 2
              
              ann = self.annotations[self.active_annotation_index]
-             ann[1] = new_cx
-             ann[2] = new_cy
-             ann[3] = new_w
-             ann[4] = new_h
+             candidate_ann = [ann[0], new_cx, new_cy, new_w, new_h]
+             clipped_ann = self._clip_annotation_to_board_region(candidate_ann, self.annotations, img_path=self.current_file_path)
+             if clipped_ann is None:
+                 return
+             ann[1:] = clipped_ann[1:]
              
              self.redraw()
 
@@ -3281,6 +4444,83 @@ class AnnotatorApp:
                 self.crosshair_lines = []
 
     def on_mouse_up(self, event):
+        if self.board_clip_draw_mode == "corners" and self.board_clip_draw_slot is not None:
+            slot = self.board_clip_draw_slot
+            quick_mode = self.board_clip_quick_draw
+            nx, ny = self._get_norm_coords(event.x, event.y)
+            nx = max(0.0, min(1.0, nx))
+            ny = max(0.0, min(1.0, ny))
+
+            while len(self.board_clip_corner_draft) < slot:
+                self.board_clip_corner_draft.append([nx, ny])
+            if len(self.board_clip_corner_draft) == slot:
+                self.board_clip_corner_draft.append([nx, ny])
+            else:
+                self.board_clip_corner_draft[slot] = [nx, ny]
+
+            if slot < 3:
+                self.board_clip_draw_slot = slot + 1
+                self._update_board_clip_mode_ui()
+                self.redraw()
+                self._refresh_board_clip_dialog_state()
+                self.status_var.set(f"Pallet corner mode: corner {slot + 1} saved. Click corner {slot + 2} of 4.")
+                return
+
+            corners = self._order_polygon_clockwise(self.board_clip_corner_draft[:4])
+            self._set_board_clip_corners_for_image(corners)
+            self._cancel_board_clip_guide_draw()
+            self.redraw()
+            self._refresh_board_clip_dialog_state()
+
+            if quick_mode:
+                self._apply_board_clip_to_current_annotations()
+                return
+
+            self.status_var.set("Pallet corners saved")
+            return
+
+        if self.board_clip_draw_mode == "edges" and self.board_clip_draw_slot is not None:
+            slot = self.board_clip_draw_slot
+            start = self.board_clip_draw_start
+            quick_mode = self.board_clip_quick_draw
+            self._cancel_board_clip_guide_draw()
+            if not start:
+                return
+
+            if math.hypot(event.x - start[0], event.y - start[1]) < 10:
+                self.status_var.set("Board clip guide too short - draw a longer line")
+                return
+
+            nx1, ny1 = self._get_norm_coords(start[0], start[1])
+            nx2, ny2 = self._get_norm_coords(event.x, event.y)
+            guides = self._get_board_clip_guides_for_image()
+            while len(guides) <= slot:
+                guides.append(None)
+            guides[slot] = [
+                max(0.0, min(1.0, nx1)),
+                max(0.0, min(1.0, ny1)),
+                max(0.0, min(1.0, nx2)),
+                max(0.0, min(1.0, ny2)),
+            ]
+            self._set_board_clip_guides_for_image([g for g in guides if g is not None])
+            self.redraw()
+            self._refresh_board_clip_dialog_state()
+
+            if quick_mode and slot == 0:
+                self._start_board_clip_guide_draw(1, mode="edges")
+                self.board_clip_quick_draw = True
+                self.status_var.set("Pallet edge mode: edge 1 saved, annotations still hidden. Draw edge 2.")
+                return
+
+            quick_apply = quick_mode and slot == 1
+            self.board_clip_quick_draw = False
+            if quick_apply:
+                self._apply_board_clip_to_current_annotations()
+                return
+
+            self.status_var.set(f"Board clip edge {slot + 1} saved")
+            return
+
         if self.drag_mode == "resize":
             self.drag_mode = None
             self.resize_handle = None
@@ -3324,10 +4564,15 @@ class AnnotatorApp:
             ncx = nx1 + nw/2
             ncy = ny1 + nh/2
             
+            new_ann = [self.selected_class_id, ncx, ncy, nw, nh]
+            new_ann = self._clip_annotation_to_board_region(new_ann, self.annotations, img_path=self.current_file_path)
+            if new_ann is None:
+                self.status_var.set("Box is outside the pallet clip region")
+                return
+
             # Save for undo BEFORE adding
             self._push_annotation_undo()
-            
-            new_ann = [self.selected_class_id, ncx, ncy, nw, nh]
+
             self.annotations.append(new_ann)
             self.last_drawn_box = list(new_ann)  # Save for R to repeat
             self.annotations_dirty = True
@@ -3614,6 +4859,344 @@ class AnnotatorApp:
         tb.Button(btn_frame, text="Close", command=on_close, 
                  bootstyle="primary", width=12).pack(side=RIGHT, padx=5)
 
+    def _board_clip_class_choices(self):
+        if self.classes:
+            return [f"{i}: {name}" for i, name in enumerate(self.classes)]
+        max_class = max(
+            self.board_clip_parent_class_id,
+            *(self.board_clip_board_class_ids or [self.board_clip_child_class_id]),
+            *(self.board_clip_stringer_class_ids or [self.board_clip_stringer_class_id]),
+            1,
+        )
+        return [str(i) for i in range(max(10, max_class + 1))]
+
+    def _board_clip_target_choices(self):
+        return [
+            "All non-container",
+            "Boards only",
+            "Stringers only",
+        ]
+
+    def _format_board_clip_class_choice(self, class_id):
+        if self.classes and 0 <= class_id < len(self.classes):
+            return f"{class_id}: {self.classes[class_id]}"
+        return str(class_id)
+
+    def _format_board_clip_target_choice(self, mode):
+        mapping = {
+            "all": "All non-container",
+            "boards": "Boards only",
+            "stringers": "Stringers only",
+        }
+        return mapping.get(mode, mapping["all"])
+
+    def _board_clip_target_summary(self):
+        if self.board_clip_target_mode == "boards":
+            return f"board classes {self._format_board_clip_class_id_summary(self.board_clip_board_class_ids)} only"
+        if self.board_clip_target_mode == "stringers":
+            return f"stringer classes {self._format_board_clip_class_id_summary(self.board_clip_stringer_class_ids)} only"
+        return "all non-container annotations"
+
+    def _normalize_board_clip_class_ids(self, values, fallback=None):
+        normalized = []
+        if isinstance(values, str):
+            raw_values = values.replace(";", ",").split(",")
+        elif isinstance(values, (list, tuple, set)):
+            raw_values = list(values)
+        else:
+            raw_values = [values]
+
+        for value in raw_values:
+            try:
+                class_id = int(str(value).split(":", 1)[0].strip())
+            except (TypeError, ValueError):
+                continue
+            if class_id < 0 or class_id in normalized:
+                continue
+            normalized.append(class_id)
+
+        if normalized:
+            return normalized
+        if fallback:
+            return list(fallback)
+        return [0]
+
+    def _format_board_clip_class_id_summary(self, class_ids, include_names=False):
+        class_ids = self._normalize_board_clip_class_ids(class_ids, fallback=[0])
+        parts = []
+        for class_id in class_ids:
+            if include_names and self.classes and 0 <= class_id < len(self.classes):
+                parts.append(f"{class_id}: {self.classes[class_id]}")
+            else:
+                parts.append(str(class_id))
+        return ", ".join(parts)
+
+    def _parse_board_clip_class_choice(self, value, fallback):
+        try:
+            return int(str(value).split(":", 1)[0].strip())
+        except (TypeError, ValueError):
+            return fallback
+
+    def _parse_board_clip_target_choice(self, value, fallback):
+        label = str(value).strip().lower()
+        if label.startswith("board"):
+            return "boards"
+        if label.startswith("stringer"):
+            return "stringers"
+        if label.startswith("all"):
+            return "all"
+        return fallback
+
+    def _choose_board_clip_class_ids(self, title, current_ids):
+        current_ids = self._normalize_board_clip_class_ids(current_ids, fallback=[0])
+
+        if not self.classes:
+            response = simpledialog.askstring(
+                title,
+                "Enter one or more class ids separated by commas:",
+                initialvalue=", ".join(str(cid) for cid in current_ids),
+                parent=self.root,
+            )
+            if response is None:
+                return None
+            parsed = self._normalize_board_clip_class_ids(response, fallback=current_ids)
+            if not parsed:
+                messagebox.showerror("Invalid Classes", "Enter at least one valid class id.", parent=self.root)
+                return None
+            return parsed
+
+        dlg = tb.Toplevel(self.root)
+        dlg.title(title)
+        dlg.geometry("340x420")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        result = {"value": None}
+        frame = tb.Frame(dlg, padding=12)
+        frame.pack(fill=BOTH, expand=True)
+
+        tb.Label(frame, text="Select one or more classes", font=("Arial", 11, "bold")).pack(anchor=W, pady=(0, 8))
+
+        list_frame = tb.Frame(frame)
+        list_frame.pack(fill=BOTH, expand=True)
+        scrollbar = tb.Scrollbar(list_frame, orient=VERTICAL)
+        scrollbar.pack(side=RIGHT, fill=Y)
+        listbox = tk.Listbox(list_frame, selectmode=tk.MULTIPLE, exportselection=False, yscrollcommand=scrollbar.set, font=("Consolas", 10))
+        listbox.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.config(command=listbox.yview)
+
+        for idx, name in enumerate(self.classes):
+            listbox.insert(tk.END, f"{idx}: {name}")
+            if idx in current_ids:
+                listbox.selection_set(idx)
+
+        def apply_selection():
+            selected = [int(i) for i in listbox.curselection()]
+            if not selected:
+                messagebox.showerror("No Classes Selected", "Select at least one class.", parent=dlg)
+                return
+            result["value"] = selected
+            dlg.destroy()
+
+        def close_dialog():
+            dlg.destroy()
+
+        btn_row = tb.Frame(frame)
+        btn_row.pack(fill=X, pady=(10, 0))
+        tb.Button(btn_row, text="OK", command=apply_selection, bootstyle="primary").pack(side=RIGHT, padx=(6, 0))
+        tb.Button(btn_row, text="Cancel", command=close_dialog, bootstyle="secondary").pack(side=RIGHT)
+
+        dlg.protocol("WM_DELETE_WINDOW", close_dialog)
+        dlg.wait_window()
+        return result["value"]
+
+    def _refresh_board_clip_dialog_state(self):
+        if not self.board_clip_dialog_vars:
+            return
+        status_var = self.board_clip_dialog_vars.get("guide_status_var")
+        if not status_var:
+            return
+
+        if not self.current_file_path:
+            status_var.set("No image loaded. Load an image to draw or apply guides.")
+            return
+
+        guides = self._get_board_clip_guides_for_image()
+        corners = self._get_board_clip_corners_for_image()
+        basename = os.path.basename(self.current_file_path)
+        if self.board_clip_draw_mode == "corners" and self.board_clip_draw_slot is not None:
+            status_var.set(f"{basename}: drawing corner {self.board_clip_draw_slot + 1} of 4")
+        elif self.board_clip_draw_mode == "edges" and self.board_clip_draw_slot is not None:
+            status_var.set(f"{basename}: drawing edge {self.board_clip_draw_slot + 1} of 2")
+        else:
+            status_var.set(f"{basename}: {len(corners)}/4 corners, {len(guides)}/2 edges saved")
+
+    def _update_board_clip_mode_ui(self):
+        drawing = self.board_clip_draw_mode is not None
+        drawing_corners = self.board_clip_draw_mode == "corners" and self.board_clip_draw_slot is not None
+        drawing_edges = self.board_clip_draw_mode == "edges" and self.board_clip_draw_slot is not None
+        draw_text = f"Click Corner {self.board_clip_draw_slot + 1}/4" if drawing_corners else "Draw 4 Corners (B)"
+        edge_text = f"Draw Edge {self.board_clip_draw_slot + 1}/2" if drawing_edges else "2 Edge Fallback (Shift+B)"
+        left_style = "danger" if drawing_corners else "warning"
+        edge_style = "danger-outline" if drawing_edges else "secondary-outline"
+        toolbar_style = "danger-outline-sm" if drawing_corners else "warning-outline-sm"
+        edge_toolbar_style = "danger-outline-sm" if drawing_edges else "secondary-outline-sm"
+
+        if self.board_clip_draw_btn:
+            self.board_clip_draw_btn.config(text=draw_text, bootstyle=left_style)
+        if self.board_clip_edge_btn:
+            self.board_clip_edge_btn.config(text=edge_text, bootstyle=edge_style)
+        if self.board_clip_draw_toolbar_btn:
+            self.board_clip_draw_toolbar_btn.config(text=draw_text, bootstyle=toolbar_style)
+        if self.board_clip_edge_toolbar_btn:
+            self.board_clip_edge_toolbar_btn.config(text=edge_text, bootstyle=edge_toolbar_style)
+        if self.board_clip_current_btn:
+            self.board_clip_current_btn.config(state=tk.DISABLED if drawing else tk.NORMAL)
+        if self.board_clip_extend_parent_btn:
+            self.board_clip_extend_parent_btn.config(state=tk.DISABLED if drawing else tk.NORMAL)
+        if self.board_clip_extend_parent_toolbar_btn:
+            self.board_clip_extend_parent_toolbar_btn.config(state=tk.DISABLED if drawing else tk.NORMAL)
+        if self.board_clip_all_btn:
+            self.board_clip_all_btn.config(state=tk.DISABLED if drawing else tk.NORMAL)
+        if self.board_clip_extend_parent_all_btn:
+            self.board_clip_extend_parent_all_btn.config(state=tk.DISABLED if drawing else tk.NORMAL)
+        if self.canvas:
+            if drawing:
+                self.canvas.config(highlightthickness=4, highlightbackground="#FF6600", highlightcolor="#FF6600")
+            else:
+                self.canvas.config(highlightthickness=0)
+
+    def show_board_clip_dialog(self):
+        if self.board_clip_dialog and self.board_clip_dialog.winfo_exists():
+            self.board_clip_dialog.lift()
+            self.board_clip_dialog.focus_force()
+            self._refresh_board_clip_dialog_state()
+            return
+
+        dlg = tb.Toplevel(self.root)
+        dlg.title("Pallet Fit")
+        dlg.geometry("420x540")
+        dlg.resizable(False, False)
+        self.board_clip_dialog = dlg
+
+        vars_map = {
+            "enabled": tk.BooleanVar(value=self.board_clip_enabled),
+            "parent": tk.StringVar(value=self._format_board_clip_class_choice(self.board_clip_parent_class_id)),
+            "target_mode": tk.StringVar(value=self._format_board_clip_target_choice(self.board_clip_target_mode)),
+            "board_summary": tk.StringVar(value=self._format_board_clip_class_id_summary(self.board_clip_board_class_ids, include_names=True)),
+            "stringer_summary": tk.StringVar(value=self._format_board_clip_class_id_summary(self.board_clip_stringer_class_ids, include_names=True)),
+            "use_guides": tk.BooleanVar(value=self.board_clip_use_guides),
+            "extend_to_guides": tk.BooleanVar(value=self.board_clip_extend_to_guides),
+            "show_guides": tk.BooleanVar(value=self.board_clip_guides_visible.get()),
+            "guide_status_var": tk.StringVar(value=""),
+        }
+        self.board_clip_dialog_vars = vars_map
+
+        class_choices = self._board_clip_class_choices()
+
+        def save_settings(*_):
+            self.board_clip_enabled = bool(vars_map["enabled"].get())
+            self.board_clip_parent_class_id = self._parse_board_clip_class_choice(vars_map["parent"].get(), self.board_clip_parent_class_id)
+            self.board_clip_target_mode = self._parse_board_clip_target_choice(vars_map["target_mode"].get(), self.board_clip_target_mode)
+            self.board_clip_use_guides = bool(vars_map["use_guides"].get())
+            self.board_clip_extend_to_guides = bool(vars_map["extend_to_guides"].get())
+            self.board_clip_guides_visible.set(bool(vars_map["show_guides"].get()))
+            self.save_config()
+            self._refresh_board_clip_parent_ui()
+            self.redraw()
+            self._refresh_board_clip_dialog_state()
+
+        def clear_guides():
+            if not self.current_file_path:
+                self.status_var.set("Load an image before clearing board clip guides")
+                return
+            self._clear_board_clip_region_for_image()
+            self.redraw()
+            self._refresh_board_clip_dialog_state()
+            self.status_var.set("Cleared pallet fit guides for this image")
+
+        def close_dialog():
+            self._cancel_board_clip_guide_draw()
+            self.board_clip_dialog_vars = {}
+            self.board_clip_dialog = None
+            dlg.destroy()
+
+        frame = tb.Frame(dlg, padding=14)
+        frame.pack(fill=BOTH, expand=True)
+
+        tb.Label(frame, text="Pallet Fit Constraints", font=("Arial", 13, "bold")).pack(anchor=W, pady=(0, 8))
+        tb.Checkbutton(frame, text="Keep selected annotations inside pallet", variable=vars_map["enabled"],
+                       command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(0, 10))
+
+        row = tb.Frame(frame)
+        row.pack(fill=X, pady=3)
+        tb.Label(row, text="Pallet class", width=14, anchor=W).pack(side=LEFT)
+        parent_combo = tb.Combobox(row, values=class_choices, textvariable=vars_map["parent"], state="readonly", width=20)
+        parent_combo.pack(side=RIGHT)
+        parent_combo.bind("<<ComboboxSelected>>", save_settings)
+
+        target_row = tb.Frame(frame)
+        target_row.pack(fill=X, pady=3)
+        tb.Label(target_row, text="Adjust", width=14, anchor=W).pack(side=LEFT)
+        target_combo = tb.Combobox(target_row, values=self._board_clip_target_choices(), textvariable=vars_map["target_mode"], state="readonly", width=20)
+        target_combo.pack(side=RIGHT)
+        target_combo.bind("<<ComboboxSelected>>", save_settings)
+
+        board_row = tb.Frame(frame)
+        board_row.pack(fill=X, pady=3)
+        tb.Label(board_row, text="Board classes", width=14, anchor=W).pack(side=LEFT)
+        tb.Button(board_row, textvariable=vars_map["board_summary"], command=lambda: [self.choose_board_clip_board_classes(), self._refresh_board_clip_dialog_state()], bootstyle="secondary-outline").pack(side=RIGHT)
+
+        stringer_row = tb.Frame(frame)
+        stringer_row.pack(fill=X, pady=3)
+        tb.Label(stringer_row, text="Stringer classes", width=14, anchor=W).pack(side=LEFT)
+        tb.Button(stringer_row, textvariable=vars_map["stringer_summary"], command=lambda: [self.choose_board_clip_stringer_classes(), self._refresh_board_clip_dialog_state()], bootstyle="secondary-outline").pack(side=RIGHT)
+
+        tb.Checkbutton(frame, text="Use saved corners or edges when available", variable=vars_map["use_guides"],
+                       command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(10, 4))
+        tb.Checkbutton(frame, text="Extend boxes to guides instead of only clipping", variable=vars_map["extend_to_guides"],
+                       command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(0, 4))
+        tb.Checkbutton(frame, text="Show saved pallet guides on canvas", variable=vars_map["show_guides"],
+                       command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(0, 10))
+
+        tb.Label(frame, textvariable=vars_map["guide_status_var"], font=("Consolas", 9), foreground="#888").pack(anchor=W, pady=(0, 10))
+
+        corner_btns = tb.Frame(frame)
+        corner_btns.pack(fill=X, pady=(0, 4))
+        tb.Button(corner_btns, text="Draw 4 Corners (B)", command=lambda: [self.start_quick_board_clip_corners(), self._refresh_board_clip_dialog_state()],
+                 bootstyle="warning", width=16).pack(side=LEFT, padx=(0, 4))
+        tb.Button(corner_btns, text="2 Edges (Shift+B)", command=lambda: [self.start_quick_board_clip_guides(), self._refresh_board_clip_dialog_state()],
+                 bootstyle="secondary-outline", width=16).pack(side=LEFT, padx=4)
+
+        guide_btns = tb.Frame(frame)
+        guide_btns.pack(fill=X, pady=2)
+        tb.Button(guide_btns, text="Set Edge 1", command=lambda: [self._start_board_clip_guide_draw(0, mode="edges"), self._refresh_board_clip_dialog_state()],
+                 bootstyle="success-outline", width=12).pack(side=LEFT, padx=(0, 4))
+        tb.Button(guide_btns, text="Set Edge 2", command=lambda: [self._start_board_clip_guide_draw(1, mode="edges"), self._refresh_board_clip_dialog_state()],
+                 bootstyle="warning-outline", width=12).pack(side=LEFT, padx=4)
+        tb.Button(guide_btns, text="Clear All", command=clear_guides, bootstyle="danger-outline", width=12).pack(side=RIGHT, padx=(4, 0))
+
+        tb.Button(frame, text="Apply To Current Image", command=self._apply_board_clip_to_current_annotations,
+                 bootstyle="primary").pack(fill=X, pady=(12, 6))
+        tb.Button(frame, text="Extend To Pallet Box Only", command=self._extend_board_clip_to_parent_current_annotations,
+                 bootstyle="info-outline").pack(fill=X, pady=(0, 6))
+        tb.Button(frame, text="Extend Across Dataset To Pallet Box", command=self.extend_board_clip_to_parent_dataset,
+                 bootstyle="info-outline").pack(fill=X, pady=(0, 6))
+
+        tb.Label(
+            frame,
+            text="Default setup is class 0 as the container, board classes 1 and 4, and stringer class 2. Choose all, boards only, or stringers only. Use 4 corners for rotated or skewed pallets, 2 edges as a fallback on straight pallet views, or the pallet-box actions when you want no saved guides involved.",
+            wraplength=380,
+            justify=LEFT,
+            font=("Arial", 9),
+            foreground="#888"
+        ).pack(anchor=W, pady=(6, 12))
+
+        tb.Button(frame, text="Close", command=close_dialog, bootstyle="secondary").pack(side=RIGHT)
+
+        dlg.protocol("WM_DELETE_WINDOW", close_dialog)
+        self._refresh_board_clip_dialog_state()
+
     def auto_annotate_current(self):
         """Auto-annotate the current image with class selection dialog."""
         if not self.model or not self.current_image:
@@ -3634,19 +5217,28 @@ class AnnotatorApp:
                 version=ver
             )
             
-            added = 0
-            skipped_dupes = 0
+            candidates = []
             for b, c, s in zip(boxes, classes, scores):
                 class_id = int(c)
-                
-                if class_id not in allowed_classes: 
+                if class_id not in allowed_classes:
                     continue
-                
                 threshold = self.class_confidence_thresholds.get(class_id, self.default_confidence_threshold)
                 if s < threshold:
                     continue
-                
-                new_ann = [class_id, b[0], b[1], b[2], b[3]]
+                candidates.append([class_id, b[0], b[1], b[2], b[3]])
+
+            if self.board_clip_enabled and self.board_clip_apply_to_auto_annotations:
+                candidates.sort(key=lambda ann: 0 if ann[0] == self.board_clip_parent_class_id else 1)
+
+            added = 0
+            skipped_dupes = 0
+            skipped_clip = 0
+            for new_ann in candidates:
+                if self.board_clip_enabled and self.board_clip_apply_to_auto_annotations:
+                    new_ann = self._clip_annotation_to_board_region(new_ann, self.annotations, img_path=self.current_file_path)
+                    if new_ann is None:
+                        skipped_clip += 1
+                        continue
                 
                 # Skip if duplicate or overlapping existing annotation
                 if self._is_duplicate_or_overlapping(new_ann, self.annotations):
@@ -3663,6 +5255,8 @@ class AnnotatorApp:
             msg = f"Auto-Annotate: Added {added} boxes"
             if skipped_dupes > 0:
                 msg += f" (skipped {skipped_dupes} duplicates)"
+            if skipped_clip > 0:
+                msg += f" (clip skipped {skipped_clip})"
             self.status_var.set(msg)
         except Exception as e:
             messagebox.showerror("Inference Error", str(e))
@@ -3689,19 +5283,28 @@ class AnnotatorApp:
                 version=ver
             )
             
-            added = 0
-            skipped_dupes = 0
+            candidates = []
             for b, c, s in zip(boxes, classes, scores):
                 class_id = int(c)
-                
                 if class_id not in allowed_classes:
                     continue
-                
                 threshold = self.class_confidence_thresholds.get(class_id, self.default_confidence_threshold)
                 if s < threshold:
                     continue
-                
-                new_ann = [class_id, b[0], b[1], b[2], b[3]]
+                candidates.append([class_id, b[0], b[1], b[2], b[3]])
+
+            if self.board_clip_enabled and self.board_clip_apply_to_auto_annotations:
+                candidates.sort(key=lambda ann: 0 if ann[0] == self.board_clip_parent_class_id else 1)
+
+            added = 0
+            skipped_dupes = 0
+            skipped_clip = 0
+            for new_ann in candidates:
+                if self.board_clip_enabled and self.board_clip_apply_to_auto_annotations:
+                    new_ann = self._clip_annotation_to_board_region(new_ann, self.annotations, img_path=self.current_file_path)
+                    if new_ann is None:
+                        skipped_clip += 1
+                        continue
                 
                 # Skip if duplicate or overlapping existing annotation
                 if self._is_duplicate_or_overlapping(new_ann, self.annotations):
@@ -3718,6 +5321,8 @@ class AnnotatorApp:
             msg = f"Quick Auto-Annotate: Added {added} boxes"
             if skipped_dupes > 0:
                 msg += f" (skipped {skipped_dupes} duplicates)"
+            if skipped_clip > 0:
+                msg += f" (clip skipped {skipped_clip})"
             self.status_var.set(msg)
         except Exception as e:
             self.status_var.set(f"Auto-annotate error: {e}")
@@ -3788,6 +5393,7 @@ class AnnotatorApp:
         default_conf = self.default_confidence_threshold
         image_paths = list(self.image_paths)
         model = self.model
+        apply_fit_to_auto_annotations = self.board_clip_apply_to_auto_annotations
         
         # --- Progress dialog with cancel ---
         top = tb.Toplevel(self.root)
@@ -3813,7 +5419,7 @@ class AnnotatorApp:
         cancel_btn.pack(pady=8)
         
         # --- Shared state between worker and UI ---
-        progress = {'i': 0, 'cnt': 0, 'skipped_images': 0, 'skipped_dupes': 0, 
+        progress = {'i': 0, 'cnt': 0, 'skipped_images': 0, 'skipped_dupes': 0, 'skipped_clip': 0,
                      'done': False, 'error': None, 'start_time': time.time()}
         
         def worker():
@@ -3821,6 +5427,7 @@ class AnnotatorApp:
             cnt = 0
             skipped_images = 0
             skipped_dupes = 0
+            skipped_clip = 0
             
             for i, p in enumerate(image_paths):
                 if cancel_flag['cancelled']:
@@ -3831,6 +5438,8 @@ class AnnotatorApp:
                     
                     # Load existing annotations for this image
                     existing_anns = self._load_annotations_from_file(lbl)
+                    preserved_lines = []
+                    working_anns = list(existing_anns)
                     
                     # Mode: unannotated_only - skip if already has annotations
                     if mode == "unannotated_only" and existing_anns:
@@ -3838,6 +5447,20 @@ class AnnotatorApp:
                         progress['i'] = i + 1
                         progress['skipped_images'] = skipped_images
                         continue
+
+                    if mode == "overwrite":
+                        working_anns = [ann for ann in existing_anns if ann[0] not in allowed_classes]
+                        if os.path.exists(lbl):
+                            with open(lbl, 'r') as f:
+                                for line in f:
+                                    parts = line.strip().split()
+                                    if len(parts) >= 5:
+                                        try:
+                                            cid = int(parts[0])
+                                            if cid not in allowed_classes:
+                                                preserved_lines.append(line if line.endswith('\n') else line + '\n')
+                                        except ValueError:
+                                            preserved_lines.append(line if line.endswith('\n') else line + '\n')
                     
                     # Use cv2 for faster image loading (reads as BGR)
                     img_bgr = cv2.imread(p)
@@ -3856,7 +5479,7 @@ class AnnotatorApp:
                     )
                     
                     # Filter and collect valid detections
-                    new_lines = []
+                    candidates = []
                     for b, c, s in zip(boxes, classes, scores):
                         class_id = int(c)
                         if class_id not in allowed_classes:
@@ -3864,35 +5487,30 @@ class AnnotatorApp:
                         threshold = conf_thresholds.get(class_id, default_conf)
                         if s < threshold:
                             continue
-                        
-                        new_ann = [class_id, b[0], b[1], b[2], b[3]]
-                        
-                        # Mode: add_missing - check against existing annotations
-                        if mode == "add_missing":
-                            if self._is_duplicate_or_overlapping(new_ann, existing_anns, iou_threshold=iou_thresh):
-                                skipped_dupes += 1
+                        candidates.append([class_id, b[0], b[1], b[2], b[3]])
+
+                    if self.board_clip_enabled and apply_fit_to_auto_annotations:
+                        candidates.sort(key=lambda ann: 0 if ann[0] == self.board_clip_parent_class_id else 1)
+
+                    new_anns = []
+                    for new_ann in candidates:
+                        if self.board_clip_enabled and apply_fit_to_auto_annotations:
+                            new_ann = self._clip_annotation_to_board_region(new_ann, working_anns, img_path=p)
+                            if new_ann is None:
+                                skipped_clip += 1
                                 continue
-                            # Also check against annotations we're about to add
-                            new_anns_so_far = [[int(l.split()[0])] + [float(x) for x in l.split()[1:]] for l in new_lines]
-                            if self._is_duplicate_or_overlapping(new_ann, new_anns_so_far, iou_threshold=iou_thresh):
-                                skipped_dupes += 1
-                                continue
-                        
-                        new_lines.append(f"{class_id} {b[0]:.6f} {b[1]:.6f} {b[2]:.6f} {b[3]:.6f}\n")
+
+                        # Mode: add_missing - check against existing annotations and new ones we've kept
+                        if mode == "add_missing" and self._is_duplicate_or_overlapping(new_ann, working_anns, iou_threshold=iou_thresh):
+                            skipped_dupes += 1
+                            continue
+
+                        working_anns.append(new_ann)
+                        new_anns.append(new_ann)
+
+                    new_lines = [f"{ann[0]} {ann[1]:.6f} {ann[2]:.6f} {ann[3]:.6f} {ann[4]:.6f}\n" for ann in new_anns]
                     
                     if mode == "overwrite":
-                        preserved_lines = []
-                        if os.path.exists(lbl):
-                            with open(lbl, 'r') as f:
-                                for line in f:
-                                    parts = line.strip().split()
-                                    if len(parts) >= 5:
-                                        try:
-                                            cid = int(parts[0])
-                                            if cid not in allowed_classes:
-                                                preserved_lines.append(line if line.endswith('\n') else line + '\n')
-                                        except ValueError:
-                                            preserved_lines.append(line if line.endswith('\n') else line + '\n')
                         all_lines = preserved_lines + new_lines
                         if all_lines:
                             os.makedirs(os.path.dirname(lbl), exist_ok=True)
@@ -3920,10 +5538,12 @@ class AnnotatorApp:
                 progress['cnt'] = cnt
                 progress['skipped_images'] = skipped_images
                 progress['skipped_dupes'] = skipped_dupes
+                progress['skipped_clip'] = skipped_clip
             
             progress['cnt'] = cnt
             progress['skipped_images'] = skipped_images
             progress['skipped_dupes'] = skipped_dupes
+            progress['skipped_clip'] = skipped_clip
             progress['done'] = True
         
         # Start worker thread
@@ -3957,6 +5577,7 @@ class AnnotatorApp:
                 cnt = progress['cnt']
                 skipped_dupes = progress['skipped_dupes']
                 skipped_images = progress['skipped_images']
+                skipped_clip = progress['skipped_clip']
                 
                 if cancel_flag['cancelled']:
                     msg = f"Cancelled: Added {cnt} annotations ({progress['i']}/{total} processed)"
@@ -3964,6 +5585,8 @@ class AnnotatorApp:
                     msg = f"Batch Done: Added {cnt} annotations"
                 if skipped_dupes > 0:
                     msg += f", skipped {skipped_dupes} duplicates"
+                if skipped_clip > 0:
+                    msg += f", clip skipped {skipped_clip}"
                 if skipped_images > 0:
                     msg += f", {skipped_images} images unchanged"
                 self.status_var.set(msg)

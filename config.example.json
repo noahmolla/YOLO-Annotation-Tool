@@ -3,5 +3,16 @@
     "classes": [],
     "model_version": "Auto",
     "last_workspace": "",
-    "last_dir": ""
+    "last_dir": "",
+    "board_clip_enabled": false,
+    "board_clip_parent_class_id": 0,
+    "board_clip_child_class_id": 1,
+    "board_clip_stringer_class_id": 2,
+    "board_clip_board_class_ids": [1, 4],
+    "board_clip_stringer_class_ids": [2],
+    "board_clip_target_mode": "all",
+    "board_clip_use_guides": true,
+    "board_clip_extend_to_guides": true,
+    "board_clip_apply_to_auto_annotations": false,
+    "board_clip_guides_visible": true
 }
