@@ -128,10 +128,12 @@ class AnnotatorApp:
         self.board_clip_board_class_ids = [1, 4]
         self.board_clip_stringer_class_ids = [2]
         self.board_clip_target_mode = "all"  # all, boards, stringers
+        self.board_clip_extend_scope = "all"  # all, stringers
         self.board_clip_use_guides = True
         self.board_clip_extend_to_guides = True
         self.board_clip_apply_to_auto_annotations = False
         self.board_clip_guides_visible = tk.BooleanVar(value=True)
+        self.board_clip_extend_scope_var = tk.StringVar(value=self.board_clip_extend_scope)
         self.board_clip_guides = {}  # Map: image key -> {"edges": [...], "corners": [...]}
         self.board_clip_draw_mode = None  # None, "edges", or "corners"
         self.board_clip_draw_slot = None  # Which edge/corner index is waiting to be drawn
@@ -154,6 +156,8 @@ class AnnotatorApp:
         self.board_clip_extend_parent_toolbar_btn = None
         self.board_clip_all_btn = None
         self.board_clip_extend_parent_all_btn = None
+        self.board_clip_extend_parent_dialog_btn = None
+        self.board_clip_extend_parent_all_dialog_btn = None
 
         # --- UI Setup ---
         self._setup_ui()
@@ -234,6 +238,11 @@ class AnnotatorApp:
             self.board_clip_target_mode = str(cfg.get("board_clip_target_mode", self.board_clip_target_mode)).strip().lower()
             if self.board_clip_target_mode not in {"all", "boards", "stringers"}:
                 self.board_clip_target_mode = "all"
+            self.board_clip_extend_scope = self._normalize_board_clip_extend_scope(
+                cfg.get("board_clip_extend_scope", self.board_clip_extend_scope),
+                fallback=self.board_clip_extend_scope,
+            )
+            self.board_clip_extend_scope_var.set(self.board_clip_extend_scope)
             self.board_clip_use_guides = bool(cfg.get("board_clip_use_guides", self.board_clip_use_guides))
             self.board_clip_extend_to_guides = bool(cfg.get("board_clip_extend_to_guides", self.board_clip_extend_to_guides))
             self.board_clip_apply_to_auto_annotations = bool(cfg.get("board_clip_apply_to_auto_annotations", self.board_clip_apply_to_auto_annotations))
@@ -266,6 +275,7 @@ class AnnotatorApp:
             "board_clip_board_class_ids": self.board_clip_board_class_ids,
             "board_clip_stringer_class_ids": self.board_clip_stringer_class_ids,
             "board_clip_target_mode": self.board_clip_target_mode,
+            "board_clip_extend_scope": self.board_clip_extend_scope,
             "board_clip_use_guides": self.board_clip_use_guides,
             "board_clip_extend_to_guides": self.board_clip_extend_to_guides,
             "board_clip_apply_to_auto_annotations": self.board_clip_apply_to_auto_annotations,
@@ -578,12 +588,32 @@ class AnnotatorApp:
         self.board_clip_edge_btn = tb.Button(clip_guide_row, text="2 Edge Fallback (Shift+B)", command=self.start_quick_board_clip_guides, bootstyle="secondary-outline")
         self.board_clip_edge_btn.pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
 
+        tb.Label(clip_frame, text="Box Extend Scope", font=("Arial", 9, "bold"), foreground="#888").pack(anchor=W, pady=(6, 2))
+        clip_extend_scope_row = tb.Frame(clip_frame)
+        clip_extend_scope_row.pack(fill=X, pady=(0, 2))
+        tb.Radiobutton(
+            clip_extend_scope_row,
+            text="All",
+            variable=self.board_clip_extend_scope_var,
+            value="all",
+            command=self.on_board_clip_extend_scope_changed,
+            bootstyle="toolbutton-outline",
+        ).pack(side=LEFT, expand=True, fill=X, padx=(0, 2))
+        tb.Radiobutton(
+            clip_extend_scope_row,
+            text="Stringers",
+            variable=self.board_clip_extend_scope_var,
+            value="stringers",
+            command=self.on_board_clip_extend_scope_changed,
+            bootstyle="toolbutton-outline",
+        ).pack(side=LEFT, expand=True, fill=X, padx=(2, 0))
+
         tb.Label(clip_frame, text="Current Image", font=("Arial", 9, "bold"), foreground="#888").pack(anchor=W, pady=(6, 2))
         clip_current_row = tb.Frame(clip_frame)
         clip_current_row.pack(fill=X, pady=1)
         self.board_clip_current_btn = tb.Button(clip_current_row, text="Fit Current (V)", command=self.apply_board_clip_to_current, bootstyle="success-outline")
         self.board_clip_current_btn.pack(side=LEFT, expand=True, fill=X, padx=(0, 1))
-        self.board_clip_extend_parent_btn = tb.Button(clip_current_row, text="Extend To Pallet Box", command=self.extend_board_clip_to_parent_current, bootstyle="info-outline")
+        self.board_clip_extend_parent_btn = tb.Button(clip_current_row, text="Extend To Box (X)", command=self.extend_board_clip_to_parent_current_selected, bootstyle="info-outline")
         self.board_clip_extend_parent_btn.pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
 
         tb.Label(clip_frame, text="Dataset", font=("Arial", 9, "bold"), foreground="#888").pack(anchor=W, pady=(6, 2))
@@ -591,7 +621,7 @@ class AnnotatorApp:
         clip_dataset_row.pack(fill=X, pady=1)
         self.board_clip_all_btn = tb.Button(clip_dataset_row, text="Fit All", command=self.apply_board_clip_to_dataset, bootstyle="danger-outline")
         self.board_clip_all_btn.pack(side=LEFT, expand=True, fill=X, padx=(0, 1))
-        self.board_clip_extend_parent_all_btn = tb.Button(clip_dataset_row, text="Extend All To Box", command=self.extend_board_clip_to_parent_dataset, bootstyle="info-outline")
+        self.board_clip_extend_parent_all_btn = tb.Button(clip_dataset_row, text="Extend All To Box (Alt+X)", command=self.extend_board_clip_to_parent_dataset_selected, bootstyle="info-outline")
         self.board_clip_extend_parent_all_btn.pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
 
         self.board_clip_auto_apply_var = tk.BooleanVar(value=self.board_clip_apply_to_auto_annotations)
@@ -605,7 +635,7 @@ class AnnotatorApp:
 
         tb.Label(
             clip_frame,
-            text="Pick all, boards only, or stringers only. Boards default to classes 1 and 4, stringers default to class 2. Use guides for rotated pallets, or Extend To Pallet Box when you only want the class-0 pallet annotation.",
+            text="Pick all, boards only, or stringers only for fitting. Use Box Extend Scope to click-run all non-container boxes or stringers only. Hotkeys: X current all, Shift+X current stringers, Alt+X dataset all, Alt+Shift+X dataset stringers.",
             wraplength=250,
             justify=LEFT,
             font=("Arial", 8),
@@ -677,7 +707,7 @@ class AnnotatorApp:
         self.lbl_idx.pack(side=LEFT, padx=5)
         tb.Button(nav_frame, text="Next >", command=self.next_image, bootstyle="outline").pack(side=LEFT, padx=1)
         
-        tb.Label(c_toolbar, text="  |  Shortcuts: A/D, 1-9, R, B, Shift+B, V, G, Ctrl+Click", font=("Arial", 9)).pack(side=LEFT, padx=10)
+        tb.Label(c_toolbar, text="  |  Shortcuts: A/D, 1-9, R, B, Shift+B, V, X, Shift+X, Alt+X, G, Ctrl+Click", font=("Arial", 9)).pack(side=LEFT, padx=10)
         
         # Crosshair Toggle
         tb.Checkbutton(c_toolbar, text="Crosshair", variable=self.show_crosshair, bootstyle="round-toggle").pack(side=LEFT, padx=10)
@@ -707,7 +737,7 @@ class AnnotatorApp:
         tb.Button(c_toolbar, text="Info", command=self.show_image_info, bootstyle="info-outline-sm").pack(side=RIGHT, padx=5)
         tb.Button(c_toolbar, text="Clip All", command=self.apply_board_clip_to_dataset, bootstyle="danger-outline-sm").pack(side=RIGHT, padx=5)
         tb.Button(c_toolbar, text="Clip Here", command=self.apply_board_clip_to_current, bootstyle="success-outline-sm").pack(side=RIGHT, padx=5)
-        self.board_clip_extend_parent_toolbar_btn = tb.Button(c_toolbar, text="Extend To Box", command=self.extend_board_clip_to_parent_current, bootstyle="info-outline-sm")
+        self.board_clip_extend_parent_toolbar_btn = tb.Button(c_toolbar, text="Extend To Box (X)", command=self.extend_board_clip_to_parent_current_selected, bootstyle="info-outline-sm")
         self.board_clip_extend_parent_toolbar_btn.pack(side=RIGHT, padx=5)
         self.board_clip_edge_toolbar_btn = tb.Button(c_toolbar, text="2 Edges (Shift+B)", command=self.start_quick_board_clip_guides, bootstyle="secondary-outline-sm")
         self.board_clip_edge_toolbar_btn.pack(side=RIGHT, padx=5)
@@ -819,6 +849,11 @@ class AnnotatorApp:
         self.root.bind("b", self.start_quick_board_clip_corners)
         self.root.bind("B", self.start_quick_board_clip_guides)
         self.root.bind("v", self.apply_board_clip_to_current)
+        self.root.bind("x", self.extend_board_clip_to_parent_current)
+        self.root.bind("X", self.extend_board_clip_stringers_to_parent_current)
+        self.root.bind_all("<Alt-x>", lambda e: self.extend_board_clip_to_parent_dataset())
+        self.root.bind_all("<Alt-X>", lambda e: self.extend_board_clip_stringers_to_parent_dataset())
+        self.root.bind_all("<Alt-Shift-X>", lambda e: self.extend_board_clip_stringers_to_parent_dataset())
         
         # Ctrl+Z for undo (use bind_all to work regardless of focus)
         self.root.bind_all("<Control-z>", lambda e: self.undo_action())
@@ -1170,14 +1205,28 @@ class AnnotatorApp:
         if self.board_clip_target_combo:
             self.board_clip_target_combo["values"] = self._board_clip_target_choices()
             self.board_clip_target_combo.set(self._format_board_clip_target_choice(self.board_clip_target_mode))
+        if self.board_clip_extend_scope_var.get() != self.board_clip_extend_scope:
+            self.board_clip_extend_scope_var.set(self.board_clip_extend_scope)
         if self.board_clip_board_btn:
             self.board_clip_board_btn.config(text=f"Boards: {self._format_board_clip_class_id_summary(self.board_clip_board_class_ids)}")
         if self.board_clip_stringer_btn:
             self.board_clip_stringer_btn.config(text=f"Stringers: {self._format_board_clip_class_id_summary(self.board_clip_stringer_class_ids)}")
+        if self.board_clip_extend_parent_btn:
+            self.board_clip_extend_parent_btn.config(text=self._board_clip_extend_current_button_text())
+        if self.board_clip_extend_parent_toolbar_btn:
+            self.board_clip_extend_parent_toolbar_btn.config(text=self._board_clip_extend_toolbar_button_text())
+        if self.board_clip_extend_parent_all_btn:
+            self.board_clip_extend_parent_all_btn.config(text=self._board_clip_extend_dataset_button_text())
+        if self.board_clip_extend_parent_dialog_btn:
+            self.board_clip_extend_parent_dialog_btn.config(text=self._board_clip_extend_dialog_current_button_text())
+        if self.board_clip_extend_parent_all_dialog_btn:
+            self.board_clip_extend_parent_all_dialog_btn.config(text=self._board_clip_extend_dialog_dataset_button_text())
         if self.board_clip_dialog_vars.get("board_summary"):
             self.board_clip_dialog_vars["board_summary"].set(self._format_board_clip_class_id_summary(self.board_clip_board_class_ids, include_names=True))
         if self.board_clip_dialog_vars.get("stringer_summary"):
             self.board_clip_dialog_vars["stringer_summary"].set(self._format_board_clip_class_id_summary(self.board_clip_stringer_class_ids, include_names=True))
+        if self.board_clip_dialog_vars.get("extend_scope") and self.board_clip_dialog_vars["extend_scope"].get() != self.board_clip_extend_scope:
+            self.board_clip_dialog_vars["extend_scope"].set(self.board_clip_extend_scope)
 
     def on_board_clip_parent_changed(self, event=None):
         if not self.board_clip_parent_combo:
@@ -1186,7 +1235,6 @@ class AnnotatorApp:
             self.board_clip_parent_combo.get(),
             self.board_clip_parent_class_id,
         )
-        self.board_clip_enabled = True
         self.save_config()
         self.redraw()
         self._refresh_board_clip_dialog_state()
@@ -1198,10 +1246,12 @@ class AnnotatorApp:
             self.board_clip_target_combo.get(),
             self.board_clip_target_mode,
         )
-        self.board_clip_enabled = True
         self.save_config()
         self.redraw()
         self._refresh_board_clip_dialog_state()
+
+    def on_board_clip_extend_scope_changed(self):
+        self._set_board_clip_extend_scope(self.board_clip_extend_scope_var.get())
 
     def choose_board_clip_board_classes(self):
         selected = self._choose_board_clip_class_ids("Select Board Classes", self.board_clip_board_class_ids)
@@ -1209,7 +1259,6 @@ class AnnotatorApp:
             return
         self.board_clip_board_class_ids = selected
         self.board_clip_child_class_id = self.board_clip_board_class_ids[0]
-        self.board_clip_enabled = True
         self.save_config()
         self._refresh_board_clip_parent_ui()
         self.redraw()
@@ -1221,7 +1270,6 @@ class AnnotatorApp:
             return
         self.board_clip_stringer_class_ids = selected
         self.board_clip_stringer_class_id = self.board_clip_stringer_class_ids[0]
-        self.board_clip_enabled = True
         self.save_config()
         self._refresh_board_clip_parent_ui()
         self.redraw()
@@ -1876,9 +1924,13 @@ class AnnotatorApp:
   Y           Repeat selected annotations & next
   E           Toggle Edit mode (resize boxes)
   T           Toggle Draw Only mode
-  B           Click 4 pallet corners, then auto-fit boards/stringers
+  B           Click 4 pallet corners, refresh pallet box, then auto-fit boards/stringers
   Shift+B     Draw 2 pallet edges as a straight-pallet fallback
   V           Fit current image inside pallet class
+  X           Extend current image to the pallet box
+  Shift+X     Extend current stringers only to the pallet box
+  Alt+X       Extend dataset to the pallet box
+  Alt+Shift+X Extend dataset stringers only to the pallet box
 
  🗑 DELETE / CLEAR
   Del         Delete current image (undoable)
@@ -2214,6 +2266,54 @@ class AnnotatorApp:
             right - left,
             bottom - top,
         ]
+
+    def _build_board_clip_parent_from_corners(self, corners=None):
+        active_corners = corners if corners is not None else self._get_board_clip_corners_for_image()
+        ordered_corners = self._order_polygon_clockwise(active_corners)
+        if len(ordered_corners) < 4:
+            return None
+
+        xs = [float(point[0]) for point in ordered_corners]
+        ys = [float(point[1]) for point in ordered_corners]
+        bounds = (min(xs), min(ys), max(xs), max(ys))
+        return self._bounds_to_ann(self.board_clip_parent_class_id, bounds)
+
+    def _replace_board_clip_parent_annotation(self, annotations, parent_ann):
+        if parent_ann is None:
+            return [list(ann) for ann in annotations], False
+
+        parent_indices = [idx for idx, ann in enumerate(annotations) if int(ann[0]) == self.board_clip_parent_class_id]
+        updated = [list(ann) for ann in annotations if int(ann[0]) != self.board_clip_parent_class_id]
+        insert_at = parent_indices[0] if parent_indices else 0
+        updated.insert(min(insert_at, len(updated)), list(parent_ann))
+
+        changed = len(parent_indices) != 1
+        if not changed and parent_indices:
+            changed = self._annotation_differs(annotations[parent_indices[0]], parent_ann)
+        return updated, changed
+
+    def _sync_board_clip_parent_to_current_corners(self, push_undo=True, save=True, redraw=True):
+        if not self.current_image:
+            return False, None
+
+        parent_ann = self._build_board_clip_parent_from_corners()
+        if parent_ann is None:
+            return False, None
+
+        new_annotations, changed = self._replace_board_clip_parent_annotation(self.annotations, parent_ann)
+        if not changed:
+            return False, parent_ann
+
+        if push_undo:
+            self._push_annotation_undo()
+
+        self.annotations = new_annotations
+        self.annotations_dirty = True
+        if save:
+            self.save_annotations()
+        if redraw:
+            self.redraw()
+        return True, parent_ann
 
     def _annotation_differs(self, ann1, ann2, tolerance=1e-6):
         if ann1 is None or ann2 is None:
@@ -2609,12 +2709,25 @@ class AnnotatorApp:
         self._ensure_board_clip_active()
         self._apply_board_clip_to_current_annotations()
 
+    def extend_board_clip_to_parent_current_selected(self, e=None):
+        if self.board_clip_extend_scope == "stringers":
+            return self.extend_board_clip_stringers_to_parent_current(e)
+        return self.extend_board_clip_to_parent_current(e)
+
     def extend_board_clip_to_parent_current(self, e=None):
         if not self.current_image:
             self.status_var.set("Load an image before extending to the pallet box")
             return
         self._ensure_board_clip_active()
         self._extend_board_clip_to_parent_current_annotations()
+
+    def extend_board_clip_stringers_to_parent_current(self, e=None):
+        if not self.current_image:
+            self.status_var.set("Load an image before extending stringers to the pallet box")
+            return
+        self._ensure_board_clip_active()
+
+        self._run_with_board_clip_target_mode("stringers", self._extend_board_clip_to_parent_current_annotations)
 
     def start_quick_board_clip_guides(self, e=None):
         if not self.current_image:
@@ -2632,7 +2745,7 @@ class AnnotatorApp:
         self._ensure_board_clip_active()
         self._start_board_clip_guide_draw(0, mode="corners")
         self.board_clip_quick_draw = True
-        self.status_var.set("Pallet corner mode ON: annotations hidden. Click the 4 pallet corners in order around the pallet. Boards/stringers will be fit after corner 4.")
+        self.status_var.set("Pallet corner mode ON: annotations hidden. Click the 4 pallet corners in order around the pallet. The pallet box will refresh after corner 4, then boards/stringers will be fit.")
 
     def _load_annotations_for_image_path(self, img_path):
         lbl_path = self._get_label_path(img_path)
@@ -2658,6 +2771,11 @@ class AnnotatorApp:
             prompt_body="This will rewrite label files where the selected targets need fitting.",
         )
 
+    def extend_board_clip_to_parent_dataset_selected(self, e=None):
+        if self.board_clip_extend_scope == "stringers":
+            return self.extend_board_clip_stringers_to_parent_dataset(e)
+        return self.extend_board_clip_to_parent_dataset(e)
+
     def extend_board_clip_to_parent_dataset(self, e=None):
         self._run_board_clip_dataset_action(
             action_label="Extend to pallet box",
@@ -2666,6 +2784,18 @@ class AnnotatorApp:
             prompt_body="This ignores saved corners/edges and rewrites label files using only the selected pallet annotation.",
             ignore_guides=True,
             force_extend_to_parent=True,
+            target_mode_override="all",
+        )
+
+    def extend_board_clip_stringers_to_parent_dataset(self, e=None):
+        self._run_board_clip_dataset_action(
+            action_label="Extend stringers to pallet box",
+            progress_title="Extend Stringers To Pallet Box",
+            prompt_title="Extend Stringers To Pallet Box",
+            prompt_body="This ignores saved corners/edges and rewrites label files using only the selected pallet annotation for stringer classes.",
+            ignore_guides=True,
+            force_extend_to_parent=True,
+            target_mode_override="stringers",
         )
 
     def _run_board_clip_dataset_action(
@@ -2676,6 +2806,7 @@ class AnnotatorApp:
         prompt_body,
         ignore_guides=False,
         force_extend_to_parent=False,
+        target_mode_override=None,
     ):
         if not self.workspace_path or not self.image_paths:
             self.status_var.set("Load a workspace before running a pallet fit dataset action")
@@ -2685,7 +2816,7 @@ class AnnotatorApp:
 
         if not messagebox.askyesno(
             prompt_title,
-            f"{action_label} {self._board_clip_target_summary()} to class {self.board_clip_parent_class_id} across {len(self.image_paths)} images?\n\n"
+            f"{action_label} {self._board_clip_target_summary(target_mode_override)} to class {self.board_clip_parent_class_id} across {len(self.image_paths)} images?\n\n"
             f"{prompt_body}"
         ):
             return
@@ -2708,11 +2839,14 @@ class AnnotatorApp:
 
         for idx, img_path in enumerate(self.image_paths, start=1):
             annotations, lbl_path = self._load_annotations_for_image_path(img_path)
-            new_annotations, stats = self._apply_board_clip_constraints(
-                annotations,
-                img_path=img_path,
-                ignore_guides=ignore_guides,
-                force_extend_to_parent=force_extend_to_parent,
+            new_annotations, stats = self._run_with_board_clip_target_mode(
+                target_mode_override or self.board_clip_target_mode,
+                lambda annotations=annotations, img_path=img_path: self._apply_board_clip_constraints(
+                    annotations,
+                    img_path=img_path,
+                    ignore_guides=ignore_guides,
+                    force_extend_to_parent=force_extend_to_parent,
+                ),
             )
             changed = (
                 len(new_annotations) != len(annotations) or
@@ -3391,10 +3525,7 @@ class AnnotatorApp:
                    self.last_drawn_box[2], 
                    self.last_drawn_box[3], 
                    self.last_drawn_box[4]]
-        new_ann = self._clip_annotation_to_board_region(new_ann, self.annotations, img_path=self.current_file_path)
-        if new_ann is None:
-            self.status_var.set("Repeated box falls outside the pallet clip region")
-            return
+        new_ann = self._clamp_annotation(new_ann)
         self.annotations.append(new_ann)
         self.last_drawn_box = list(new_ann)
         self.annotations_dirty = True
@@ -3436,15 +3567,11 @@ class AnnotatorApp:
         # Step 3: Paste clipboard if it has content
         pasted = 0
         removed = 0
-        skipped_clip = 0
         if self.repeat_clipboard:
             # Save state for undo BEFORE pasting
             self._push_annotation_undo()
             for new_ann in self.repeat_clipboard:
-                candidate_ann = self._clip_annotation_to_board_region(list(new_ann), self.annotations, img_path=self.current_file_path)
-                if candidate_ann is None:
-                    skipped_clip += 1
-                    continue
+                candidate_ann = self._clamp_annotation(list(new_ann))
 
                 # Find and remove any overlapping annotations of the same class
                 new_box = (candidate_ann[1], candidate_ann[2], candidate_ann[3], candidate_ann[4])
@@ -3470,18 +3597,18 @@ class AnnotatorApp:
         # Status message
         if copied_count > 0 and pasted > 0:
             if removed > 0:
-                self.status_var.set(f"Copied {copied_count}, pasted {pasted} (replaced {removed}{', clipped skip ' + str(skipped_clip) if skipped_clip else ''})")
+                self.status_var.set(f"Copied {copied_count}, pasted {pasted} (replaced {removed})")
             else:
-                self.status_var.set(f"Copied {copied_count}, pasted {pasted}{' (clip skipped ' + str(skipped_clip) + ')' if skipped_clip else ''} - Y to continue")
+                self.status_var.set(f"Copied {copied_count}, pasted {pasted} - Y to continue")
         elif copied_count > 0:
             self.status_var.set(f"Copied {copied_count} - Y to paste on next images")
         elif pasted > 0:
             if removed > 0:
-                self.status_var.set(f"Pasted {pasted} (replaced {removed}{', clip skipped ' + str(skipped_clip) if skipped_clip else ''}) - Y to repeat")
+                self.status_var.set(f"Pasted {pasted} (replaced {removed}) - Y to repeat")
             else:
-                self.status_var.set(f"Pasted {pasted} annotations{' (clip skipped ' + str(skipped_clip) + ')' if skipped_clip else ''} - Y to repeat")
+                self.status_var.set(f"Pasted {pasted} annotations - Y to repeat")
         elif self.repeat_clipboard:
-            self.status_var.set(f"Clipboard has {len(self.repeat_clipboard)}{' - some boxes were outside clip region' if skipped_clip else ''} - Y to paste")
+            self.status_var.set(f"Clipboard has {len(self.repeat_clipboard)} - Y to paste")
         else:
             self.status_var.set(f"Ctrl+Click to select, then Y to copy & repeat")
         
@@ -3926,7 +4053,7 @@ class AnnotatorApp:
         self.canvas.create_rectangle(panel_x1, panel_y1, panel_x2, panel_y2, fill="#111111", outline="#FF6600", width=2, tags="board_clip_mode")
         if self.board_clip_draw_mode == "corners":
             title = f"PALLET CORNER MODE  *  Click corner {self.board_clip_draw_slot + 1} of 4"
-            subtitle = "Annotations hidden while drawing. Click each corner around the pallet. Esc cancels."
+            subtitle = "Annotations hidden while drawing. Click each corner around the pallet. Corner 4 refreshes the pallet box. Esc cancels."
         else:
             title = f"PALLET EDGE MODE  *  Draw edge {self.board_clip_draw_slot + 1} of 2"
             subtitle = "Annotations hidden while drawing. Left-drag along the pallet edge. Esc cancels."
@@ -4176,10 +4303,6 @@ class AnnotatorApp:
                 ncy = ny1 + nh/2
                 
                 new_ann = [self.selected_class_id, ncx, ncy, nw, nh]
-                new_ann = self._clip_annotation_to_board_region(new_ann, self.annotations, img_path=self.current_file_path)
-                if new_ann is None:
-                    self.status_var.set("Box is outside the pallet clip region")
-                    return
 
                 # Save for undo BEFORE adding
                 self._push_annotation_undo()
@@ -4329,10 +4452,7 @@ class AnnotatorApp:
                  ann[3],
                  ann[4],
              ]
-             clipped_ann = self._clip_annotation_to_board_region(candidate_ann, self.annotations, img_path=self.current_file_path)
-             if clipped_ann is None:
-                 return
-             ann[1:] = clipped_ann[1:]
+             ann[1:] = self._clamp_annotation(candidate_ann)[1:]
              
              self.redraw()
              
@@ -4379,10 +4499,7 @@ class AnnotatorApp:
              
              ann = self.annotations[self.active_annotation_index]
              candidate_ann = [ann[0], new_cx, new_cy, new_w, new_h]
-             clipped_ann = self._clip_annotation_to_board_region(candidate_ann, self.annotations, img_path=self.current_file_path)
-             if clipped_ann is None:
-                 return
-             ann[1:] = clipped_ann[1:]
+             ann[1:] = self._clamp_annotation(candidate_ann)[1:]
              
              self.redraw()
 
@@ -4469,14 +4586,48 @@ class AnnotatorApp:
             corners = self._order_polygon_clockwise(self.board_clip_corner_draft[:4])
             self._set_board_clip_corners_for_image(corners)
             self._cancel_board_clip_guide_draw()
+            parent_changed, _ = self._sync_board_clip_parent_to_current_corners(push_undo=not quick_mode, save=not quick_mode, redraw=False)
             self.redraw()
             self._refresh_board_clip_dialog_state()
 
             if quick_mode:
-                self._apply_board_clip_to_current_annotations()
+                previous_annotations = [list(ann) for ann in self.annotations]
+                new_annotations, stats = self._apply_board_clip_constraints(self.annotations, img_path=self.current_file_path)
+                fit_changed = (
+                    len(new_annotations) != len(previous_annotations) or
+                    any(self._annotation_differs(old, new) for old, new in zip(previous_annotations, new_annotations))
+                )
+
+                if parent_changed or fit_changed:
+                    if parent_changed:
+                        self._push_annotation_undo()
+                    elif fit_changed:
+                        self._push_annotation_undo()
+                    self.annotations = new_annotations
+                    self.annotations_dirty = True
+                    self.save_annotations()
+                    self.redraw()
+
+                if fit_changed:
+                    msg = f"Pallet corners saved; pallet box {'updated' if parent_changed else 'confirmed'}; fitted {self._board_clip_target_summary()}"
+                    if stats["clipped"] > 0:
+                        msg += f" ({stats['clipped']} adjusted"
+                        if stats["removed"] > 0:
+                            msg += f", {stats['removed']} removed"
+                        msg += ")"
+                    elif stats["removed"] > 0:
+                        msg += f" ({stats['removed']} removed)"
+                    self.status_var.set(msg)
+                elif parent_changed:
+                    self.status_var.set("Pallet corners saved; pallet box updated")
+                else:
+                    self.status_var.set("Pallet corners saved")
                 return
 
-            self.status_var.set("Pallet corners saved")
+            if parent_changed:
+                self.status_var.set("Pallet corners saved; pallet box updated")
+            else:
+                self.status_var.set("Pallet corners saved")
             return
 
         if self.board_clip_draw_mode == "edges" and self.board_clip_draw_slot is not None:
@@ -4565,10 +4716,6 @@ class AnnotatorApp:
             ncy = ny1 + nh/2
             
             new_ann = [self.selected_class_id, ncx, ncy, nw, nh]
-            new_ann = self._clip_annotation_to_board_region(new_ann, self.annotations, img_path=self.current_file_path)
-            if new_ann is None:
-                self.status_var.set("Box is outside the pallet clip region")
-                return
 
             # Save for undo BEFORE adding
             self._push_annotation_undo()
@@ -4877,6 +5024,12 @@ class AnnotatorApp:
             "Stringers only",
         ]
 
+    def _normalize_board_clip_extend_scope(self, value, fallback="all"):
+        scope = str(value).strip().lower()
+        if scope in {"all", "stringers"}:
+            return scope
+        return fallback
+
     def _format_board_clip_class_choice(self, class_id):
         if self.classes and 0 <= class_id < len(self.classes):
             return f"{class_id}: {self.classes[class_id]}"
@@ -4890,12 +5043,58 @@ class AnnotatorApp:
         }
         return mapping.get(mode, mapping["all"])
 
-    def _board_clip_target_summary(self):
-        if self.board_clip_target_mode == "boards":
+    def _board_clip_target_summary(self, mode=None):
+        mode = mode or self.board_clip_target_mode
+        if mode == "boards":
             return f"board classes {self._format_board_clip_class_id_summary(self.board_clip_board_class_ids)} only"
-        if self.board_clip_target_mode == "stringers":
+        if mode == "stringers":
             return f"stringer classes {self._format_board_clip_class_id_summary(self.board_clip_stringer_class_ids)} only"
         return "all non-container annotations"
+
+    def _set_board_clip_extend_scope(self, scope, save=True):
+        normalized = self._normalize_board_clip_extend_scope(scope, fallback=self.board_clip_extend_scope)
+        self.board_clip_extend_scope = normalized
+        if self.board_clip_extend_scope_var.get() != normalized:
+            self.board_clip_extend_scope_var.set(normalized)
+        if self.board_clip_dialog_vars.get("extend_scope") and self.board_clip_dialog_vars["extend_scope"].get() != normalized:
+            self.board_clip_dialog_vars["extend_scope"].set(normalized)
+        self._refresh_board_clip_parent_ui()
+        if save:
+            self.save_config()
+
+    def _board_clip_extend_current_button_text(self):
+        if self.board_clip_extend_scope == "stringers":
+            return "Extend Stringers To Box (Shift+X)"
+        return "Extend To Box (X)"
+
+    def _board_clip_extend_toolbar_button_text(self):
+        if self.board_clip_extend_scope == "stringers":
+            return "Extend Stringers (Shift+X)"
+        return "Extend To Box (X)"
+
+    def _board_clip_extend_dataset_button_text(self):
+        if self.board_clip_extend_scope == "stringers":
+            return "Extend All Stringers (Alt+Shift+X)"
+        return "Extend All To Box (Alt+X)"
+
+    def _board_clip_extend_dialog_current_button_text(self):
+        if self.board_clip_extend_scope == "stringers":
+            return "Extend Stringers To Pallet Box (Shift+X)"
+        return "Extend To Pallet Box Only (X)"
+
+    def _board_clip_extend_dialog_dataset_button_text(self):
+        if self.board_clip_extend_scope == "stringers":
+            return "Extend Stringers Across Dataset To Pallet Box (Alt+Shift+X)"
+        return "Extend Across Dataset To Pallet Box (Alt+X)"
+
+    def _run_with_board_clip_target_mode(self, mode, callback):
+        normalized = str(mode).strip().lower()
+        previous_mode = self.board_clip_target_mode
+        try:
+            self.board_clip_target_mode = normalized
+            return callback()
+        finally:
+            self.board_clip_target_mode = previous_mode
 
     def _normalize_board_clip_class_ids(self, values, fallback=None):
         normalized = []
@@ -5060,6 +5259,10 @@ class AnnotatorApp:
             self.board_clip_all_btn.config(state=tk.DISABLED if drawing else tk.NORMAL)
         if self.board_clip_extend_parent_all_btn:
             self.board_clip_extend_parent_all_btn.config(state=tk.DISABLED if drawing else tk.NORMAL)
+        if self.board_clip_extend_parent_dialog_btn:
+            self.board_clip_extend_parent_dialog_btn.config(state=tk.DISABLED if drawing else tk.NORMAL)
+        if self.board_clip_extend_parent_all_dialog_btn:
+            self.board_clip_extend_parent_all_dialog_btn.config(state=tk.DISABLED if drawing else tk.NORMAL)
         if self.canvas:
             if drawing:
                 self.canvas.config(highlightthickness=4, highlightbackground="#FF6600", highlightcolor="#FF6600")
@@ -5083,6 +5286,7 @@ class AnnotatorApp:
             "enabled": tk.BooleanVar(value=self.board_clip_enabled),
             "parent": tk.StringVar(value=self._format_board_clip_class_choice(self.board_clip_parent_class_id)),
             "target_mode": tk.StringVar(value=self._format_board_clip_target_choice(self.board_clip_target_mode)),
+            "extend_scope": tk.StringVar(value=self.board_clip_extend_scope),
             "board_summary": tk.StringVar(value=self._format_board_clip_class_id_summary(self.board_clip_board_class_ids, include_names=True)),
             "stringer_summary": tk.StringVar(value=self._format_board_clip_class_id_summary(self.board_clip_stringer_class_ids, include_names=True)),
             "use_guides": tk.BooleanVar(value=self.board_clip_use_guides),
@@ -5098,6 +5302,7 @@ class AnnotatorApp:
             self.board_clip_enabled = bool(vars_map["enabled"].get())
             self.board_clip_parent_class_id = self._parse_board_clip_class_choice(vars_map["parent"].get(), self.board_clip_parent_class_id)
             self.board_clip_target_mode = self._parse_board_clip_target_choice(vars_map["target_mode"].get(), self.board_clip_target_mode)
+            self.board_clip_extend_scope = self._normalize_board_clip_extend_scope(vars_map["extend_scope"].get(), fallback=self.board_clip_extend_scope)
             self.board_clip_use_guides = bool(vars_map["use_guides"].get())
             self.board_clip_extend_to_guides = bool(vars_map["extend_to_guides"].get())
             self.board_clip_guides_visible.set(bool(vars_map["show_guides"].get()))
@@ -5119,6 +5324,8 @@ class AnnotatorApp:
             self._cancel_board_clip_guide_draw()
             self.board_clip_dialog_vars = {}
             self.board_clip_dialog = None
+            self.board_clip_extend_parent_dialog_btn = None
+            self.board_clip_extend_parent_all_dialog_btn = None
             dlg.destroy()
 
         frame = tb.Frame(dlg, padding=14)
@@ -5152,8 +5359,18 @@ class AnnotatorApp:
         tb.Label(stringer_row, text="Stringer classes", width=14, anchor=W).pack(side=LEFT)
         tb.Button(stringer_row, textvariable=vars_map["stringer_summary"], command=lambda: [self.choose_board_clip_stringer_classes(), self._refresh_board_clip_dialog_state()], bootstyle="secondary-outline").pack(side=RIGHT)
 
+        extend_scope_row = tb.Frame(frame)
+        extend_scope_row.pack(fill=X, pady=(10, 4))
+        tb.Label(extend_scope_row, text="Box extend", width=14, anchor=W).pack(side=LEFT)
+        extend_scope_btns = tb.Frame(extend_scope_row)
+        extend_scope_btns.pack(side=RIGHT, fill=X, expand=True)
+        tb.Radiobutton(extend_scope_btns, text="All", variable=vars_map["extend_scope"], value="all",
+                       command=save_settings, bootstyle="toolbutton-outline").pack(side=LEFT, expand=True, fill=X, padx=(0, 2))
+        tb.Radiobutton(extend_scope_btns, text="Stringers", variable=vars_map["extend_scope"], value="stringers",
+                       command=save_settings, bootstyle="toolbutton-outline").pack(side=LEFT, expand=True, fill=X, padx=(2, 0))
+
         tb.Checkbutton(frame, text="Use saved corners or edges when available", variable=vars_map["use_guides"],
-                       command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(10, 4))
+                       command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(8, 4))
         tb.Checkbutton(frame, text="Extend boxes to guides instead of only clipping", variable=vars_map["extend_to_guides"],
                        command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(0, 4))
         tb.Checkbutton(frame, text="Show saved pallet guides on canvas", variable=vars_map["show_guides"],
@@ -5178,14 +5395,16 @@ class AnnotatorApp:
 
         tb.Button(frame, text="Apply To Current Image", command=self._apply_board_clip_to_current_annotations,
                  bootstyle="primary").pack(fill=X, pady=(12, 6))
-        tb.Button(frame, text="Extend To Pallet Box Only", command=self._extend_board_clip_to_parent_current_annotations,
-                 bootstyle="info-outline").pack(fill=X, pady=(0, 6))
-        tb.Button(frame, text="Extend Across Dataset To Pallet Box", command=self.extend_board_clip_to_parent_dataset,
-                 bootstyle="info-outline").pack(fill=X, pady=(0, 6))
+        self.board_clip_extend_parent_dialog_btn = tb.Button(frame, text=self._board_clip_extend_dialog_current_button_text(),
+                 command=self.extend_board_clip_to_parent_current_selected, bootstyle="info-outline")
+        self.board_clip_extend_parent_dialog_btn.pack(fill=X, pady=(0, 6))
+        self.board_clip_extend_parent_all_dialog_btn = tb.Button(frame, text=self._board_clip_extend_dialog_dataset_button_text(),
+                 command=self.extend_board_clip_to_parent_dataset_selected, bootstyle="info-outline")
+        self.board_clip_extend_parent_all_dialog_btn.pack(fill=X, pady=(0, 6))
 
         tb.Label(
             frame,
-            text="Default setup is class 0 as the container, board classes 1 and 4, and stringer class 2. Choose all, boards only, or stringers only. Use 4 corners for rotated or skewed pallets, 2 edges as a fallback on straight pallet views, or the pallet-box actions when you want no saved guides involved.",
+            text="Default setup is class 0 as the container, board classes 1 and 4, and stringer class 2. Adjust controls drive pallet fit. Box extend scope drives the click actions above. Hotkeys: X current all, Shift+X current stringers, Alt+X dataset all, Alt+Shift+X dataset stringers.",
             wraplength=380,
             justify=LEFT,
             font=("Arial", 9),

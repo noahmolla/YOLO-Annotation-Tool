@@ -11,6 +11,7 @@
     "board_clip_board_class_ids": [1, 4],
     "board_clip_stringer_class_ids": [2],
     "board_clip_target_mode": "all",
+    "board_clip_extend_scope": "all",
     "board_clip_use_guides": true,
     "board_clip_extend_to_guides": true,
     "board_clip_apply_to_auto_annotations": false,
