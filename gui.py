@@ -808,7 +808,7 @@ class AnnotatorApp:
         export_row = tb.Frame(quick_frame)
         export_row.pack(fill=X, pady=1)
         tb.Button(export_row, text="📦 320px Export", command=self.show_320_export_dialog, bootstyle="warning").pack(fill=X)
-        # Classes List
+        # Rotation row
         rotate_row = tb.Frame(quick_frame)
         rotate_row.pack(fill=X, pady=1)
         tb.Button(rotate_row, text="Rotate Here", command=self.rotate_current_image_dialog, bootstyle="secondary", width=10).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
@@ -2802,12 +2802,12 @@ class AnnotatorApp:
     def _rotation_description(self, normalized_degrees):
         normalized_degrees = self._normalize_rotation_degrees(normalized_degrees)
         if normalized_degrees == 90:
-            return "90° clockwise"
+            return "90 deg clockwise"
         if normalized_degrees == 180:
-            return "180°"
+            return "180 deg"
         if normalized_degrees == 270:
-            return "90° counterclockwise"
-        return "0°"
+            return "90 deg counterclockwise"
+        return "0 deg"
 
     def _rotate_normalized_point(self, x, y, normalized_degrees):
         normalized_degrees = self._normalize_rotation_degrees(normalized_degrees)
@@ -4402,6 +4402,253 @@ class AnnotatorApp:
         self._update_stats()
         self.status_var.set(f"Cleared annotations for {cleared} image(s)")
 
+    def _prompt_rotation_degrees(self, target_label):
+        prompt = (
+            f"Enter rotation degrees for {target_label}.\n\n"
+            "Use multiples of 90 like 90, 180, 270, or -90."
+        )
+        while True:
+            degrees = simpledialog.askinteger(
+                "Rotate Images",
+                prompt,
+                parent=self.root,
+                initialvalue=90,
+                minvalue=-1080,
+                maxvalue=1080,
+            )
+            if degrees is None:
+                return None
+            try:
+                normalized = self._normalize_rotation_degrees(degrees)
+            except ValueError as exc:
+                messagebox.showerror("Rotate Images", str(exc), parent=self.root)
+                continue
+            if normalized == 0:
+                messagebox.showinfo("Rotate Images", "That resolves to 0 deg. Enter a non-zero quarter turn.", parent=self.root)
+                continue
+            return normalized
+
+    def _save_rotated_image_file(self, img_path, normalized_degrees):
+        normalized_degrees = self._normalize_rotation_degrees(normalized_degrees)
+        if normalized_degrees == 0:
+            return
+
+        transpose_enum = getattr(Image, "Transpose", Image)
+        transpose_map = {
+            90: transpose_enum.ROTATE_270,
+            180: transpose_enum.ROTATE_180,
+            270: transpose_enum.ROTATE_90,
+        }
+        temp_path = img_path + ".rotate_tmp"
+
+        try:
+            with Image.open(img_path) as src:
+                src.load()
+                rotated = src.transpose(transpose_map[normalized_degrees])
+                try:
+                    save_kwargs = {}
+                    if src.format:
+                        save_kwargs["format"] = src.format
+                    if src.info.get("exif"):
+                        save_kwargs["exif"] = src.info["exif"]
+                    if src.info.get("icc_profile"):
+                        save_kwargs["icc_profile"] = src.info["icc_profile"]
+
+                    try:
+                        if src.format == "JPEG":
+                            rotated.save(
+                                temp_path,
+                                quality="keep",
+                                subsampling="keep",
+                                qtables="keep",
+                                **save_kwargs,
+                            )
+                        else:
+                            rotated.save(temp_path, **save_kwargs)
+                    except Exception:
+                        rotated.save(temp_path, **save_kwargs)
+                finally:
+                    try:
+                        rotated.close()
+                    except Exception:
+                        pass
+
+            os.replace(temp_path, img_path)
+        except Exception:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            raise
+
+    def _rotate_image_label_pair(self, img_path, normalized_degrees):
+        normalized_degrees = self._normalize_rotation_degrees(normalized_degrees)
+        read_label_path = self._get_label_read_path(img_path)
+        label_exists = os.path.exists(read_label_path)
+        annotations = self._load_annotations_from_file(read_label_path)
+        label_format = LABEL_FORMAT_SEGMENT if any(self._is_polygon_annotation(ann) for ann in annotations) else LABEL_FORMAT_DETECT
+        rotated_annotations = self._rotate_annotations_geometry(annotations, normalized_degrees) if annotations else []
+
+        self._save_rotated_image_file(img_path, normalized_degrees)
+
+        if label_exists and annotations:
+            self._write_annotations_atomically(read_label_path, rotated_annotations, label_format)
+
+        return len(rotated_annotations)
+
+    def _rotate_image_paths(self, image_paths, normalized_degrees, action_label):
+        try:
+            normalized_degrees = self._normalize_rotation_degrees(normalized_degrees)
+        except ValueError as exc:
+            messagebox.showerror("Rotate Images", str(exc), parent=self.root)
+            return
+
+        if normalized_degrees == 0:
+            self.status_var.set("Rotation resolved to 0 deg. Nothing changed.")
+            return
+
+        unique_paths = []
+        seen = set()
+        for path in image_paths or []:
+            if not path or not os.path.exists(path):
+                continue
+            key = os.path.normcase(os.path.normpath(path))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_paths.append(path)
+
+        if not unique_paths:
+            self.status_var.set("No images available to rotate.")
+            return
+
+        rotate_desc = self._rotation_description(normalized_degrees)
+        count = len(unique_paths)
+        noun = "image" if count == 1 else "images"
+        confirm = (
+            f"Rotate {action_label} {rotate_desc}?\n\n"
+            f"This will update the {count} {noun} and any matching YOLO labels in place."
+        )
+        if not messagebox.askyesno("Rotate Images", confirm, parent=self.root):
+            return
+
+        current_path = self.current_file_path
+        preferred_index = self.current_index if 0 <= self.current_index < len(self.filtered_image_paths) else 0
+
+        if self.current_image and self.current_file_path and self.annotations_dirty:
+            self.save_annotations(force=True)
+
+        if self.current_image:
+            try:
+                self.current_image.close()
+            except Exception:
+                pass
+            self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=False)
+
+        progress = None
+        progress_bar = None
+        progress_label = None
+        if count > 1:
+            progress = tb.Toplevel(self.root)
+            progress.title("Rotating Images")
+            progress.geometry("440x130")
+            progress.transient(self.root)
+            progress.protocol("WM_DELETE_WINDOW", lambda: None)
+
+            progress_bar = tb.Progressbar(progress, maximum=count)
+            progress_bar.pack(fill=X, padx=20, pady=(20, 8))
+            progress_label = tb.Label(progress, text="Starting...", font=("Consolas", 9))
+            progress_label.pack(pady=4)
+            progress.update_idletasks()
+
+        rotated_images = 0
+        rotated_annotations = 0
+        errors = []
+
+        try:
+            for idx, img_path in enumerate(unique_paths, start=1):
+                try:
+                    rotated_annotations += self._rotate_image_label_pair(img_path, normalized_degrees)
+                    rotated_images += 1
+                except Exception as exc:
+                    errors.append(f"{os.path.basename(img_path)}: {exc}")
+
+                if progress_bar is not None:
+                    progress_bar["value"] = idx
+                if progress_label is not None:
+                    progress_label.config(text=f"Processed {idx}/{count}  |  rotated {rotated_images}")
+                if progress is not None and (idx % 10 == 0 or idx == count):
+                    progress.update_idletasks()
+        finally:
+            if progress is not None:
+                progress.destroy()
+
+        self._build_annotation_cache_and_stats()
+        self._refresh_file_list()
+
+        if current_path and current_path in self.filtered_image_paths:
+            self.load_image(self.filtered_image_paths.index(current_path))
+        elif self.filtered_image_paths:
+            fallback_index = max(0, min(preferred_index, len(self.filtered_image_paths) - 1))
+            self.load_image(fallback_index)
+        else:
+            self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=True)
+
+        summary = (
+            f"Rotated {rotated_images}/{count} {noun} {rotate_desc}"
+            f" and updated {rotated_annotations} annotation(s)."
+        )
+        self.status_var.set(summary)
+
+        if errors:
+            details = "\n".join(errors[:12])
+            if len(errors) > 12:
+                details += f"\n...and {len(errors) - 12} more"
+            messagebox.showwarning(
+                "Rotate Images",
+                f"{summary}\n\nSome files could not be rotated:\n{details}",
+                parent=self.root,
+            )
+
+    def rotate_current_image_dialog(self):
+        if not self.current_file_path:
+            self.status_var.set("Load an image before rotating it.")
+            return
+
+        normalized_degrees = self._prompt_rotation_degrees(os.path.basename(self.current_file_path))
+        if normalized_degrees is None:
+            return
+
+        self._rotate_image_paths([self.current_file_path], normalized_degrees, "the current image")
+
+    def rotate_selected_files_dialog(self, indices=None):
+        indices = self.file_list.curselection() if indices is None else indices
+        valid_indices = sorted({idx for idx in indices if 0 <= idx < len(self.filtered_image_paths)})
+        if not valid_indices:
+            self.status_var.set("Select one or more images to rotate.")
+            return
+
+        selected_paths = [self.filtered_image_paths[idx] for idx in valid_indices]
+        target_label = os.path.basename(selected_paths[0]) if len(selected_paths) == 1 else f"{len(selected_paths)} selected images"
+        normalized_degrees = self._prompt_rotation_degrees(target_label)
+        if normalized_degrees is None:
+            return
+
+        action_label = "the selected image" if len(selected_paths) == 1 else f"the {len(selected_paths)} selected images"
+        self._rotate_image_paths(selected_paths, normalized_degrees, action_label)
+
+    def rotate_all_images_dialog(self):
+        if not self.image_paths:
+            self.status_var.set("Load a workspace before rotating all images.")
+            return
+
+        normalized_degrees = self._prompt_rotation_degrees(f"all {len(self.image_paths)} images")
+        if normalized_degrees is None:
+            return
+
+        self._rotate_image_paths(self.image_paths, normalized_degrees, f"all {len(self.image_paths)} images")
+
     def on_class_selected(self, event):
         sel = self.cls_list.curselection()
         if sel:
@@ -4990,6 +5237,15 @@ class AnnotatorApp:
         subdir = os.path.join(dirname, "labels")
         return os.path.join(subdir, rootname + ".txt")
 
+    def _get_label_read_path(self, img_path):
+        lbl_path = self._get_label_path(img_path)
+        if os.path.exists(lbl_path):
+            return lbl_path
+        same_dir = os.path.splitext(img_path)[0] + ".txt"
+        if os.path.exists(same_dir):
+            return same_dir
+        return lbl_path
+
     def load_image(self, index, from_list_click=False):
         """Load image at index. Optimized for fast transitions."""
         if not self.filtered_image_paths:
@@ -5059,15 +5315,7 @@ class AnnotatorApp:
         # Load Labels - clear selection since indices change
         self.annotations = []
         self.selected_annotations.clear()  # Clear selection when changing images
-        lbl_path = self._get_label_path(path)
-        
-        # Fallback for reading: check same directory if labels path doesn't exist
-        # This allows opening easy datasets
-        read_path = lbl_path
-        if not os.path.exists(lbl_path):
-            same_dir = os.path.splitext(path)[0] + ".txt"
-            if os.path.exists(same_dir):
-                read_path = same_dir
+        read_path = self._get_label_read_path(path)
         
         if os.path.exists(read_path):
             self.annotations = self._load_annotations_from_file(read_path, update_loaded_format=True)
