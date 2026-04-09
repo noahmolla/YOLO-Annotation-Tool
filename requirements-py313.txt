@@ -1,0 +1,10 @@
+# Python 3.13-compatible install set
+# TensorFlow is intentionally omitted because it is not reliably available on 3.13.
+# The app still runs normally and supports PyTorch `.pt` YOLO models.
+
+Pillow>=9.0.0
+numpy>=1.21.0
+opencv-python>=4.5.5
+ttkbootstrap>=1.10.0
+PyYAML>=6.0.1
+ultralytics>=8.0.0

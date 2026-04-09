@@ -27,6 +27,7 @@ build_release.py
 # User-specific application data
 # (contains: last workspace, model path, classes, window geometry)
 config.json
+.board_clip_guides.json
 
 # Model files (too large for git)
 *.tflite
@@ -46,6 +47,7 @@ config.json
 *.webp
 *.yaml
 !config.example.json
+datasets/
 
 # Temporary files
 *.tmp
