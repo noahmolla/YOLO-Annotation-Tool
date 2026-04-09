@@ -26,6 +26,7 @@ LABEL_FORMAT_AUTO = "auto"
 LABEL_FORMAT_DETECT = "detect"
 LABEL_FORMAT_SEGMENT = "segment"
 LABEL_BACKUP_DIR = ".annotator_backups"
+DATASET_SETTINGS_FILE = ".annotator_dataset.json"
 AUTO_PALLET_CLASS_ID = 0
 
 class AnnotatorApp:
@@ -49,7 +50,13 @@ class AnnotatorApp:
         self.image_to_classes_cache = {} # Cache: image_path -> set(class_ids)
         self.image_id_map = {}           # Cache: image_path -> persistent ID (1-based)
 
-        self.model = None              # TFLiteModel instance
+        self.model = None              # Primary auto-annotate model
+        self.people_models = []        # Configured multi-model people detectors
+        self.people_model_cache = {}   # Cache: (path, imgsz) -> loaded runtime
+        self.people_target_class_id = None
+        self.people_allow_overlap = False
+        self.people_overlap_iou_threshold = 0.30
+        self.people_summary_var = tk.StringVar(value="No people models configured.")
         
         self.current_image = None      # PIL Image
         self.photo_image = None        # ImageTk to prevent GC
@@ -71,6 +78,7 @@ class AnnotatorApp:
         self.current_file_path = None  # EXPLICITLY track the file we are editing
         self.annotations_dirty = False # Track if annotations need saving
         self.loaded_label_format = LABEL_FORMAT_DETECT
+        self.dataset_label_format = LABEL_FORMAT_DETECT
         self.label_backup_paths = set()
 
         
@@ -112,7 +120,7 @@ class AnnotatorApp:
         self.first_click_point = None  # Store first click point (canvas coords)
         self.temp_box_id = None  # ID of temporary box preview
         self.annotation_mode = tk.StringVar(value=ANNOTATION_MODE_BOX)
-        self.save_format_mode = tk.StringVar(value=LABEL_FORMAT_AUTO)
+        self.save_format_mode = tk.StringVar(value=LABEL_FORMAT_DETECT)
         self.zoom_lock = tk.BooleanVar(value=False)
         self.zoom_label_var = tk.StringVar(value="Zoom 100%")
         self.pending_segment_points = []  # List of normalized [x, y] points
@@ -200,6 +208,7 @@ class AnnotatorApp:
         # --- UI Setup ---
         self._setup_ui()
         self._refresh_board_clip_parent_ui()
+        self._refresh_people_model_ui()
         self._bind_events()
         
         # Initial status
@@ -243,8 +252,22 @@ class AnnotatorApp:
                 
             if "model_version" in cfg:
                 self.model_ver_combo.set(cfg["model_version"])
-            self.annotation_mode.set(cfg.get("annotation_mode", self.annotation_mode.get()))
-            self.save_format_mode.set(cfg.get("save_format_mode", self.save_format_mode.get()))
+            normalized_people_models = []
+            for entry in cfg.get("people_models", []):
+                normalized = self._normalize_people_model_entry(entry)
+                if normalized is not None:
+                    normalized_people_models.append(normalized)
+            self.people_models = normalized_people_models
+            people_target = cfg.get("people_target_class_id", self.people_target_class_id)
+            self.people_target_class_id = int(people_target) if people_target is not None else None
+            self.people_allow_overlap = bool(cfg.get("people_allow_overlap", self.people_allow_overlap))
+            try:
+                self.people_overlap_iou_threshold = float(
+                    cfg.get("people_overlap_iou_threshold", self.people_overlap_iou_threshold)
+                )
+            except (TypeError, ValueError):
+                self.people_overlap_iou_threshold = 0.30
+            self.people_overlap_iou_threshold = max(0.0, min(1.0, self.people_overlap_iou_threshold))
             self.zoom_lock.set(bool(cfg.get("zoom_lock", self.zoom_lock.get())))
 
             self.board_clip_enabled = bool(cfg.get("board_clip_enabled", self.board_clip_enabled))
@@ -307,6 +330,7 @@ class AnnotatorApp:
             elif "last_dir" in cfg and os.path.exists(cfg["last_dir"]):
                 # Legacy support
                 self._load_images_from_dir(cfg["last_dir"])
+            self._refresh_people_model_ui()
                 
         except Exception as e:
             print(f"Failed to load config: {e}")
@@ -318,6 +342,10 @@ class AnnotatorApp:
             "model_version": self.model_ver_combo.get(),
             "last_workspace": self.workspace_path,
             "last_dir": os.path.dirname(self.image_paths[0]) if self.image_paths else "",
+            "people_models": self.people_models,
+            "people_target_class_id": self.people_target_class_id,
+            "people_allow_overlap": self.people_allow_overlap,
+            "people_overlap_iou_threshold": self.people_overlap_iou_threshold,
             "board_clip_enabled": self.board_clip_enabled,
             "board_clip_parent_class_id": self.board_clip_parent_class_id,
             "board_clip_child_class_id": self.board_clip_board_class_ids[0],
@@ -332,8 +360,6 @@ class AnnotatorApp:
             "board_clip_extend_to_guides": self.board_clip_extend_to_guides,
             "board_clip_apply_to_auto_annotations": self.board_clip_apply_to_auto_annotations,
             "board_clip_guides_visible": self.board_clip_guides_visible.get(),
-            "annotation_mode": self.annotation_mode.get(),
-            "save_format_mode": self.save_format_mode.get(),
             "zoom_lock": self.zoom_lock.get(),
         }
         if hasattr(self, 'model_path_str'):
@@ -344,6 +370,157 @@ class AnnotatorApp:
                 json.dump(cfg, f, indent=4)
         except Exception as e:
             print(f"Failed to save config: {e}")
+
+    def _dataset_settings_path(self):
+        if not self.workspace_path:
+            return None
+        return os.path.join(self.workspace_path, DATASET_SETTINGS_FILE)
+
+    def _scan_label_paths(self, label_paths):
+        summary = {
+            "label_paths": list(label_paths),
+            "total_files": len(label_paths),
+            "labeled_files": 0,
+            "empty_files": 0,
+            "detect_files": 0,
+            "segment_files": 0,
+            "mixed_files": 0,
+            "detect_annotations": 0,
+            "segment_annotations": 0,
+            "segment_examples": [],
+            "mixed_examples": [],
+            "dataset_format": "empty",
+        }
+
+        for lbl_path in label_paths:
+            annotations = self._load_annotations_from_file(lbl_path)
+            file_format = self._classify_annotation_collection_format(annotations)
+
+            detect_count = 0
+            segment_count = 0
+            for ann in annotations:
+                if self._is_polygon_annotation(ann):
+                    segment_count += 1
+                else:
+                    detect_count += 1
+
+            summary["detect_annotations"] += detect_count
+            summary["segment_annotations"] += segment_count
+
+            if file_format == LABEL_FORMAT_DETECT:
+                summary["labeled_files"] += 1
+                summary["detect_files"] += 1
+            elif file_format == LABEL_FORMAT_SEGMENT:
+                summary["labeled_files"] += 1
+                summary["segment_files"] += 1
+                if len(summary["segment_examples"]) < 5:
+                    summary["segment_examples"].append(os.path.basename(lbl_path))
+            elif file_format == "mixed":
+                summary["labeled_files"] += 1
+                summary["mixed_files"] += 1
+                if len(summary["mixed_examples"]) < 5:
+                    summary["mixed_examples"].append(os.path.basename(lbl_path))
+            else:
+                summary["empty_files"] += 1
+
+        if summary["mixed_files"] > 0 or (summary["detect_files"] > 0 and summary["segment_files"] > 0):
+            summary["dataset_format"] = "mixed"
+        elif summary["segment_files"] > 0:
+            summary["dataset_format"] = LABEL_FORMAT_SEGMENT
+        elif summary["detect_files"] > 0:
+            summary["dataset_format"] = LABEL_FORMAT_DETECT
+
+        return summary
+
+    def _collect_label_paths_for_dataset_settings(self, image_dir=None):
+        seen = set()
+        label_paths = []
+
+        def add_path(path):
+            norm = os.path.normcase(os.path.normpath(path))
+            if norm in seen or not os.path.exists(path):
+                return
+            seen.add(norm)
+            label_paths.append(path)
+
+        labels_dir = os.path.join(self.workspace_path, "labels") if self.workspace_path else None
+        if labels_dir and os.path.exists(labels_dir):
+            for path in sorted(glob.glob(os.path.join(labels_dir, "*.txt"))):
+                add_path(path)
+
+        if image_dir and os.path.exists(image_dir):
+            exts = ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"]
+            for pattern in exts:
+                for img_path in glob.glob(os.path.join(image_dir, pattern)):
+                    same_dir = os.path.splitext(img_path)[0] + ".txt"
+                    add_path(same_dir)
+                for img_path in glob.glob(os.path.join(image_dir, pattern.upper())):
+                    same_dir = os.path.splitext(img_path)[0] + ".txt"
+                    add_path(same_dir)
+
+        label_paths.sort(key=lambda path: os.path.basename(path).lower())
+        return label_paths
+
+    def _set_dataset_label_format(self, label_format, persist=True, update_ui=True):
+        if label_format not in (LABEL_FORMAT_DETECT, LABEL_FORMAT_SEGMENT):
+            label_format = LABEL_FORMAT_DETECT
+        self.dataset_label_format = label_format
+        if update_ui and self.save_format_mode.get() != label_format:
+            self.save_format_mode.set(label_format)
+        if persist:
+            self._save_dataset_settings()
+
+    def _save_dataset_settings(self):
+        path = self._dataset_settings_path()
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"label_format": self.dataset_label_format}, f, indent=2)
+        except Exception as e:
+            print(f"Failed to save dataset settings: {e}")
+
+    def _load_dataset_settings(self, image_dir=None):
+        path = self._dataset_settings_path()
+        label_format = None
+
+        if path and os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    raw = json.load(f) or {}
+                candidate = str(raw.get("label_format", "")).strip().lower()
+                if candidate in (LABEL_FORMAT_DETECT, LABEL_FORMAT_SEGMENT):
+                    label_format = candidate
+            except Exception as e:
+                print(f"Failed to load dataset settings: {e}")
+
+        if label_format is None:
+            label_paths = self._collect_label_paths_for_dataset_settings(image_dir=image_dir)
+            summary = self._scan_label_paths(label_paths)
+            if summary["segment_files"] > 0 or summary["mixed_files"] > 0:
+                label_format = LABEL_FORMAT_SEGMENT
+            else:
+                label_format = LABEL_FORMAT_DETECT
+
+        self._set_dataset_label_format(label_format, persist=True, update_ui=True)
+
+    def _on_dataset_label_format_changed(self, event=None):
+        selected = str(self.save_format_mode.get()).strip().lower()
+        if selected not in (LABEL_FORMAT_DETECT, LABEL_FORMAT_SEGMENT):
+            selected = self.dataset_label_format or LABEL_FORMAT_DETECT
+        if selected == self.dataset_label_format:
+            return
+
+        self._set_dataset_label_format(selected, persist=True, update_ui=False)
+        if selected == LABEL_FORMAT_DETECT:
+            self.annotation_mode.set(ANNOTATION_MODE_BOX)
+        self.status_var.set(f"Dataset label type locked to {self._dataset_format_label(selected)}")
+
+    def _ensure_segment_dataset_mode(self, action_label="segmentation"):
+        if self.dataset_label_format == LABEL_FORMAT_SEGMENT:
+            return
+        self._set_dataset_label_format(LABEL_FORMAT_SEGMENT, persist=True, update_ui=True)
+        self.status_var.set(f"Dataset label type switched to Segment for {action_label}")
 
     def _board_clip_guides_path(self):
         if not self.workspace_path:
@@ -621,6 +798,43 @@ class AnnotatorApp:
         self.btn_auto_curr.pack(side=LEFT, expand=True, fill=X, padx=(0,1))
         self.btn_auto_all = tb.Button(auto_frame, text="All Images", command=self.auto_annotate_all, bootstyle="danger", width=8)
         self.btn_auto_all.pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+
+        people_frame = tb.Labelframe(model_frame, text="People Multi-Model", padding=8)
+        people_frame.pack(fill=X, pady=(6, 1))
+
+        self.btn_people_manage = tb.Button(
+            people_frame,
+            text="Manage People Models",
+            command=self.show_people_models_dialog,
+            bootstyle="secondary",
+        )
+        self.btn_people_manage.pack(fill=X, pady=(0, 4))
+
+        tb.Label(
+            people_frame,
+            textvariable=self.people_summary_var,
+            font=("Arial", 8),
+            foreground="#888",
+            wraplength=280,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(0, 4))
+
+        people_auto_frame = tb.Frame(people_frame)
+        people_auto_frame.pack(fill=X)
+        self.btn_people_curr = tb.Button(
+            people_auto_frame,
+            text="People Current",
+            command=self.auto_annotate_people_current,
+            bootstyle="info",
+        )
+        self.btn_people_curr.pack(side=LEFT, expand=True, fill=X, padx=(0, 1))
+        self.btn_people_all = tb.Button(
+            people_auto_frame,
+            text="People All",
+            command=self.auto_annotate_people_all,
+            bootstyle="danger-outline",
+        )
+        self.btn_people_all.pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
         
         # Settings button
         tb.Button(model_frame, text="⚙ Confidence & IOU Settings", command=self.show_annotation_settings, bootstyle="info").pack(fill=X, pady=1)
@@ -804,6 +1018,11 @@ class AnnotatorApp:
         tb.Button(check_row, text="🔎 Suspicious", command=self.check_suspicious_annotations_dialog, bootstyle="danger", width=10).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
         tb.Button(check_row, text="✅ YOLO Check", command=self.yolo_format_check_dialog, bootstyle="success", width=10).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
 
+        format_row = tb.Frame(quick_frame)
+        format_row.pack(fill=X, pady=1)
+        tb.Button(format_row, text="Label Type", command=self.show_dataset_label_type_dialog, bootstyle="info", width=10).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
+        tb.Button(format_row, text="Seg -> Detect", command=self.convert_dataset_segment_labels_to_detect, bootstyle="warning", width=10).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+
         # 320 Export row
         export_row = tb.Frame(quick_frame)
         export_row.pack(fill=X, pady=1)
@@ -901,15 +1120,16 @@ class AnnotatorApp:
 
         fmt_frame = tb.Frame(c_toolbar)
         fmt_frame.pack(side=LEFT, padx=10)
-        tb.Label(fmt_frame, text="Save As:").pack(side=LEFT, padx=(0, 4))
+        tb.Label(fmt_frame, text="Dataset Type:").pack(side=LEFT, padx=(0, 4))
         self.save_format_combo = tb.Combobox(
             fmt_frame,
             state="readonly",
             width=10,
             textvariable=self.save_format_mode,
-            values=[LABEL_FORMAT_AUTO, LABEL_FORMAT_DETECT, LABEL_FORMAT_SEGMENT],
+            values=[LABEL_FORMAT_DETECT, LABEL_FORMAT_SEGMENT],
         )
         self.save_format_combo.pack(side=LEFT)
+        self.save_format_combo.bind("<<ComboboxSelected>>", self._on_dataset_label_format_changed)
         
         # Speed toggle
         self.speed_btn = tb.Button(c_toolbar, text="Speed: Single", command=self.toggle_nav_speed, bootstyle="secondary-outline", width=12)
@@ -1235,6 +1455,8 @@ class AnnotatorApp:
         img_dir = os.path.join(self.workspace_path, "images")
         if not os.path.exists(img_dir):
             img_dir = self.workspace_path  # Fallback to workspace root
+
+        self._load_dataset_settings(image_dir=img_dir)
         
         # Rescan images
         old_count = len(self.image_paths)
@@ -1268,6 +1490,8 @@ class AnnotatorApp:
             # 1. Ensure Structure
             img_dir, lbl_dir, yaml_path = utils.ensure_workspace_structure(d)
             self.workspace_path = d
+            self.annotation_mode.set(ANNOTATION_MODE_BOX)
+            self._load_dataset_settings(image_dir=img_dir)
             self._load_board_clip_guides()
             
             # 2. Load Classes from YAML
@@ -1278,7 +1502,10 @@ class AnnotatorApp:
             # 3. Load Images
             self._load_images_from_dir(img_dir)
             
-            self.status_var.set(f"Loaded Workspace: {os.path.basename(d)}")
+            self.status_var.set(
+                f"Loaded Workspace: {os.path.basename(d)} | "
+                f"{self._dataset_format_label(self.dataset_label_format)} dataset"
+            )
         except Exception as e:
             messagebox.showerror("Workspace Error", str(e))
             
@@ -1541,6 +1768,7 @@ class AnnotatorApp:
             self.selected_class_id = 0
             self.cls_list.selection_set(0)
         self._refresh_board_clip_parent_ui()
+        self._refresh_people_model_ui()
 
     def _refresh_board_clip_parent_ui(self):
         choices = self._board_clip_class_choices()
@@ -1658,6 +1886,661 @@ class AnnotatorApp:
         self.board_cluster_expected_count_var.set(str(self.board_cluster_expected_count))
         self.save_config()
 
+    def _default_people_target_class_id(self):
+        preferred_names = ("person", "people", "human")
+        for preferred in preferred_names:
+            for idx, name in enumerate(self.classes):
+                if str(name).strip().lower() == preferred:
+                    return idx
+        for idx, name in enumerate(self.classes):
+            lowered = str(name).strip().lower()
+            if any(token in lowered for token in preferred_names):
+                return idx
+        if self.classes and 0 <= self.selected_class_id < len(self.classes):
+            return int(self.selected_class_id)
+        return 0
+
+    def _resolved_people_target_class_id(self):
+        try:
+            if self.people_target_class_id is not None:
+                return max(0, int(self.people_target_class_id))
+        except (TypeError, ValueError):
+            pass
+        return self._default_people_target_class_id()
+
+    def _people_target_choice_values(self):
+        target_class_id = self._resolved_people_target_class_id()
+        max_class = max(target_class_id, self.selected_class_id, len(self.classes) - 1, 0)
+        values = [f"{idx}: {name}" for idx, name in enumerate(self.classes)]
+        for class_id in range(len(self.classes), max_class + 1):
+            values.append(str(class_id))
+        return values
+
+    def _format_people_target_choice(self, class_id=None):
+        class_id = self._resolved_people_target_class_id() if class_id is None else int(class_id)
+        if self.classes and 0 <= class_id < len(self.classes):
+            return f"{class_id}: {self.classes[class_id]}"
+        return str(class_id)
+
+    def _normalize_people_model_entry(self, entry):
+        if not isinstance(entry, dict):
+            return None
+
+        path = str(entry.get("path", "")).strip()
+        if not path:
+            return None
+
+        version = str(entry.get("version", "Auto") or "Auto").strip()
+        if version not in {"Auto", "v5", "v8/v11", "v26"}:
+            version = "Auto"
+
+        imgsz = str(entry.get("imgsz", "Auto") or "Auto").strip()
+        if imgsz.lower() == "auto":
+            imgsz = "Auto"
+        else:
+            try:
+                imgsz = str(max(32, int(imgsz)))
+            except (TypeError, ValueError):
+                imgsz = "Auto"
+
+        try:
+            person_class_id = max(0, int(entry.get("person_class_id", 0)))
+        except (TypeError, ValueError):
+            person_class_id = 0
+
+        return {
+            "path": path,
+            "version": version,
+            "imgsz": imgsz,
+            "person_class_id": person_class_id,
+            "enabled": bool(entry.get("enabled", True)),
+        }
+
+    def _people_model_display_text(self, entry):
+        normalized = self._normalize_people_model_entry(entry)
+        if normalized is None:
+            return "Invalid people model"
+        state = "On" if normalized["enabled"] else "Off"
+        basename = os.path.basename(normalized["path"]) or normalized["path"]
+        return (
+            f"[{state}] {basename} | src person={normalized['person_class_id']} | "
+            f"{normalized['version']} | imgsz={normalized['imgsz']}"
+        )
+
+    def _refresh_people_model_ui(self):
+        enabled_models = [entry for entry in self.people_models if entry.get("enabled", True)]
+        target_label = self._format_people_target_choice()
+        overlap_text = (
+            "overlap allowed"
+            if self.people_allow_overlap
+            else f"overlap blocked (IoU {self.people_overlap_iou_threshold:.2f})"
+        )
+        if enabled_models:
+            summary = (
+                f"{len(enabled_models)} enabled people model(s). "
+                f"Target class: {target_label}. {overlap_text}."
+            )
+        elif self.people_models:
+            summary = (
+                f"{len(self.people_models)} people model(s) saved, but none enabled. "
+                f"Target class: {target_label}."
+            )
+        else:
+            summary = f"No people models configured. Target class: {target_label}."
+        self.people_summary_var.set(summary)
+
+        enabled_state = "normal" if enabled_models else "disabled"
+        if hasattr(self, "btn_people_curr") and self.btn_people_curr is not None:
+            self.btn_people_curr.config(state=enabled_state)
+        if hasattr(self, "btn_people_all") and self.btn_people_all is not None:
+            self.btn_people_all.config(state=enabled_state)
+
+    def _resolve_model_imgsz_value(self, version, imgsz_value):
+        version = str(version or "Auto").strip()
+        raw_value = str(imgsz_value or "Auto").strip()
+        if raw_value.lower() == "auto":
+            raw_value = "Auto"
+
+        if raw_value == "Auto":
+            if version == "v26":
+                return 1280, "1280"
+            return None, "Auto"
+
+        try:
+            imgsz = max(32, int(raw_value))
+        except (TypeError, ValueError):
+            if version == "v26":
+                return 1280, "1280"
+            return None, "Auto"
+        return imgsz, str(imgsz)
+
+    def _load_inference_model_from_path(self, model_path, version="Auto", imgsz_value="Auto"):
+        if not model_path or not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found:\n{model_path}")
+
+        imgsz, resolved_imgsz = self._resolve_model_imgsz_value(version, imgsz_value)
+
+        if model_path.lower().endswith(".pt"):
+            from inference import PyTorchYOLOModel
+
+            model = PyTorchYOLOModel(model_path, imgsz=imgsz)
+            model_type = "PyTorch"
+        elif model_path.lower().endswith(".tflite"):
+            from inference import TFLiteModel
+
+            model = TFLiteModel(model_path)
+            model_type = "TFLite"
+        else:
+            raise ValueError("Unsupported model format. Use .pt or .tflite")
+
+        return {
+            "model": model,
+            "model_type": model_type,
+            "imgsz": imgsz,
+            "resolved_imgsz": resolved_imgsz,
+        }
+
+    def _active_people_model_entries(self):
+        active_entries = []
+        missing_paths = []
+        for entry in self.people_models:
+            normalized = self._normalize_people_model_entry(entry)
+            if normalized is None or not normalized["enabled"]:
+                continue
+            if not os.path.exists(normalized["path"]):
+                missing_paths.append(normalized["path"])
+                continue
+            active_entries.append(normalized)
+        return active_entries, missing_paths
+
+    def _get_people_model_runtime(self, model_entry, cache=None):
+        normalized = self._normalize_people_model_entry(model_entry)
+        if normalized is None:
+            raise ValueError("Invalid people model configuration.")
+
+        cache = self.people_model_cache if cache is None else cache
+        _, resolved_imgsz = self._resolve_model_imgsz_value(normalized["version"], normalized["imgsz"])
+        cache_key = (
+            os.path.normcase(os.path.normpath(normalized["path"])),
+            normalized["version"],
+            resolved_imgsz,
+        )
+        if cache_key not in cache:
+            cache[cache_key] = self._load_inference_model_from_path(
+                normalized["path"],
+                version=normalized["version"],
+                imgsz_value=normalized["imgsz"],
+            )
+        return cache[cache_key]
+
+    def _load_people_model_runtimes(self, model_entries, cache=None):
+        runtimes = []
+        errors = []
+        for entry in model_entries:
+            try:
+                runtimes.append((entry, self._get_people_model_runtime(entry, cache=cache)))
+            except Exception as exc:
+                errors.append(f"{os.path.basename(entry.get('path', 'model'))}: {exc}")
+        return runtimes, errors
+
+    def _warn_people_model_errors(self, errors, title):
+        unique_errors = []
+        seen = set()
+        for error in errors:
+            text = str(error).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            unique_errors.append(text)
+        if not unique_errors:
+            return
+
+        preview = "\n".join(unique_errors[:12])
+        if len(unique_errors) > 12:
+            preview += f"\n... and {len(unique_errors) - 12} more"
+        messagebox.showwarning(title, preview)
+
+    def _collect_people_annotations_for_image(
+        self,
+        image_arr,
+        existing_annotations,
+        people_runtimes,
+        target_class_id,
+        confidence_threshold=None,
+        allow_overlap=None,
+        overlap_iou_threshold=None,
+        model_iou_threshold=None,
+    ):
+        if confidence_threshold is None:
+            confidence_threshold = self.class_confidence_thresholds.get(
+                int(target_class_id),
+                self.default_confidence_threshold,
+            )
+        if allow_overlap is None:
+            allow_overlap = self.people_allow_overlap
+        if overlap_iou_threshold is None:
+            overlap_iou_threshold = self.people_overlap_iou_threshold
+        if model_iou_threshold is None:
+            model_iou_threshold = self.iou_threshold
+
+        candidate_records = []
+        errors = []
+        working_annotations = self._copy_annotations(existing_annotations)
+
+        for entry, runtime in people_runtimes:
+            try:
+                boxes, classes, scores = runtime["model"].predict(
+                    image_arr,
+                    confidence_threshold=0.01,
+                    iou_threshold=model_iou_threshold,
+                    version=entry["version"],
+                )
+            except Exception as exc:
+                errors.append(f"{os.path.basename(entry.get('path', 'model'))}: {exc}")
+                continue
+
+            source_person_class_id = int(entry["person_class_id"])
+            for box, class_id, score in zip(boxes, classes, scores):
+                if int(class_id) != source_person_class_id:
+                    continue
+                if float(score) < float(confidence_threshold):
+                    continue
+                ann = self._make_box_annotation(
+                    int(target_class_id),
+                    float(box[0]),
+                    float(box[1]),
+                    float(box[2]),
+                    float(box[3]),
+                )
+                if ann is None:
+                    continue
+                candidate_records.append(
+                    {
+                        "annotation": ann,
+                        "score": float(score),
+                    }
+                )
+
+        candidate_records.sort(key=lambda item: item["score"], reverse=True)
+
+        new_annotations = []
+        skipped_overlap = 0
+        for record in candidate_records:
+            new_ann = record["annotation"]
+            if (
+                not allow_overlap
+                and self._is_duplicate_or_overlapping(
+                    new_ann,
+                    working_annotations,
+                    iou_threshold=overlap_iou_threshold,
+                )
+            ):
+                skipped_overlap += 1
+                continue
+            working_annotations.append(self._copy_annotation(new_ann))
+            new_annotations.append(new_ann)
+
+        return {
+            "new_annotations": new_annotations,
+            "working_annotations": working_annotations,
+            "candidate_count": len(candidate_records),
+            "skipped_overlap": skipped_overlap,
+            "errors": errors,
+        }
+
+    def _edit_people_model_dialog(self, existing=None):
+        existing = self._normalize_people_model_entry(existing) if existing is not None else None
+        dlg = tb.Toplevel(self.root)
+        dlg.title("Edit People Model" if existing else "Add People Model")
+        dlg.geometry("640x270")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        frame = tb.Frame(dlg, padding=15)
+        frame.pack(fill=BOTH, expand=True)
+
+        tb.Label(
+            frame,
+            text="Each people model only needs a model file plus the source class index that means person. No YAML is required.",
+            wraplength=580,
+            justify=LEFT,
+            foreground="#888",
+        ).pack(anchor=W, pady=(0, 12))
+
+        path_var = tk.StringVar(value=existing["path"] if existing else "")
+        version_var = tk.StringVar(value=existing["version"] if existing else self.model_ver_combo.get())
+        imgsz_var = tk.StringVar(value=existing["imgsz"] if existing else self.imgsz_combo.get())
+        person_class_var = tk.StringVar(value=str(existing["person_class_id"] if existing else 0))
+        enabled_var = tk.BooleanVar(value=existing["enabled"] if existing else True)
+
+        path_row = tb.Frame(frame)
+        path_row.pack(fill=X, pady=3)
+        tb.Label(path_row, text="Model:", width=12, anchor=W).pack(side=LEFT)
+        tb.Entry(path_row, textvariable=path_var).pack(side=LEFT, fill=X, expand=True, padx=(0, 6))
+        tb.Button(
+            path_row,
+            text="Browse",
+            bootstyle="secondary",
+            command=lambda: path_var.set(
+                filedialog.askopenfilename(
+                    filetypes=[
+                        ("YOLO Models", "*.tflite *.pt"),
+                        ("TFLite", "*.tflite"),
+                        ("PyTorch", "*.pt"),
+                        ("All Files", "*.*"),
+                    ]
+                )
+                or path_var.get()
+            ),
+        ).pack(side=LEFT)
+
+        settings_row = tb.Frame(frame)
+        settings_row.pack(fill=X, pady=3)
+        tb.Label(settings_row, text="YOLO Ver:", width=12, anchor=W).pack(side=LEFT)
+        tb.Combobox(
+            settings_row,
+            textvariable=version_var,
+            values=["Auto", "v5", "v8/v11", "v26"],
+            state="readonly",
+            width=12,
+        ).pack(side=LEFT, padx=(0, 12))
+        tb.Label(settings_row, text="Infer Size:", anchor=W).pack(side=LEFT)
+        tb.Combobox(
+            settings_row,
+            textvariable=imgsz_var,
+            values=["Auto", "320", "512", "640", "1024", "1280"],
+            state="readonly",
+            width=10,
+        ).pack(side=LEFT, padx=(6, 0))
+
+        person_row = tb.Frame(frame)
+        person_row.pack(fill=X, pady=3)
+        tb.Label(person_row, text="Person Index:", width=12, anchor=W).pack(side=LEFT)
+        tb.Entry(person_row, textvariable=person_class_var, width=12).pack(side=LEFT)
+        tb.Checkbutton(
+            person_row,
+            text="Enabled",
+            variable=enabled_var,
+            bootstyle="round-toggle",
+        ).pack(side=LEFT, padx=(18, 0))
+
+        tb.Label(
+            frame,
+            text="Tip: if this model predicts people as class 0 or class 15, enter that number here and the app will remap it into your dataset's person class.",
+            wraplength=580,
+            justify=LEFT,
+            foreground="#888",
+        ).pack(anchor=W, pady=(10, 0))
+
+        result = {"value": None}
+
+        def on_save():
+            model_path = path_var.get().strip()
+            if not model_path:
+                messagebox.showerror("Missing Model", "Select a model file first.")
+                return
+            if not os.path.exists(model_path):
+                messagebox.showerror("Missing Model", f"Model file not found:\n{model_path}")
+                return
+            try:
+                person_class_id = max(0, int(person_class_var.get().strip()))
+            except (TypeError, ValueError):
+                messagebox.showerror("Invalid Person Index", "Person Index must be a whole number.")
+                return
+
+            result["value"] = self._normalize_people_model_entry(
+                {
+                    "path": model_path,
+                    "version": version_var.get(),
+                    "imgsz": imgsz_var.get(),
+                    "person_class_id": person_class_id,
+                    "enabled": enabled_var.get(),
+                }
+            )
+            dlg.destroy()
+
+        btn_row = tb.Frame(frame)
+        btn_row.pack(fill=X, pady=(18, 0))
+        tb.Button(btn_row, text="Save", command=on_save, bootstyle="primary", width=12).pack(side=RIGHT, padx=(6, 0))
+        tb.Button(btn_row, text="Cancel", command=dlg.destroy, bootstyle="secondary-outline", width=12).pack(side=RIGHT)
+
+        self.root.wait_window(dlg)
+        return result["value"]
+
+    def show_people_models_dialog(self):
+        dlg = tb.Toplevel(self.root)
+        dlg.title("People Auto-Annotate")
+        dlg.geometry("760x560")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        frame = tb.Frame(dlg, padding=15)
+        frame.pack(fill=BOTH, expand=True)
+
+        tb.Label(frame, text="People Auto-Annotate", font=("Arial", 14, "bold")).pack(anchor=W)
+        tb.Label(
+            frame,
+            text="Use one or many detector models, tell the app which source class means person for each model, and remap them into your dataset's people class.",
+            wraplength=700,
+            justify=LEFT,
+            foreground="#888",
+        ).pack(anchor=W, pady=(2, 12))
+
+        list_frame = tb.Labelframe(frame, text="Configured People Models", padding=10)
+        list_frame.pack(fill=BOTH, expand=True)
+
+        model_list = tk.Listbox(list_frame, height=10)
+        model_list.pack(fill=BOTH, expand=True, pady=(0, 8))
+
+        list_btns = tb.Frame(list_frame)
+        list_btns.pack(fill=X)
+
+        def selected_index():
+            sel = model_list.curselection()
+            return sel[0] if sel else None
+
+        def refresh_list():
+            model_list.delete(0, tk.END)
+            for entry in self.people_models:
+                model_list.insert(tk.END, self._people_model_display_text(entry))
+
+        def add_model():
+            entry = self._edit_people_model_dialog()
+            if entry is None:
+                return
+            self.people_models.append(entry)
+            self.people_model_cache.clear()
+            refresh_list()
+            self._refresh_people_model_ui()
+            self.save_config()
+
+        def edit_model():
+            idx = selected_index()
+            if idx is None:
+                return
+            updated = self._edit_people_model_dialog(self.people_models[idx])
+            if updated is None:
+                return
+            self.people_models[idx] = updated
+            self.people_model_cache.clear()
+            refresh_list()
+            model_list.selection_set(idx)
+            self._refresh_people_model_ui()
+            self.save_config()
+
+        def remove_model():
+            idx = selected_index()
+            if idx is None:
+                return
+            removed = self.people_models[idx]
+            if not messagebox.askyesno(
+                "Remove People Model",
+                f"Remove this people model?\n\n{self._people_model_display_text(removed)}",
+                parent=dlg,
+            ):
+                return
+            del self.people_models[idx]
+            self.people_model_cache.clear()
+            refresh_list()
+            self._refresh_people_model_ui()
+            self.save_config()
+
+        tb.Button(list_btns, text="Add", command=add_model, bootstyle="primary", width=12).pack(side=LEFT, padx=(0, 6))
+        tb.Button(list_btns, text="Edit", command=edit_model, bootstyle="secondary", width=12).pack(side=LEFT, padx=6)
+        tb.Button(list_btns, text="Remove", command=remove_model, bootstyle="danger-outline", width=12).pack(side=LEFT, padx=6)
+
+        settings_frame = tb.Labelframe(frame, text="People Mapping", padding=10)
+        settings_frame.pack(fill=X, pady=(12, 0))
+
+        target_var = tk.StringVar(value=self._format_people_target_choice())
+        overlap_var = tk.BooleanVar(value=self.people_allow_overlap)
+        overlap_iou_var = tk.DoubleVar(value=self.people_overlap_iou_threshold)
+
+        target_row = tb.Frame(settings_frame)
+        target_row.pack(fill=X, pady=3)
+        tb.Label(target_row, text="Target dataset class:", width=18, anchor=W).pack(side=LEFT)
+        target_combo = tb.Combobox(
+            target_row,
+            textvariable=target_var,
+            values=self._people_target_choice_values(),
+            state="normal",
+            width=24,
+        )
+        target_combo.pack(side=LEFT, fill=X, expand=True)
+
+        overlap_row = tb.Frame(settings_frame)
+        overlap_row.pack(fill=X, pady=(10, 4))
+        overlap_chk = tb.Checkbutton(
+            overlap_row,
+            text="Allow overlapping people boxes",
+            variable=overlap_var,
+            bootstyle="round-toggle",
+        )
+        overlap_chk.pack(side=LEFT)
+
+        overlap_scale_row = tb.Frame(settings_frame)
+        overlap_scale_row.pack(fill=X, pady=(0, 4))
+        tb.Label(overlap_scale_row, text="Block overlap IoU:", width=18, anchor=W).pack(side=LEFT)
+        overlap_scale = tb.Scale(
+            overlap_scale_row,
+            from_=0.0,
+            to=1.0,
+            variable=overlap_iou_var,
+            orient=HORIZONTAL,
+            length=240,
+        )
+        overlap_scale.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
+        overlap_label = tb.Label(
+            overlap_scale_row,
+            text=f"{self.people_overlap_iou_threshold:.2f}",
+            width=5,
+            font=("Consolas", 10),
+        )
+        overlap_label.pack(side=LEFT)
+
+        tb.Label(
+            settings_frame,
+            text="Default behavior is to merge detections from every enabled people model and keep only one person box when the saved class would overlap an existing person annotation.",
+            wraplength=680,
+            justify=LEFT,
+            foreground="#888",
+        ).pack(anchor=W, pady=(6, 0))
+
+        def save_settings(*_):
+            self.people_target_class_id = self._parse_board_clip_class_choice(
+                target_var.get(),
+                self._resolved_people_target_class_id(),
+            )
+            self.people_allow_overlap = bool(overlap_var.get())
+            self.people_overlap_iou_threshold = max(0.0, min(1.0, float(overlap_iou_var.get())))
+            overlap_label.config(text=f"{self.people_overlap_iou_threshold:.2f}")
+            self._refresh_people_model_ui()
+            self.save_config()
+
+        def update_overlap_state(*_):
+            state = "disabled" if overlap_var.get() else "normal"
+            overlap_scale.config(state=state)
+            overlap_label.config(foreground="#666" if overlap_var.get() else "")
+            save_settings()
+
+        target_combo.bind("<<ComboboxSelected>>", save_settings)
+        target_combo.bind("<Return>", save_settings)
+        target_combo.bind("<FocusOut>", save_settings)
+        overlap_scale.config(command=lambda value: save_settings())
+        overlap_var.trace_add("write", update_overlap_state)
+
+        refresh_list()
+        update_overlap_state()
+
+        btn_row = tb.Frame(frame)
+        btn_row.pack(fill=X, pady=(14, 0))
+        tb.Button(btn_row, text="Close", command=lambda: [save_settings(), dlg.destroy()], bootstyle="primary", width=12).pack(side=RIGHT)
+
+    def auto_annotate_people_current(self):
+        if not self.current_image:
+            messagebox.showerror("No Image", "Load an image first.")
+            return
+
+        model_entries, missing_paths = self._active_people_model_entries()
+        if missing_paths:
+            self._warn_people_model_errors(
+                [f"Missing model file: {path}" for path in missing_paths],
+                "Missing People Models",
+            )
+        if not model_entries:
+            messagebox.showerror(
+                "No People Models",
+                "No enabled people models are available.\n\nFix the saved model paths or add a new people model first.",
+            )
+            return
+
+        self.status_var.set("Loading people models...")
+        self.root.update_idletasks()
+
+        people_runtimes, load_errors = self._load_people_model_runtimes(
+            model_entries,
+            cache=self.people_model_cache,
+        )
+        if not people_runtimes:
+            self._warn_people_model_errors(load_errors, "People Model Load Failed")
+            self.status_var.set("People auto-annotate failed: no models could be loaded")
+            return
+
+        target_class_id = self._resolved_people_target_class_id()
+        confidence_threshold = self.class_confidence_thresholds.get(
+            target_class_id,
+            self.default_confidence_threshold,
+        )
+
+        self._push_annotation_undo()
+
+        result = self._collect_people_annotations_for_image(
+            np.array(self.current_image),
+            self.annotations,
+            people_runtimes,
+            target_class_id=target_class_id,
+            confidence_threshold=confidence_threshold,
+            allow_overlap=self.people_allow_overlap,
+            overlap_iou_threshold=self.people_overlap_iou_threshold,
+            model_iou_threshold=self.iou_threshold,
+        )
+
+        added = len(result["new_annotations"])
+        if added > 0:
+            self.annotations.extend(result["new_annotations"])
+            self.annotations_dirty = True
+            self.save_annotations()
+        self.redraw()
+
+        msg = f"People auto-annotate: added {added}"
+        if result["candidate_count"] > 0 and not self.people_allow_overlap:
+            msg += f" (skipped {result['skipped_overlap']} overlaps)"
+        self.status_var.set(msg)
+
+        combined_errors = list(load_errors) + list(result["errors"])
+        if combined_errors:
+            self._warn_people_model_errors(combined_errors, "People Auto-Annotate Warnings")
+
     def load_model(self):
         f = filedialog.askopenfilename(
             filetypes=[
@@ -1675,42 +2558,33 @@ class AnnotatorApp:
         self.root.update()  # Force UI update
         
         try:
-            # Get inference size from combo
-            imgsz_str = self.imgsz_combo.get()
-            imgsz = None if imgsz_str == "Auto" else int(imgsz_str)
-            
-            # Auto-set to 1280 for YOLO26 if user hasn't changed it
             model_ver = self.model_ver_combo.get()
-            if model_ver == "v26" and imgsz_str == "Auto":
-                imgsz = 1280
-                self.imgsz_combo.set("1280")
-                self.status_var.set("YOLO26 detected - using 1280 inference size for best accuracy")
-                self.root.update()
-            
-            # Detect model type based on extension
-            if f.lower().endswith('.pt'):
+            requested_imgsz = self.imgsz_combo.get()
+            if f.lower().endswith(".pt"):
                 self.status_var.set("Loading PyTorch model (this may take a moment)...")
-                self.root.update()
-                
-                from inference import PyTorchYOLOModel
-                self.model = PyTorchYOLOModel(f, imgsz=imgsz)
-                model_type = "PyTorch"
-            elif f.lower().endswith('.tflite'):
-                self.status_var.set("Loading TFLite model...")
-                self.root.update()
-                
-                from inference import TFLiteModel
-                self.model = TFLiteModel(f)
-                model_type = "TFLite"
             else:
-                raise ValueError("Unsupported model format. Use .pt or .tflite")
+                self.status_var.set("Loading TFLite model...")
+            self.root.update()
+
+            runtime = self._load_inference_model_from_path(
+                f,
+                version=model_ver,
+                imgsz_value=requested_imgsz,
+            )
+            self.model = runtime["model"]
+            model_type = runtime["model_type"]
             
             self.model_path_str = f
+            if model_ver == "v26" and requested_imgsz == "Auto" and runtime["resolved_imgsz"] != "Auto":
+                self.imgsz_combo.set(runtime["resolved_imgsz"])
             
             # Show success with imgsz info if applicable
-            imgsz_info = f" (imgsz={imgsz})" if imgsz and model_type == "PyTorch" else ""
+            imgsz_info = ""
+            if model_type == "PyTorch" and runtime["resolved_imgsz"] != "Auto":
+                imgsz_info = f" (imgsz={runtime['resolved_imgsz']})"
             messagebox.showinfo("Loaded", f"{model_type} model loaded successfully!{imgsz_info}\n\n{os.path.basename(f)}")
             self.status_var.set(f"Loaded {model_type} model: {os.path.basename(f)}{imgsz_info}")
+            self.save_config()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load model:\n{str(e)}")
             self.status_var.set("Model loading failed")
@@ -1802,6 +2676,9 @@ class AnnotatorApp:
             train_ratio = train / total
             val_ratio = val / total
             test_ratio = test / total
+
+            if not self._confirm_export_label_compatibility("Export"):
+                return
             
             # Get output file
             f = filedialog.asksaveasfilename(
@@ -2468,14 +3345,20 @@ class AnnotatorApp:
         """Save current annotation state for undo."""
         if not self.current_file_path:
             return
-        
+
+        self._push_annotation_undo_snapshot(self.current_file_path, self.annotations)
+
+    def _push_annotation_undo_snapshot(self, file_path, annotations):
+        if not file_path:
+            return
+
         # Clear redo stack when new action is performed
         self.annotation_redo_stack.clear()
-        
+
         # Deep copy annotations
-        annotations_copy = self._copy_annotations(self.annotations)
-        self.annotation_undo_stack.append((self.current_file_path, annotations_copy))
-        
+        annotations_copy = self._copy_annotations(annotations)
+        self.annotation_undo_stack.append((file_path, annotations_copy))
+
         # Limit stack size
         if len(self.annotation_undo_stack) > self.max_undo_size:
             self.annotation_undo_stack.pop(0)
@@ -2593,13 +3476,16 @@ class AnnotatorApp:
         if names:
             self.file_list.insert(tk.END, *names)
 
-    def _rebuild_after_image_list_change(self, preferred_filtered_index=0):
+    def _rebuild_after_image_list_change(self, preferred_filtered_index=0, preferred_path=None):
         self.image_id_map = {path: i + 1 for i, path in enumerate(self.image_paths)}
         self._build_annotation_cache_and_stats()
         self._refresh_file_list()
 
         if self.filtered_image_paths:
-            next_index = max(0, min(int(preferred_filtered_index), len(self.filtered_image_paths) - 1))
+            if preferred_path and preferred_path in self.filtered_image_paths:
+                next_index = self.filtered_image_paths.index(preferred_path)
+            else:
+                next_index = max(0, min(int(preferred_filtered_index), len(self.filtered_image_paths) - 1))
             self.load_image(next_index)
         else:
             self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=True)
@@ -2733,26 +3619,16 @@ class AnnotatorApp:
     def _resolve_label_format(self, annotations=None):
         annotations = self.annotations if annotations is None else annotations
         mode = self.save_format_mode.get()
-        resolved = self._resolve_label_format_value(
+        return self._resolve_label_format_value(
             mode,
             annotations=annotations,
             loaded_label_format=self.loaded_label_format,
         )
-        if mode == LABEL_FORMAT_DETECT and resolved == LABEL_FORMAT_SEGMENT:
-            self.save_format_mode.set(LABEL_FORMAT_SEGMENT)
-            self.status_var.set("Switched save format to Segment so polygon detail is not lost.")
-        return resolved
 
     def _resolve_label_format_value(self, mode, annotations=None, loaded_label_format=None):
-        annotations = self.annotations if annotations is None else annotations
-        has_polygon = any(self._is_polygon_annotation(ann) for ann in annotations)
-        if mode == LABEL_FORMAT_DETECT:
-            return LABEL_FORMAT_SEGMENT if has_polygon else LABEL_FORMAT_DETECT
         if mode == LABEL_FORMAT_SEGMENT:
             return LABEL_FORMAT_SEGMENT
-        if has_polygon:
-            return LABEL_FORMAT_SEGMENT
-        return loaded_label_format or LABEL_FORMAT_DETECT
+        return LABEL_FORMAT_DETECT
 
     def _clamp_annotation(self, ann, min_size=0.001):
         """Clamp a YOLO annotation to valid normalized bounds."""
@@ -3504,6 +4380,9 @@ class AnnotatorApp:
         cid = int(ann[0])
         if cid == self.board_clip_parent_class_id:
             return False
+        if self.board_clip_target_mode == "quick":
+            quick_class_ids = set(self.board_clip_board_class_ids) | set(self.board_clip_stringer_class_ids)
+            return cid in quick_class_ids
         if self.board_clip_target_mode == "boards":
             return cid in set(self.board_clip_board_class_ids)
         if self.board_clip_target_mode == "stringers":
@@ -3529,7 +4408,10 @@ class AnnotatorApp:
         bounds = self._ann_to_bounds(ann)
         if force_extend_to_parent and parent_ann is not None:
             bounds = self._extend_bounds_for_guides(ann)
-        elif (has_guides or has_corner_polygon) and self.board_clip_extend_to_guides:
+        elif has_guides and self.board_clip_extend_to_guides:
+            # Edge guides represent open-ended boundaries, so extension helps boards/stringers
+            # reach the saved lines. For a closed 4-corner polygon, extending first is too
+            # destructive and can wipe or over-expand boxes, so we clip the real box directly.
             bounds = self._extend_bounds_for_guides(ann)
 
         if parent_ann is not None:
@@ -3680,6 +4562,7 @@ class AnnotatorApp:
             self.status_var.set("Load an image before auto-generating a pallet segmentation")
             return
 
+        self._ensure_segment_dataset_mode("auto pallet segmentation")
         generated_annotations, info = self._build_auto_pallet_segment_annotations(self.annotations)
         new_annotations, changed, replaced_count = self._replace_annotations_for_class(
             self.annotations,
@@ -3718,6 +4601,7 @@ class AnnotatorApp:
         if not self._validate_auto_board_cluster_target():
             return
 
+        self._ensure_segment_dataset_mode("auto BoardCluster")
         generated_annotations, info = self._build_auto_board_cluster_annotations(self.annotations)
         new_annotations, changed, replaced_count = self._replace_annotations_for_class(
             self.annotations,
@@ -3854,6 +4738,7 @@ class AnnotatorApp:
             self.status_var.set("Load a workspace before running an auto segmentation dataset action")
             return None
 
+        self._ensure_segment_dataset_mode(action_label)
         if self.current_image and self.current_file_path and self.annotations_dirty:
             self.save_annotations(force=True)
 
@@ -4215,18 +5100,231 @@ class AnnotatorApp:
             self.loaded_label_format = detected_format
         return annotations
 
+    def _save_current_annotations_if_dirty(self):
+        if self.current_image and self.current_file_path and self.annotations_dirty:
+            self.save_annotations(force=True)
+
+    def _classify_annotation_collection_format(self, annotations):
+        has_detect = False
+        has_segment = False
+
+        for ann in annotations:
+            if self._is_polygon_annotation(ann):
+                has_segment = True
+            else:
+                has_detect = True
+            if has_detect and has_segment:
+                return "mixed"
+
+        if has_segment:
+            return LABEL_FORMAT_SEGMENT
+        if has_detect:
+            return LABEL_FORMAT_DETECT
+        return "empty"
+
+    def _get_workspace_label_paths(self):
+        if not self.workspace_path:
+            return []
+
+        label_paths = self._collect_label_paths_for_dataset_settings()
+        seen = {os.path.normcase(os.path.normpath(path)) for path in label_paths}
+        for img_path in self.image_paths:
+            read_path = self._get_label_read_path(img_path)
+            norm = os.path.normcase(os.path.normpath(read_path))
+            if norm not in seen and os.path.exists(read_path):
+                seen.add(norm)
+                label_paths.append(read_path)
+
+        label_paths.sort(key=lambda path: os.path.basename(path).lower())
+        return label_paths
+
+    def _scan_workspace_label_formats(self):
+        return self._scan_label_paths(self._get_workspace_label_paths())
+
+    def _dataset_format_label(self, dataset_format):
+        if dataset_format == LABEL_FORMAT_DETECT:
+            return "Detect"
+        if dataset_format == LABEL_FORMAT_SEGMENT:
+            return "Segment"
+        if dataset_format == "mixed":
+            return "Mixed"
+        return "Empty / None"
+
+    def _format_dataset_label_summary(self, summary):
+        lines = [
+            f"Locked dataset type: {self._dataset_format_label(self.dataset_label_format)}",
+            "",
+            f"Dataset label type: {self._dataset_format_label(summary['dataset_format'])}",
+            "",
+            f"Label files scanned: {summary['total_files']}",
+            f"Labeled files: {summary['labeled_files']}",
+            f"Detect-only files: {summary['detect_files']}",
+            f"Segment-only files: {summary['segment_files']}",
+            f"Mixed files: {summary['mixed_files']}",
+            f"Empty/invalid files: {summary['empty_files']}",
+            f"Detect annotations: {summary['detect_annotations']}",
+            f"Segment annotations: {summary['segment_annotations']}",
+        ]
+
+        if summary["segment_examples"]:
+            lines.append("")
+            lines.append("Segment examples: " + ", ".join(summary["segment_examples"]))
+        if summary["mixed_examples"]:
+            lines.append("")
+            lines.append("Mixed examples: " + ", ".join(summary["mixed_examples"]))
+
+        return "\n".join(lines)
+
+    def show_dataset_label_type_dialog(self):
+        if not self.workspace_path:
+            messagebox.showerror("Error", "No workspace loaded.")
+            return
+
+        self._save_current_annotations_if_dirty()
+        self.status_var.set("Checking dataset label type...")
+        self.root.update_idletasks()
+
+        summary = self._scan_workspace_label_formats()
+        messagebox.showinfo("Dataset Label Type", self._format_dataset_label_summary(summary))
+        self.status_var.set(f"Dataset label type: {self._dataset_format_label(summary['dataset_format'])}")
+
+    def _confirm_export_label_compatibility(self, export_name):
+        self._save_current_annotations_if_dirty()
+        summary = self._scan_workspace_label_formats()
+        dataset_format = summary["dataset_format"]
+
+        if dataset_format in (LABEL_FORMAT_DETECT, "empty"):
+            return True
+
+        warning_intro = (
+            "This dataset mixes detect and segment labels."
+            if dataset_format == "mixed"
+            else "This dataset currently uses segmentation labels."
+        )
+
+        proceed = messagebox.askyesno(
+            f"{export_name} Warning",
+            f"{warning_intro}\n\n"
+            "This export will keep segmentation rows as-is, which can look wrong in detect-only tools.\n\n"
+            "Use 'Seg -> Detect' first if you want every label saved as a standard YOLO detect box.\n\n"
+            "Continue exporting anyway?\n\n"
+            f"{self._format_dataset_label_summary(summary)}",
+        )
+        if not proceed:
+            self.status_var.set(f"{export_name} canceled because segmentation labels were detected")
+        return proceed
+
+    def convert_dataset_segment_labels_to_detect(self):
+        if not self.workspace_path:
+            messagebox.showerror("Error", "No workspace loaded.")
+            return
+
+        self._save_current_annotations_if_dirty()
+        summary = self._scan_workspace_label_formats()
+
+        if summary["segment_annotations"] == 0:
+            messagebox.showinfo(
+                "Seg -> Detect",
+                "No segmentation labels were found.\n\n" + self._format_dataset_label_summary(summary),
+            )
+            self.status_var.set("No segmentation labels found to convert")
+            return
+
+        files_with_segments = summary["segment_files"] + summary["mixed_files"]
+        if not messagebox.askyesno(
+            "Convert Segment Labels To Detect",
+            f"This will rewrite every segmentation label row as a YOLO detect box across {files_with_segments} file(s).\n\n"
+            "Polygon detail will be lost, but the files will become detect-compatible.\n"
+            "Backups are saved in .annotator_backups next to each label file.\n\n"
+            "Proceed?\n\n"
+            f"{self._format_dataset_label_summary(summary)}",
+        ):
+            return
+
+        label_paths = summary["label_paths"]
+        current_path = self.current_file_path
+        current_index_snapshot = self.current_index
+
+        progress = tb.Toplevel(self.root)
+        progress.title("Convert Segment Labels To Detect")
+        progress.geometry("460x140")
+        progress.transient(self.root)
+        progress.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        pb = tb.Progressbar(progress, maximum=max(1, len(label_paths)))
+        pb.pack(fill=X, padx=20, pady=(20, 8))
+        status_lbl = tb.Label(progress, text="Starting...", font=("Consolas", 9))
+        status_lbl.pack(pady=4)
+
+        files_converted = 0
+        annotations_converted = 0
+        errors = []
+
+        for idx, lbl_path in enumerate(label_paths, start=1):
+            try:
+                annotations = self._load_annotations_from_file(lbl_path)
+                converted_annotations = []
+                file_changed = False
+                file_segment_count = 0
+
+                for ann in annotations:
+                    base_ann = self._clamp_annotation(ann[:5])
+                    if self._is_polygon_annotation(ann):
+                        file_changed = True
+                        file_segment_count += 1
+                    converted_annotations.append(base_ann)
+
+                if file_changed:
+                    self._write_annotations_atomically(lbl_path, converted_annotations, LABEL_FORMAT_DETECT)
+                    files_converted += 1
+                    annotations_converted += file_segment_count
+            except Exception as exc:
+                errors.append(f"{os.path.basename(lbl_path)}: {exc}")
+
+            pb["value"] = idx
+            status_lbl.config(text=f"Processed {idx}/{len(label_paths)}  |  converted {files_converted}")
+            if idx % 25 == 0 or idx == len(label_paths):
+                progress.update_idletasks()
+
+        progress.destroy()
+
+        self._set_dataset_label_format(LABEL_FORMAT_DETECT, persist=True, update_ui=True)
+        self.annotation_mode.set(ANNOTATION_MODE_BOX)
+        self._build_annotation_cache_and_stats()
+        if current_path and current_path in self.filtered_image_paths:
+            self.load_image(self.filtered_image_paths.index(current_path))
+        elif self.filtered_image_paths:
+            self.load_image(min(current_index_snapshot, len(self.filtered_image_paths) - 1))
+
+        result_summary = self._scan_workspace_label_formats()
+        result_message = (
+            f"Converted {annotations_converted} segmentation annotation(s) across {files_converted} file(s).\n\n"
+            f"{self._format_dataset_label_summary(result_summary)}"
+        )
+        if errors:
+            result_message += f"\n\nErrors: {len(errors)}"
+            if len(errors) <= 5:
+                result_message += "\n" + "\n".join(errors)
+            else:
+                result_message += "\n" + "\n".join(errors[:5]) + f"\n... and {len(errors) - 5} more"
+        messagebox.showinfo(
+            "Conversion Complete",
+            result_message,
+        )
+        self.status_var.set(
+            f"Converted {annotations_converted} segmentation annotation(s) across {files_converted} file(s)"
+        )
+
     def on_filter_changed(self, event):
-        # Save before list changes/invalidation
-        if self.current_image:
-            self.save_annotations()
-            self.current_image = None # Prevent load_image from saving to wrong index/file
-            self.current_file_path = None
-
-
         # Snapshot current path to try and keep it selected
         current_path = None
         if 0 <= self.current_index < len(self.filtered_image_paths):
             current_path = self.filtered_image_paths[self.current_index]
+
+        # Save before list changes/invalidation
+        if self.current_image:
+            self.save_annotations()
+        self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=False)
 
         val = self.filter_combo.get()
         self.filter_mode = val
@@ -4237,21 +5335,7 @@ class AnnotatorApp:
         
         # Rebuild cache to ensure filter uses fresh annotation data
         # This is crucial for filters like "Unannotated" and "Missing: X" to work correctly
-        self._build_annotation_cache_and_stats()
-        
-        self._refresh_file_list()
-        
-        # Restore selection or default to 0
-        new_index = 0
-        if current_path and current_path in self.filtered_image_paths:
-            new_index = self.filtered_image_paths.index(current_path)
-        
-        # Only load if we have images
-        if self.filtered_image_paths:
-             self.load_image(new_index)
-        else:
-             # Clear loaded image state if no matches
-             self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=False)
+        self._rebuild_after_image_list_change(preferred_filtered_index=0, preferred_path=current_path)
 
     def on_file_selected(self, event):
         sel = self.file_list.curselection()
@@ -4731,6 +5815,7 @@ class AnnotatorApp:
             if self.pending_segment_points:
                 self.status_var.set("Need at least 3 points to close a segmentation polygon")
             return
+        self._ensure_segment_dataset_mode("manual segmentation")
         new_ann = self._make_polygon_annotation(self.selected_class_id, self.pending_segment_points)
         if new_ann is None:
             self.status_var.set("Could not create polygon from the selected points")
@@ -5293,6 +6378,13 @@ class AnnotatorApp:
             # Verify image can be loaded by accessing pixel data
             self.current_image.load()
             self.current_file_path = path # Update this ONLY after successful load
+            self.annotations = []
+            self.selected_annotations.clear()
+            self.active_annotation_index = -1
+            self.active_vertex_index = None
+            self.photo_image = None
+            self.photo_cache_key = None
+            self.photo_cache_image = None
         except Exception as e:
             self.status_var.set(f"Error loading {os.path.basename(path)}: {str(e)}")
             # Clear state to avoid mismatch
@@ -5313,8 +6405,6 @@ class AnnotatorApp:
 
         
         # Load Labels - clear selection since indices change
-        self.annotations = []
-        self.selected_annotations.clear()  # Clear selection when changing images
         read_path = self._get_label_read_path(path)
         
         if os.path.exists(read_path):
@@ -6563,6 +7653,8 @@ class AnnotatorApp:
                 return
 
             corners = self._order_polygon_clockwise(self.board_clip_corner_draft[:4])
+            undo_file_path = self.current_file_path
+            undo_annotations = self._copy_annotations(self.annotations)
             self._set_board_clip_corners_for_image(corners)
             self._cancel_board_clip_guide_draw()
             parent_changed, _ = self._sync_board_clip_parent_to_current_corners(push_undo=not quick_mode, save=not quick_mode, redraw=False)
@@ -6571,24 +7663,24 @@ class AnnotatorApp:
 
             if quick_mode:
                 previous_annotations = self._copy_annotations(self.annotations)
-                new_annotations, stats = self._apply_board_clip_constraints(self.annotations, img_path=self.current_file_path)
+                new_annotations, stats = self._run_with_board_clip_target_mode(
+                    "quick",
+                    lambda: self._apply_board_clip_constraints(self.annotations, img_path=self.current_file_path),
+                )
                 fit_changed = (
                     len(new_annotations) != len(previous_annotations) or
                     any(self._annotation_differs(old, new) for old, new in zip(previous_annotations, new_annotations))
                 )
 
                 if parent_changed or fit_changed:
-                    if parent_changed:
-                        self._push_annotation_undo()
-                    elif fit_changed:
-                        self._push_annotation_undo()
+                    self._push_annotation_undo_snapshot(undo_file_path, undo_annotations)
                     self.annotations = new_annotations
                     self.annotations_dirty = True
                     self.save_annotations()
                     self.redraw()
 
                 if fit_changed:
-                    msg = f"Pallet corners saved; pallet box {'updated' if parent_changed else 'confirmed'}; fitted {self._board_clip_target_summary()}"
+                    msg = f"Pallet corners saved; pallet box {'updated' if parent_changed else 'confirmed'}; fitted {self._board_clip_target_summary('quick')}"
                     if stats["clipped"] > 0:
                         msg += f" ({stats['clipped']} adjusted"
                         if stats["removed"] > 0:
@@ -6645,7 +7737,7 @@ class AnnotatorApp:
             quick_apply = quick_mode and slot == 1
             self.board_clip_quick_draw = False
             if quick_apply:
-                self._apply_board_clip_to_current_annotations()
+                self._run_with_board_clip_target_mode("quick", self._apply_board_clip_to_current_annotations)
                 return
 
             self.status_var.set(f"Board clip edge {slot + 1} saved")
@@ -7079,6 +8171,8 @@ class AnnotatorApp:
 
     def _board_clip_target_summary(self, mode=None):
         mode = mode or self.board_clip_target_mode
+        if mode == "quick":
+            return "configured board/stringer annotations"
         if mode == "boards":
             return f"board classes {self._format_board_clip_class_id_summary(self.board_clip_board_class_ids)} only"
         if mode == "stringers":
@@ -7413,7 +8507,7 @@ class AnnotatorApp:
 
         tb.Checkbutton(frame, text="Use saved corners or edges when available", variable=vars_map["use_guides"],
                        command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(8, 4))
-        tb.Checkbutton(frame, text="Extend boxes to guides instead of only clipping", variable=vars_map["extend_to_guides"],
+        tb.Checkbutton(frame, text="Extend boxes to saved edges instead of only clipping", variable=vars_map["extend_to_guides"],
                        command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(0, 4))
         tb.Checkbutton(frame, text="Show saved pallet guides on canvas", variable=vars_map["show_guides"],
                        command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(0, 10))
@@ -7457,6 +8551,215 @@ class AnnotatorApp:
 
         dlg.protocol("WM_DELETE_WINDOW", close_dialog)
         self._refresh_board_clip_dialog_state()
+
+    def auto_annotate_people_all(self):
+        if not self.image_paths:
+            messagebox.showerror("No Images", "Load a workspace or image folder first.")
+            return
+
+        model_entries, missing_paths = self._active_people_model_entries()
+        if missing_paths:
+            self._warn_people_model_errors(
+                [f"Missing model file: {path}" for path in missing_paths],
+                "Missing People Models",
+            )
+        if not model_entries:
+            messagebox.showerror(
+                "No People Models",
+                "No enabled people models are available.\n\nFix the saved model paths or add a new people model first.",
+            )
+            return
+
+        if self.current_image and self.current_file_path and self.annotations_dirty:
+            self.save_annotations(force=True)
+
+        image_paths = list(self.image_paths)
+        target_class_id = self._resolved_people_target_class_id()
+        target_confidence = self.class_confidence_thresholds.get(
+            target_class_id,
+            self.default_confidence_threshold,
+        )
+        allow_overlap = self.people_allow_overlap
+        overlap_iou_threshold = self.people_overlap_iou_threshold
+        model_iou_threshold = self.iou_threshold
+        save_format_mode_snapshot = self.save_format_mode.get()
+
+        top = tb.Toplevel(self.root)
+        top.title("People Auto Annotating...")
+        top.geometry("500x170")
+        top.transient(self.root)
+        top.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        pb = tb.Progressbar(top, maximum=len(image_paths))
+        pb.pack(fill=X, padx=20, pady=(20, 6))
+        lbl_status = tb.Label(top, text="Loading people models...", font=("Consolas", 9))
+        lbl_status.pack(pady=2)
+        lbl_speed = tb.Label(top, text="", font=("Arial", 8), foreground="#888")
+        lbl_speed.pack(pady=0)
+
+        cancel_flag = {"cancelled": False}
+
+        def on_cancel_batch():
+            cancel_flag["cancelled"] = True
+            cancel_btn.config(state="disabled", text="Cancelling...")
+
+        cancel_btn = tb.Button(top, text="Cancel", command=on_cancel_batch, bootstyle="danger-outline", width=14)
+        cancel_btn.pack(pady=10)
+
+        progress = {
+            "i": 0,
+            "cnt": 0,
+            "candidate_count": 0,
+            "unchanged_images": 0,
+            "skipped_overlap": 0,
+            "done": False,
+            "error": None,
+            "start_time": time.time(),
+            "model_errors": [],
+        }
+
+        def add_error(message):
+            text = str(message).strip()
+            if text and text not in progress["model_errors"]:
+                progress["model_errors"].append(text)
+
+        def worker():
+            cnt = 0
+            candidate_count = 0
+            unchanged_images = 0
+            skipped_overlap = 0
+            local_cache = {}
+
+            people_runtimes, load_errors = self._load_people_model_runtimes(model_entries, cache=local_cache)
+            for error in load_errors:
+                add_error(error)
+            if not people_runtimes:
+                progress["error"] = "No enabled people models could be loaded."
+                progress["done"] = True
+                return
+
+            for i, p in enumerate(image_paths):
+                if cancel_flag["cancelled"]:
+                    break
+
+                try:
+                    existing_anns, lbl = self._load_annotations_for_image_path(p)
+                    existing_format = (
+                        LABEL_FORMAT_SEGMENT
+                        if any(self._is_polygon_annotation(ann) for ann in existing_anns)
+                        else LABEL_FORMAT_DETECT
+                    )
+
+                    img_bgr = cv2.imread(p)
+                    if img_bgr is None:
+                        pil_img = Image.open(p)
+                        img_arr = np.array(pil_img)
+                    else:
+                        img_arr = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+                    result = self._collect_people_annotations_for_image(
+                        img_arr,
+                        existing_anns,
+                        people_runtimes,
+                        target_class_id=target_class_id,
+                        confidence_threshold=target_confidence,
+                        allow_overlap=allow_overlap,
+                        overlap_iou_threshold=overlap_iou_threshold,
+                        model_iou_threshold=model_iou_threshold,
+                    )
+
+                    candidate_count += result["candidate_count"]
+                    skipped_overlap += result["skipped_overlap"]
+                    for error in result["errors"]:
+                        add_error(error)
+
+                    if result["new_annotations"]:
+                        label_format = self._resolve_label_format_value(
+                            save_format_mode_snapshot,
+                            annotations=result["working_annotations"],
+                            loaded_label_format=existing_format,
+                        )
+                        self._write_annotations_atomically(lbl, result["working_annotations"], label_format)
+                        cnt += len(result["new_annotations"])
+                    else:
+                        unchanged_images += 1
+                except Exception as exc:
+                    add_error(f"{os.path.basename(p)}: {exc}")
+                    unchanged_images += 1
+
+                progress["i"] = i + 1
+                progress["cnt"] = cnt
+                progress["candidate_count"] = candidate_count
+                progress["unchanged_images"] = unchanged_images
+                progress["skipped_overlap"] = skipped_overlap
+
+            progress["i"] = min(progress["i"], len(image_paths))
+            progress["cnt"] = cnt
+            progress["candidate_count"] = candidate_count
+            progress["unchanged_images"] = unchanged_images
+            progress["skipped_overlap"] = skipped_overlap
+            progress["done"] = True
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        def poll_progress():
+            processed = progress["i"]
+            total = len(image_paths)
+            pb["value"] = processed
+            lbl_status.config(
+                text=(
+                    f"Processed {processed}/{total}  |  "
+                    f"added {progress['cnt']} people boxes"
+                )
+            )
+
+            elapsed = time.time() - progress["start_time"]
+            if processed > 0 and elapsed > 0:
+                ips = processed / elapsed
+                remaining = (total - processed) / ips if ips > 0 else 0
+                mins, secs = divmod(int(remaining), 60)
+                lbl_speed.config(text=f"{ips:.1f} img/sec  |  ~{mins}m {secs}s remaining")
+
+            if progress["done"] or cancel_flag["cancelled"]:
+                thread.join(timeout=2)
+                top.destroy()
+
+                if progress["error"]:
+                    messagebox.showerror("People Auto-Annotate Failed", progress["error"])
+                    self.status_var.set("People auto-annotate failed")
+                    return
+
+                msg = f"People batch done: added {progress['cnt']} boxes"
+                if progress["candidate_count"] > 0 and not allow_overlap:
+                    msg += f", skipped {progress['skipped_overlap']} overlaps"
+                if progress["unchanged_images"] > 0:
+                    msg += f", {progress['unchanged_images']} images unchanged"
+                if cancel_flag["cancelled"]:
+                    msg = (
+                        f"People batch cancelled: added {progress['cnt']} boxes "
+                        f"({progress['i']}/{total} processed)"
+                    )
+                current_path = self.current_file_path
+                preferred_index = self.current_index
+
+                self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=False)
+                self._rebuild_after_image_list_change(
+                    preferred_filtered_index=preferred_index,
+                    preferred_path=current_path,
+                )
+                self.status_var.set(msg)
+
+                if progress["model_errors"]:
+                    self._warn_people_model_errors(
+                        progress["model_errors"],
+                        "People Auto-Annotate Warnings",
+                    )
+                return
+
+            top.after(100, poll_progress)
+
+        poll_progress()
 
     def auto_annotate_current(self):
         """Auto-annotate the current image with class selection dialog."""
@@ -7823,12 +9126,12 @@ class AnnotatorApp:
                 thread.join(timeout=2)
                 top.destroy()
                 
-                self._build_annotation_cache()
-                
                 cnt = progress['cnt']
                 skipped_dupes = progress['skipped_dupes']
                 skipped_images = progress['skipped_images']
                 skipped_clip = progress['skipped_clip']
+                current_path = self.current_file_path
+                preferred_index = self.current_index
                 
                 if cancel_flag['cancelled']:
                     msg = f"Cancelled: Added {cnt} annotations ({progress['i']}/{total} processed)"
@@ -7840,16 +9143,14 @@ class AnnotatorApp:
                     msg += f", clip skipped {skipped_clip}"
                 if skipped_images > 0:
                     msg += f", {skipped_images} images unchanged"
-                self.status_var.set(msg)
-                
                 # Clear current image state so load_image doesn't save stale
                 # in-memory annotations back to disk (overwriting worker's results)
-                self.current_image = None
-                self.current_file_path = None
-                self.annotations = []
-                self.annotations_dirty = False
-                
-                self.load_image(self.current_index)
+                self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=False)
+                self._rebuild_after_image_list_change(
+                    preferred_filtered_index=preferred_index,
+                    preferred_path=current_path,
+                )
+                self.status_var.set(msg)
                 return
             
             # Poll again in 100ms
@@ -9308,6 +10609,8 @@ class AnnotatorApp:
             if not matches:
                 messagebox.showinfo("No Matches", "No images match the query.")
                 return
+            self._save_current_annotations_if_dirty()
+            self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=False)
             
             # Save query conditions for re-opening dialog later
             self.last_query_conditions = []
@@ -9327,11 +10630,7 @@ class AnnotatorApp:
             self.filter_combo.set("🔍 Query Active")
             
             # Use standard refresh to populate the list
-            self._refresh_file_list()
-            
-            # Load first match
-            if self.filtered_image_paths:
-                self.load_image(0)
+            self._rebuild_after_image_list_change(preferred_filtered_index=0)
             
             self.status_var.set(f"🔍 Query: Showing {len(matches)} matching images")
             dialog.destroy()
@@ -9470,6 +10769,9 @@ class AnnotatorApp:
             
             as_zip = fmt_var.get() == "zip"
             include_neg = neg_var.get()
+
+            if not self._confirm_export_label_compatibility("320 Export"):
+                return
             
             # --- Choose output path ---
             if as_zip:
