@@ -28,6 +28,7 @@ LABEL_FORMAT_SEGMENT = "segment"
 LABEL_BACKUP_DIR = ".annotator_backups"
 DATASET_SETTINGS_FILE = ".annotator_dataset.json"
 AUTO_PALLET_CLASS_ID = 0
+CURRENT_BOARD_CLIP_HISTORY_REGION = "__CURRENT_BOARD_CLIP_HISTORY_REGION__"
 
 class AnnotatorApp:
     def __init__(self, root):
@@ -103,8 +104,8 @@ class AnnotatorApp:
         self.deleted_files_stack = []  # List of (image_path, label_path, image_data, label_data)
         
         # Undo stack for annotation changes (moves, clears, etc.)
-        self.annotation_undo_stack = []  # List of (file_path, annotations_copy)
-        self.annotation_redo_stack = []  # List of (file_path, annotations_copy) for redo
+        self.annotation_undo_stack = []  # List of (file_path, snapshot)
+        self.annotation_redo_stack = []  # List of (file_path, snapshot) for redo
         self.max_undo_size = 50  # Limit undo memory
         
         # Multi-selection for repeat function (Ctrl+Click)
@@ -168,8 +169,14 @@ class AnnotatorApp:
         self.board_clip_extend_scope = "all"  # all, stringers
         self.board_clip_use_guides = True
         self.board_clip_extend_to_guides = True
+        self.board_clip_remove_outside = True
         self.board_clip_apply_to_auto_annotations = False
+        self.board_clip_quick_apply_on_corners = True
+        self.board_clip_quick_sync_parent = True
+        self.board_clip_quick_adjust_boards = True
+        self.board_clip_quick_adjust_stringers = True
         self.board_clip_guides_visible = tk.BooleanVar(value=True)
+        self.board_clip_corner_guides_visible = tk.BooleanVar(value=True)
         self.board_clip_extend_scope_var = tk.StringVar(value=self.board_clip_extend_scope)
         self.board_clip_guides = {}  # Map: image key -> {"edges": [...], "corners": [...]}
         self.board_clip_draw_mode = None  # None, "edges", or "corners"
@@ -178,12 +185,23 @@ class AnnotatorApp:
         self.board_clip_draw_preview_id = None
         self.board_clip_quick_draw = False
         self.board_clip_corner_draft = []
+        self.board_clip_batch_mode = False
+        self.board_clip_batch_paths = []
+        self.board_clip_batch_cursor = -1
+        self.board_clip_batch_total = 0
+        self.board_clip_batch_captured_count = 0
+        self.board_clip_batch_processed = 0
+        self.board_clip_batch_pending_jobs = []
+        self.board_clip_batch_job_after_id = None
+        self.board_clip_batch_needs_cache_refresh = False
         self.board_clip_dialog = None
         self.board_clip_dialog_vars = {}
         self.board_clip_parent_combo = None
         self.board_clip_target_combo = None
         self.board_clip_board_btn = None
         self.board_clip_stringer_btn = None
+        self.board_clip_batch_btn = None
+        self.board_clip_batch_dialog_btn = None
         self.board_cluster_class_id = 3
         self.board_cluster_expected_count = 1
         self.board_cluster_expected_count_var = tk.StringVar(value=str(self.board_cluster_expected_count))
@@ -318,8 +336,14 @@ class AnnotatorApp:
             self.board_clip_extend_scope_var.set(self.board_clip_extend_scope)
             self.board_clip_use_guides = bool(cfg.get("board_clip_use_guides", self.board_clip_use_guides))
             self.board_clip_extend_to_guides = bool(cfg.get("board_clip_extend_to_guides", self.board_clip_extend_to_guides))
+            self.board_clip_remove_outside = bool(cfg.get("board_clip_remove_outside", self.board_clip_remove_outside))
             self.board_clip_apply_to_auto_annotations = bool(cfg.get("board_clip_apply_to_auto_annotations", self.board_clip_apply_to_auto_annotations))
+            self.board_clip_quick_apply_on_corners = bool(cfg.get("board_clip_quick_apply_on_corners", self.board_clip_quick_apply_on_corners))
+            self.board_clip_quick_sync_parent = bool(cfg.get("board_clip_quick_sync_parent", self.board_clip_quick_sync_parent))
+            self.board_clip_quick_adjust_boards = bool(cfg.get("board_clip_quick_adjust_boards", self.board_clip_quick_adjust_boards))
+            self.board_clip_quick_adjust_stringers = bool(cfg.get("board_clip_quick_adjust_stringers", self.board_clip_quick_adjust_stringers))
             self.board_clip_guides_visible.set(bool(cfg.get("board_clip_guides_visible", self.board_clip_guides_visible.get())))
+            self.board_clip_corner_guides_visible.set(bool(cfg.get("board_clip_corner_guides_visible", self.board_clip_corner_guides_visible.get())))
             if hasattr(self, "board_clip_auto_apply_var") and self.board_clip_auto_apply_var is not None:
                 self.board_clip_auto_apply_var.set(self.board_clip_apply_to_auto_annotations)
             self._refresh_board_clip_parent_ui()
@@ -358,8 +382,14 @@ class AnnotatorApp:
             "board_clip_extend_scope": self.board_clip_extend_scope,
             "board_clip_use_guides": self.board_clip_use_guides,
             "board_clip_extend_to_guides": self.board_clip_extend_to_guides,
+            "board_clip_remove_outside": self.board_clip_remove_outside,
             "board_clip_apply_to_auto_annotations": self.board_clip_apply_to_auto_annotations,
+            "board_clip_quick_apply_on_corners": self.board_clip_quick_apply_on_corners,
+            "board_clip_quick_sync_parent": self.board_clip_quick_sync_parent,
+            "board_clip_quick_adjust_boards": self.board_clip_quick_adjust_boards,
+            "board_clip_quick_adjust_stringers": self.board_clip_quick_adjust_stringers,
             "board_clip_guides_visible": self.board_clip_guides_visible.get(),
+            "board_clip_corner_guides_visible": self.board_clip_corner_guides_visible.get(),
             "zoom_lock": self.zoom_lock.get(),
         }
         if hasattr(self, 'model_path_str'):
@@ -670,7 +700,8 @@ class AnnotatorApp:
         key = self._board_clip_image_key(img_path)
         entry = self.board_clip_guides.get(key, {"edges": [], "corners": []})
         cleaned = []
-        for point in corners[:4]:
+        fitted_corners = self._fit_board_clip_corners_to_oriented_box(corners)
+        for point in fitted_corners[:4]:
             if not isinstance(point, (list, tuple)) or len(point) != 2:
                 continue
             px, py = [max(0.0, min(1.0, float(v))) for v in point]
@@ -690,6 +721,53 @@ class AnnotatorApp:
             return
         self.board_clip_guides.pop(self._board_clip_image_key(img_path), None)
 
+        self._save_board_clip_guides()
+
+    def _copy_board_clip_region_snapshot(self, img_path=None):
+        img_path = img_path or self.current_file_path
+        if not img_path:
+            return None
+
+        key = self._board_clip_image_key(img_path)
+        entry = self.board_clip_guides.get(key)
+        if not entry:
+            return None
+
+        return {
+            "edges": [list(guide) for guide in entry.get("edges", [])[:2]],
+            "corners": [list(point) for point in entry.get("corners", [])[:4]],
+        }
+
+    def _clone_board_clip_region_snapshot(self, snapshot):
+        if not snapshot:
+            return None
+        return {
+            "edges": [list(guide) for guide in snapshot.get("edges", [])[:2]],
+            "corners": [list(point) for point in snapshot.get("corners", [])[:4]],
+        }
+
+    def _restore_board_clip_region_snapshot(self, img_path, snapshot):
+        if not img_path:
+            return
+
+        key = self._board_clip_image_key(img_path)
+        if not snapshot:
+            self.board_clip_guides.pop(key, None)
+            self._save_board_clip_guides()
+            return
+
+        cleaned = {"edges": [], "corners": []}
+        for guide in snapshot.get("edges", [])[:2]:
+            if isinstance(guide, (list, tuple)) and len(guide) == 4:
+                cleaned["edges"].append([max(0.0, min(1.0, float(v))) for v in guide])
+        for point in snapshot.get("corners", [])[:4]:
+            if isinstance(point, (list, tuple)) and len(point) == 2:
+                cleaned["corners"].append([max(0.0, min(1.0, float(v))) for v in point])
+
+        if cleaned["edges"] or cleaned["corners"]:
+            self.board_clip_guides[key] = cleaned
+        else:
+            self.board_clip_guides.pop(key, None)
         self._save_board_clip_guides()
 
     def on_close(self):
@@ -839,9 +917,9 @@ class AnnotatorApp:
         # Settings button
         tb.Button(model_frame, text="⚙ Confidence & IOU Settings", command=self.show_annotation_settings, bootstyle="info").pack(fill=X, pady=1)
 
-        tb.Button(model_frame, text="Pallet Fit Settings", command=self.show_board_clip_dialog, bootstyle="secondary").pack(fill=X, pady=1)
+        tb.Button(model_frame, text="Pallet Fit Options", command=self.show_board_clip_dialog, bootstyle="secondary").pack(fill=X, pady=1)
 
-        clip_frame = tb.Labelframe(model_frame, text="Fit To Pallet", padding=8)
+        clip_frame = tb.Labelframe(model_frame, text="Pallet Fit", padding=8)
         clip_frame.pack(fill=X, pady=(4, 1))
 
         clip_class_row = tb.Frame(clip_frame)
@@ -853,7 +931,7 @@ class AnnotatorApp:
 
         clip_target_row = tb.Frame(clip_frame)
         clip_target_row.pack(fill=X, pady=(0, 4))
-        tb.Label(clip_target_row, text="Adjust:").pack(side=LEFT)
+        tb.Label(clip_target_row, text="Manual fit:").pack(side=LEFT)
         self.board_clip_target_combo = tb.Combobox(clip_target_row, state="readonly", width=18)
         self.board_clip_target_combo.pack(side=RIGHT, fill=X, expand=True)
         self.board_clip_target_combo.bind("<<ComboboxSelected>>", self.on_board_clip_target_changed)
@@ -871,12 +949,30 @@ class AnnotatorApp:
         tb.Label(clip_frame, text="Guides", font=("Arial", 9, "bold"), foreground="#888").pack(anchor=W, pady=(2, 2))
         clip_guide_row = tb.Frame(clip_frame)
         clip_guide_row.pack(fill=X, pady=1)
-        self.board_clip_draw_btn = tb.Button(clip_guide_row, text="Draw 4 Corners (B)", command=self.start_quick_board_clip_corners, bootstyle="warning")
+        self.board_clip_draw_btn = tb.Button(clip_guide_row, text="4 Corners (B)", command=self.start_quick_board_clip_corners, bootstyle="warning")
         self.board_clip_draw_btn.pack(side=LEFT, expand=True, fill=X, padx=(0, 1))
-        self.board_clip_edge_btn = tb.Button(clip_guide_row, text="2 Edge Fallback (Shift+B)", command=self.start_quick_board_clip_guides, bootstyle="info")
+        self.board_clip_edge_btn = tb.Button(clip_guide_row, text="2-Edge Fallback", command=self.start_quick_board_clip_guides, bootstyle="info")
         self.board_clip_edge_btn.pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
 
-        tb.Label(clip_frame, text="Box Extend Scope", font=("Arial", 9, "bold"), foreground="#888").pack(anchor=W, pady=(6, 2))
+        clip_batch_row = tb.Frame(clip_frame)
+        clip_batch_row.pack(fill=X, pady=(2, 0))
+        self.board_clip_batch_btn = tb.Button(
+            clip_batch_row,
+            text=self._board_clip_batch_button_text(),
+            command=self.start_quick_board_clip_corners_batch,
+            bootstyle="warning-outline",
+        )
+        self.board_clip_batch_btn.pack(fill=X)
+
+        tb.Checkbutton(
+            clip_frame,
+            text="Show saved 4-point dots + dotted outline",
+            variable=self.board_clip_corner_guides_visible,
+            command=self.on_board_clip_corner_guides_visibility_changed,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=(4, 0))
+
+        tb.Label(clip_frame, text="X / Alt+X Target", font=("Arial", 9, "bold"), foreground="#888").pack(anchor=W, pady=(6, 2))
         clip_extend_scope_row = tb.Frame(clip_frame)
         clip_extend_scope_row.pack(fill=X, pady=(0, 2))
         tb.Radiobutton(
@@ -982,7 +1078,7 @@ class AnnotatorApp:
 
         tb.Label(
             clip_frame,
-            text="Pick all, boards only, or stringers only for fitting. The auto segment buttons below reuse the pallet class and board classes above, replace the target class safely, and save through the same backup path as manual edits. Hotkeys: X current all, Shift+X current stringers, Alt+X dataset all, Alt+Shift+X dataset stringers.",
+            text="B runs the 4-corner quick fit. Alt+B walks the filtered images from here so you can click 4 corners and jump straight to the next image while the fitting work queues behind you.",
             wraplength=250,
             justify=LEFT,
             font=("Arial", 8),
@@ -1022,6 +1118,9 @@ class AnnotatorApp:
         format_row.pack(fill=X, pady=1)
         tb.Button(format_row, text="Label Type", command=self.show_dataset_label_type_dialog, bootstyle="info", width=10).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
         tb.Button(format_row, text="Seg -> Detect", command=self.convert_dataset_segment_labels_to_detect, bootstyle="warning", width=10).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+        convert_row = tb.Frame(quick_frame)
+        convert_row.pack(fill=X, pady=1)
+        tb.Button(convert_row, text="OBB -> Detect", command=self.convert_dataset_oriented_box_labels_to_detect, bootstyle="warning-outline").pack(fill=X)
 
         # 320 Export row
         export_row = tb.Frame(quick_frame)
@@ -1345,6 +1444,8 @@ class AnnotatorApp:
         self.root.bind("q", lambda e: self.auto_annotate_quick())
         self.root.bind("b", self.start_quick_board_clip_corners)
         self.root.bind("B", self.start_quick_board_clip_guides)
+        self.root.bind_all("<Alt-b>", lambda e: self.start_quick_board_clip_corners_batch())
+        self.root.bind_all("<Alt-B>", lambda e: self.start_quick_board_clip_corners_batch())
         self.root.bind("v", self.apply_board_clip_to_current)
         self.root.bind("x", self.extend_board_clip_to_parent_current)
         self.root.bind("X", self.extend_board_clip_stringers_to_parent_current)
@@ -1815,6 +1916,16 @@ class AnnotatorApp:
             self.board_clip_dialog_vars["stringer_summary"].set(self._format_board_clip_class_id_summary(self.board_clip_stringer_class_ids, include_names=True))
         if self.board_clip_dialog_vars.get("extend_scope") and self.board_clip_dialog_vars["extend_scope"].get() != self.board_clip_extend_scope:
             self.board_clip_dialog_vars["extend_scope"].set(self.board_clip_extend_scope)
+        if self.board_clip_dialog_vars.get("remove_outside"):
+            self.board_clip_dialog_vars["remove_outside"].set(self.board_clip_remove_outside)
+        if self.board_clip_dialog_vars.get("quick_apply"):
+            self.board_clip_dialog_vars["quick_apply"].set(self.board_clip_quick_apply_on_corners)
+        if self.board_clip_dialog_vars.get("quick_sync_parent"):
+            self.board_clip_dialog_vars["quick_sync_parent"].set(self.board_clip_quick_sync_parent)
+        if self.board_clip_dialog_vars.get("quick_adjust_boards"):
+            self.board_clip_dialog_vars["quick_adjust_boards"].set(self.board_clip_quick_adjust_boards)
+        if self.board_clip_dialog_vars.get("quick_adjust_stringers"):
+            self.board_clip_dialog_vars["quick_adjust_stringers"].set(self.board_clip_quick_adjust_stringers)
 
     def on_board_clip_parent_changed(self, event=None):
         if not self.board_clip_parent_combo:
@@ -3211,10 +3322,11 @@ class AnnotatorApp:
   Y           Repeat selected annotations & next
   E           Toggle Edit mode (resize boxes / move polygon points)
   T           Toggle Draw Only mode
-  B           Click 4 pallet corners, refresh pallet box, then auto-fit boards/stringers
-  Shift+B     Draw 2 pallet edges as a straight-pallet fallback
+  B           Click 4 pallet corners, save a rotated fit guide, then auto-adjust boards/stringers
+  Alt+B       4-point all mode from the current filtered image onward
+  Shift+B     Draw 2 pallet edges as a fallback guide
   V           Fit current image inside pallet class
-  X           Extend current image to the pallet box
+  X           Extend current targets to the pallet box
   Shift+X     Extend current stringers only to the pallet box
   Alt+X       Extend dataset to the pallet box
   Alt+Shift+X Extend dataset stringers only to the pallet box
@@ -3246,20 +3358,39 @@ class AnnotatorApp:
         
         tb.Button(dlg, text="Close", command=dlg.destroy, bootstyle="secondary").pack(pady=10)
 
+    def _make_annotation_history_snapshot(self, file_path, annotations, board_clip_region=CURRENT_BOARD_CLIP_HISTORY_REGION):
+        return {
+            "annotations": self._copy_annotations(annotations),
+            "board_clip_region": (
+                self._copy_board_clip_region_snapshot(file_path)
+                if board_clip_region == CURRENT_BOARD_CLIP_HISTORY_REGION else
+                self._clone_board_clip_region_snapshot(board_clip_region)
+            ),
+        }
+
+    def _unpack_annotation_history_snapshot(self, snapshot):
+        if isinstance(snapshot, dict):
+            annotations = self._copy_annotations(snapshot.get("annotations", []))
+            raw_region = snapshot.get("board_clip_region")
+            return annotations, self._clone_board_clip_region_snapshot(raw_region)
+        return self._copy_annotations(snapshot or []), None
+
     def undo_action(self):
         """Undo last action - annotation changes or file deletions."""
         # First try annotation undo (more common)
         if self.annotation_undo_stack:
-            file_path, old_annotations = self.annotation_undo_stack.pop()
+            file_path, snapshot = self.annotation_undo_stack.pop()
+            old_annotations, old_region = self._unpack_annotation_history_snapshot(snapshot)
             
             # Save current state to redo stack BEFORE restoring
             if self.current_file_path:
-                current_copy = self._copy_annotations(self.annotations)
-                self.annotation_redo_stack.append((self.current_file_path, current_copy))
+                current_snapshot = self._make_annotation_history_snapshot(self.current_file_path, self.annotations)
+                self.annotation_redo_stack.append((self.current_file_path, current_snapshot))
             
             # If we're on the same file, restore annotations
             if file_path == self.current_file_path:
                 self.annotations = old_annotations
+                self._restore_board_clip_region_snapshot(file_path, old_region)
                 self.save_annotations()
                 self.redraw()
                 self._flash_notification(f"↶ Undo (Ctrl+Y to redo)")
@@ -3270,6 +3401,7 @@ class AnnotatorApp:
                     idx = self.filtered_image_paths.index(file_path)
                     self.load_image(idx)
                     self.annotations = old_annotations
+                    self._restore_board_clip_region_snapshot(file_path, old_region)
                     self.save_annotations()
                     self.redraw()
                     self._flash_notification(f"↶ Undo on {os.path.basename(file_path)}")
@@ -3319,16 +3451,18 @@ class AnnotatorApp:
             self.status_var.set("Nothing to redo")
             return
         
-        file_path, redo_annotations = self.annotation_redo_stack.pop()
+        file_path, snapshot = self.annotation_redo_stack.pop()
+        redo_annotations, redo_region = self._unpack_annotation_history_snapshot(snapshot)
         
         # Save current state to undo stack
         if self.current_file_path:
-            current_copy = self._copy_annotations(self.annotations)
-            self.annotation_undo_stack.append((self.current_file_path, current_copy))
+            current_snapshot = self._make_annotation_history_snapshot(self.current_file_path, self.annotations)
+            self.annotation_undo_stack.append((self.current_file_path, current_snapshot))
         
         # Apply redo
         if file_path == self.current_file_path:
             self.annotations = redo_annotations
+            self._restore_board_clip_region_snapshot(file_path, redo_region)
             self.save_annotations()
             self.redraw()
             self._flash_notification(f"↷ Redo")
@@ -3337,6 +3471,7 @@ class AnnotatorApp:
                 idx = self.filtered_image_paths.index(file_path)
                 self.load_image(idx)
                 self.annotations = redo_annotations
+                self._restore_board_clip_region_snapshot(file_path, redo_region)
                 self.save_annotations()
                 self.redraw()
                 self._flash_notification(f"↷ Redo on {os.path.basename(file_path)}")
@@ -3348,16 +3483,15 @@ class AnnotatorApp:
 
         self._push_annotation_undo_snapshot(self.current_file_path, self.annotations)
 
-    def _push_annotation_undo_snapshot(self, file_path, annotations):
+    def _push_annotation_undo_snapshot(self, file_path, annotations, board_clip_region=CURRENT_BOARD_CLIP_HISTORY_REGION):
         if not file_path:
             return
 
         # Clear redo stack when new action is performed
         self.annotation_redo_stack.clear()
 
-        # Deep copy annotations
-        annotations_copy = self._copy_annotations(annotations)
-        self.annotation_undo_stack.append((file_path, annotations_copy))
+        snapshot = self._make_annotation_history_snapshot(file_path, annotations, board_clip_region=board_clip_region)
+        self.annotation_undo_stack.append((file_path, snapshot))
 
         # Limit stack size
         if len(self.annotation_undo_stack) > self.max_undo_size:
@@ -3540,6 +3674,22 @@ class AnnotatorApp:
     def _is_polygon_annotation(self, ann):
         meta = self._annotation_meta(ann)
         return bool(meta and meta.get("shape") == "polygon" and meta.get("points"))
+
+    def _is_oriented_box_annotation(self, ann, area_ratio_threshold=0.92):
+        if not self._is_polygon_annotation(ann):
+            return False
+        points = self._annotation_points(ann)
+        if len(points) != 4:
+            return False
+
+        contour = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
+        polygon_area = abs(float(cv2.contourArea(contour)))
+        if polygon_area <= 1e-9:
+            return False
+
+        rect = cv2.minAreaRect(contour)
+        rect_area = max(1e-9, float(rect[1][0]) * float(rect[1][1]))
+        return (polygon_area / rect_area) >= float(area_ratio_threshold)
 
     def _copy_annotation(self, ann):
         base = [int(ann[0]), float(ann[1]), float(ann[2]), float(ann[3]), float(ann[4])]
@@ -3804,14 +3954,227 @@ class AnnotatorApp:
 
     def _build_board_clip_parent_from_corners(self, corners=None):
         active_corners = corners if corners is not None else self._get_board_clip_corners_for_image()
-        ordered_corners = self._order_polygon_clockwise(active_corners)
-        if len(ordered_corners) < 4:
+        fitted_corners = self._fit_board_clip_corners_to_oriented_box(active_corners)
+        if len(fitted_corners) < 4:
             return None
 
-        xs = [float(point[0]) for point in ordered_corners]
-        ys = [float(point[1]) for point in ordered_corners]
-        bounds = (min(xs), min(ys), max(xs), max(ys))
-        return self._bounds_to_ann(self.board_clip_parent_class_id, bounds)
+        xs = [float(point[0]) for point in fitted_corners]
+        ys = [float(point[1]) for point in fitted_corners]
+        return self._bounds_to_ann(self.board_clip_parent_class_id, (min(xs), min(ys), max(xs), max(ys)))
+
+    def _fit_board_clip_corners_to_oriented_box(self, corners):
+        cleaned = []
+        for point in corners or []:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                continue
+            cleaned.append([
+                max(0.0, min(1.0, float(point[0]))),
+                max(0.0, min(1.0, float(point[1]))),
+            ])
+
+        ordered = self._order_polygon_clockwise(cleaned)
+        if len(ordered) < 4:
+            return ordered
+
+        pts = np.array(ordered, dtype=np.float32).reshape(-1, 1, 2)
+        rect = cv2.minAreaRect(pts)
+        box = cv2.boxPoints(rect)
+        fitted = [[float(point[0]), float(point[1])] for point in box]
+        fitted = self._sanitize_polygon_points(fitted)
+        if len(fitted) < 4:
+            return ordered
+        return self._order_polygon_clockwise(fitted)
+
+    def _clip_box_polygon_to_corner_polygon(self, bounds, corners):
+        polygon = [
+            (bounds[0], bounds[1]),
+            (bounds[2], bounds[1]),
+            (bounds[2], bounds[3]),
+            (bounds[0], bounds[3]),
+        ]
+        clipped = self._clip_polygon_with_convex_polygon(polygon, corners)
+        if len(clipped) < 3:
+            return []
+        return [[float(point[0]), float(point[1])] for point in clipped]
+
+    def _scan_unique_values(self, values, tolerance=1e-6):
+        ordered = []
+        for value in sorted(float(v) for v in values):
+            if ordered and abs(ordered[-1] - value) <= tolerance:
+                continue
+            ordered.append(value)
+        return ordered
+
+    def _polygon_horizontal_span(self, polygon, y, tolerance=1e-6):
+        intersections = []
+        y = float(y)
+        ordered = [tuple(point) for point in polygon]
+        if len(ordered) < 3:
+            return None
+
+        for idx, start in enumerate(ordered):
+            end = ordered[(idx + 1) % len(ordered)]
+            x1, y1 = start
+            x2, y2 = end
+
+            if abs(y2 - y1) <= tolerance:
+                if abs(y - y1) <= tolerance:
+                    intersections.extend([x1, x2])
+                continue
+
+            lower = min(y1, y2)
+            upper = max(y1, y2)
+            if y < lower - tolerance or y > upper + tolerance:
+                continue
+            t = (y - y1) / (y2 - y1)
+            if -tolerance <= t <= 1.0 + tolerance:
+                intersections.append(x1 + (x2 - x1) * t)
+
+        intersections = self._scan_unique_values(intersections, tolerance=tolerance)
+        if len(intersections) < 2:
+            return None
+        return intersections[0], intersections[-1]
+
+    def _polygon_vertical_span(self, polygon, x, tolerance=1e-6):
+        intersections = []
+        x = float(x)
+        ordered = [tuple(point) for point in polygon]
+        if len(ordered) < 3:
+            return None
+
+        for idx, start in enumerate(ordered):
+            end = ordered[(idx + 1) % len(ordered)]
+            x1, y1 = start
+            x2, y2 = end
+
+            if abs(x2 - x1) <= tolerance:
+                if abs(x - x1) <= tolerance:
+                    intersections.extend([y1, y2])
+                continue
+
+            lower = min(x1, x2)
+            upper = max(x1, x2)
+            if x < lower - tolerance or x > upper + tolerance:
+                continue
+            t = (x - x1) / (x2 - x1)
+            if -tolerance <= t <= 1.0 + tolerance:
+                intersections.append(y1 + (y2 - y1) * t)
+
+        intersections = self._scan_unique_values(intersections, tolerance=tolerance)
+        if len(intersections) < 2:
+            return None
+        return intersections[0], intersections[-1]
+
+    def _select_corner_polygon_extension_sample(self, bounds, corners, axis):
+        ordered_corners = self._order_polygon_clockwise(corners)
+        if len(ordered_corners) < 4:
+            left, top, right, bottom = bounds
+            return (left + right) / 2 if axis == "y" else (top + bottom) / 2
+
+        center_x = sum(point[0] for point in ordered_corners) / len(ordered_corners)
+        center_y = sum(point[1] for point in ordered_corners) / len(ordered_corners)
+        left, top, right, bottom = bounds
+
+        if axis == "y":
+            width = max(1e-6, right - left)
+            margin = min(width * 0.25, 0.01)
+            midpoint_x = (left + right) / 2
+            if midpoint_x <= center_x:
+                return max(left + margin, right - margin)
+            return min(right - margin, left + margin)
+
+        height = max(1e-6, bottom - top)
+        margin = min(height * 0.25, 0.01)
+        midpoint_y = (top + bottom) / 2
+        if midpoint_y <= center_y:
+            return max(top + margin, bottom - margin)
+        return min(bottom - margin, top + margin)
+
+    def _extend_bounds_inside_corner_polygon(self, bounds, corners, axis):
+        ordered_corners = self._order_polygon_clockwise(corners)
+        if len(ordered_corners) < 4:
+            return bounds
+
+        left, top, right, bottom = bounds
+        if axis == "y":
+            sample_x = self._select_corner_polygon_extension_sample(bounds, ordered_corners, "y")
+            span = self._polygon_vertical_span(ordered_corners, sample_x)
+            if span is None:
+                span = self._polygon_vertical_span(ordered_corners, (left + right) / 2)
+            if span is None:
+                return None
+            span_top, span_bottom = span
+            if (span_bottom - span_top) <= 1e-6:
+                return None
+            return (left, span_top, right, span_bottom)
+
+        sample_y = self._select_corner_polygon_extension_sample(bounds, ordered_corners, "x")
+        span = self._polygon_horizontal_span(ordered_corners, sample_y)
+        if span is None:
+            span = self._polygon_horizontal_span(ordered_corners, (top + bottom) / 2)
+        if span is None:
+            return None
+        span_left, span_right = span
+        if (span_right - span_left) <= 1e-6:
+            return None
+        return (span_left, top, span_right, bottom)
+
+    def _measure_board_clip_axis(self, annotations, class_ids):
+        class_ids = {int(class_id) for class_id in class_ids}
+        if not class_ids:
+            return None, 0.0
+
+        score = 0.0
+        weight = 0.0
+        for ann in annotations:
+            if int(ann[0]) not in class_ids:
+                continue
+            left, top, right, bottom = self._ann_to_bounds(ann)
+            width = max(1e-6, right - left)
+            height = max(1e-6, bottom - top)
+            score += width - height
+            weight += width + height
+
+        if weight <= 1e-9:
+            return None, 0.0
+
+        normalized_score = score / weight
+        if normalized_score > 0.08:
+            return "x", abs(normalized_score)
+        if normalized_score < -0.08:
+            return "y", abs(normalized_score)
+        return None, abs(normalized_score)
+
+    def _opposite_axis(self, axis):
+        if axis == "x":
+            return "y"
+        if axis == "y":
+            return "x"
+        return None
+
+    def _infer_board_clip_extension_axis(self, ann, annotations):
+        board_axis, board_strength = self._measure_board_clip_axis(annotations, self.board_clip_board_class_ids)
+        stringer_axis, stringer_strength = self._measure_board_clip_axis(annotations, self.board_clip_stringer_class_ids)
+
+        if board_axis and stringer_axis and board_axis == stringer_axis:
+            if board_strength >= stringer_strength:
+                stringer_axis = self._opposite_axis(board_axis)
+            else:
+                board_axis = self._opposite_axis(stringer_axis)
+
+        cid = int(ann[0])
+        if cid in set(int(class_id) for class_id in self.board_clip_board_class_ids):
+            axis = board_axis or self._opposite_axis(stringer_axis)
+        elif cid in set(int(class_id) for class_id in self.board_clip_stringer_class_ids):
+            axis = stringer_axis or self._opposite_axis(board_axis)
+        else:
+            axis = None
+
+        if axis:
+            return axis
+
+        left, top, right, bottom = self._ann_to_bounds(ann)
+        return "x" if (right - left) >= (bottom - top) else "y"
 
     def _replace_annotations_for_class(self, annotations, target_class_id, replacement_annotations):
         target_class_id = int(target_class_id)
@@ -4135,6 +4498,76 @@ class AnnotatorApp:
             self.redraw()
         return True, parent_ann
 
+    def _preview_board_clip_parent_from_saved_corners(self):
+        if not self.current_image or not self.board_clip_quick_sync_parent:
+            return False
+
+        corners = self._fit_board_clip_corners_to_oriented_box(self._get_board_clip_corners_for_image())
+        if len(corners) < 4:
+            return False
+
+        parent_ann = self._build_board_clip_parent_from_corners(corners)
+        if parent_ann is None:
+            return False
+
+        new_annotations, changed = self._replace_board_clip_parent_annotation(self.annotations, parent_ann)
+        if changed:
+            self.annotations = new_annotations
+        return changed
+
+    def _apply_quick_board_clip_from_corners(self, corners):
+        if not self.current_image or not self.current_file_path:
+            return False, {"clipped": 0, "removed": 0}, False
+
+        fitted_corners = self._fit_board_clip_corners_to_oriented_box(corners)
+        if len(fitted_corners) < 4:
+            return False, {"clipped": 0, "removed": 0}, False
+
+        previous_region = self._copy_board_clip_region_snapshot(self.current_file_path)
+        previous_annotations = self._copy_annotations(self.annotations)
+
+        self._set_board_clip_corners_for_image(fitted_corners)
+
+        new_annotations = self._copy_annotations(self.annotations)
+        parent_changed = False
+        fit_changed = False
+        stats = {"clipped": 0, "removed": 0}
+
+        if self.board_clip_quick_sync_parent:
+            parent_ann = self._build_board_clip_parent_from_corners(fitted_corners)
+            if parent_ann is not None:
+                new_annotations, parent_changed = self._replace_board_clip_parent_annotation(new_annotations, parent_ann)
+
+        if self.board_clip_quick_apply_on_corners and self._quick_board_clip_target_class_ids():
+            fit_source_annotations = self._copy_annotations(new_annotations)
+            new_annotations, stats = self._run_with_board_clip_target_mode(
+                "quick",
+                lambda annotations=new_annotations: self._apply_board_clip_constraints(
+                    annotations,
+                    img_path=self.current_file_path,
+                    remove_outside=self.board_clip_remove_outside,
+                ),
+            )
+            fit_changed = self._annotation_list_differs(fit_source_annotations, new_annotations)
+
+        annotations_changed = self._annotation_list_differs(previous_annotations, new_annotations)
+        region_changed = previous_region != self._copy_board_clip_region_snapshot(self.current_file_path)
+
+        if region_changed or annotations_changed:
+            self._push_annotation_undo_snapshot(
+                self.current_file_path,
+                previous_annotations,
+                board_clip_region=previous_region,
+            )
+
+        if annotations_changed:
+            self.annotations = new_annotations
+            self.annotations_dirty = True
+            self.save_annotations()
+
+        self.redraw()
+        return fit_changed, stats, parent_changed
+
     def _annotation_differs(self, ann1, ann2, tolerance=1e-6):
         if ann1 is None or ann2 is None:
             return ann1 != ann2
@@ -4155,6 +4588,11 @@ class AnnotatorApp:
                 if abs(float(point1[0]) - float(point2[0])) > tolerance or abs(float(point1[1]) - float(point2[1])) > tolerance:
                     return True
         return False
+
+    def _annotation_list_differs(self, old_annotations, new_annotations):
+        if len(new_annotations) != len(old_annotations):
+            return True
+        return any(self._annotation_differs(old, new) for old, new in zip(old_annotations, new_annotations))
 
     def _intersect_bounds(self, bounds_a, bounds_b):
         left = max(bounds_a[0], bounds_b[0])
@@ -4381,7 +4819,7 @@ class AnnotatorApp:
         if cid == self.board_clip_parent_class_id:
             return False
         if self.board_clip_target_mode == "quick":
-            quick_class_ids = set(self.board_clip_board_class_ids) | set(self.board_clip_stringer_class_ids)
+            quick_class_ids = self._quick_board_clip_target_class_ids()
             return cid in quick_class_ids
         if self.board_clip_target_mode == "boards":
             return cid in set(self.board_clip_board_class_ids)
@@ -4399,6 +4837,7 @@ class AnnotatorApp:
         parent_ann = self._select_board_clip_parent(ann, annotations)
         active_guides = guides if guides is not None else self._get_board_clip_guides_for_image(img_path)
         active_corners = corners if corners is not None else self._get_board_clip_corners_for_image(img_path)
+        active_corners = self._fit_board_clip_corners_to_oriented_box(active_corners)
         has_corner_polygon = (not ignore_guides) and self.board_clip_use_guides and len(active_corners) >= 4
         has_guides = (not ignore_guides) and self.board_clip_use_guides and len(active_guides) >= 2 and not has_corner_polygon
 
@@ -4420,9 +4859,20 @@ class AnnotatorApp:
                 return None
 
         if has_corner_polygon:
-            bounds = self._clip_bounds_to_corner_polygon(bounds, active_corners)
-            if bounds is None:
+            clipped_polygon = self._clip_box_polygon_to_corner_polygon(bounds, active_corners)
+            if not clipped_polygon:
                 return None
+
+            clipped_bounds = self._polygon_bounds(clipped_polygon)
+            if force_extend_to_parent or self.board_clip_extend_to_guides:
+                axis = self._infer_board_clip_extension_axis(ann, annotations)
+                oriented_bounds = self._extend_bounds_inside_corner_polygon(bounds, active_corners, axis)
+                if oriented_bounds is not None:
+                    bounds = oriented_bounds
+                else:
+                    bounds = clipped_bounds
+            else:
+                bounds = clipped_bounds
         elif has_guides:
             bounds = self._clip_bounds_to_guide_strip(bounds, active_guides)
             if bounds is None:
@@ -4443,16 +4893,17 @@ class AnnotatorApp:
         )
         return transformed
 
-    def _apply_board_clip_constraints(self, annotations, img_path=None, ignore_guides=False, force_extend_to_parent=False):
+    def _apply_board_clip_constraints(self, annotations, img_path=None, ignore_guides=False, force_extend_to_parent=False, remove_outside=None):
         sanitized = [self._clamp_annotation(ann) for ann in annotations]
         if not self.board_clip_enabled:
             return sanitized, {"clipped": 0, "removed": 0}
 
         guides = [] if ignore_guides else self._get_board_clip_guides_for_image(img_path)
-        corners = [] if ignore_guides else self._get_board_clip_corners_for_image(img_path)
+        corners = [] if ignore_guides else self._fit_board_clip_corners_to_oriented_box(self._get_board_clip_corners_for_image(img_path))
         clipped_annotations = []
         clipped_count = 0
         removed_count = 0
+        allow_removal = self.board_clip_remove_outside if remove_outside is None else bool(remove_outside)
         primary_parent = self._select_primary_board_clip_parent(sanitized)
 
         for ann in sanitized:
@@ -4477,8 +4928,10 @@ class AnnotatorApp:
                 force_extend_to_parent=force_extend_to_parent,
             )
             if clipped_ann is None:
-                removed_count += 1
-                continue
+                if allow_removal:
+                    removed_count += 1
+                    continue
+                clipped_ann = ann
 
             if self._annotation_differs(ann, clipped_ann):
                 clipped_count += 1
@@ -4670,10 +5123,19 @@ class AnnotatorApp:
 
         self._run_with_board_clip_target_mode("stringers", self._extend_board_clip_to_parent_current_annotations)
 
+    def on_board_clip_corner_guides_visibility_changed(self):
+        if self.board_clip_dialog_vars.get("show_corner_guides"):
+            self.board_clip_dialog_vars["show_corner_guides"].set(self.board_clip_corner_guides_visible.get())
+        self.save_config()
+        self.redraw()
+        self._refresh_board_clip_dialog_state()
+
     def start_quick_board_clip_guides(self, e=None):
         if not self.current_image:
             self.status_var.set("Load an image before drawing quick board clip guides")
             return
+        if self.board_clip_batch_mode:
+            self._stop_board_clip_batch_mode()
         self._ensure_board_clip_active()
         self._start_board_clip_guide_draw(0, mode="edges")
         self.board_clip_quick_draw = True
@@ -4683,10 +5145,258 @@ class AnnotatorApp:
         if not self.current_image:
             self.status_var.set("Load an image before drawing pallet corners")
             return
+        if self.board_clip_batch_mode:
+            self._stop_board_clip_batch_mode()
         self._ensure_board_clip_active()
         self._start_board_clip_guide_draw(0, mode="corners")
         self.board_clip_quick_draw = True
-        self.status_var.set("Pallet corner mode ON: annotations hidden. Click the 4 pallet corners in order around the pallet. The pallet box will refresh after corner 4, then boards/stringers will be fit.")
+        self.status_var.set("Pallet corner mode ON: annotations hidden. Click the 4 pallet corners around the pallet. Corner 4 updates the saved rotated guide, refreshes the pallet detect box, and auto-adjusts the selected classes.")
+
+    def start_quick_board_clip_corners_batch(self, e=None):
+        if self.board_clip_batch_mode:
+            self._stop_board_clip_batch_mode()
+            self._cancel_board_clip_guide_draw("4-point all mode cancelled. Any queued pallet fits will keep finishing.")
+            return
+        if self.board_clip_batch_pending_jobs or self.board_clip_batch_job_after_id is not None:
+            self.status_var.set("4-point all is still finishing the previous run. Wait for it to finish before starting another batch.")
+            return
+        if not self.current_image or not self.filtered_image_paths:
+            self.status_var.set("Load an image before running 4-point all mode")
+            return
+
+        self._reset_board_clip_batch_state()
+        self._ensure_board_clip_active()
+        self.board_clip_batch_mode = True
+        self.board_clip_batch_paths = list(self.filtered_image_paths[self.current_index:])
+        self.board_clip_batch_cursor = 0
+        self.board_clip_batch_total = len(self.board_clip_batch_paths)
+        self.board_clip_batch_captured_count = 0
+        self.board_clip_batch_processed = 0
+        self.board_clip_batch_needs_cache_refresh = False
+        self._start_board_clip_guide_draw(0, mode="corners")
+        self.board_clip_quick_draw = True
+        self._update_board_clip_mode_ui()
+        self._refresh_board_clip_dialog_state()
+        self.status_var.set(
+            f"4-point all mode ON: image 1/{self.board_clip_batch_total}. "
+            "Click corner 1 of 4. After corner 4 the app jumps to the next image and queues the fit work behind you. Esc stops."
+        )
+
+    def _reset_board_clip_batch_state(self):
+        self.board_clip_batch_mode = False
+        self.board_clip_batch_paths = []
+        self.board_clip_batch_cursor = -1
+        self.board_clip_batch_total = 0
+        self.board_clip_batch_captured_count = 0
+        self.board_clip_batch_processed = 0
+        self.board_clip_batch_pending_jobs = []
+        self.board_clip_batch_job_after_id = None
+        self.board_clip_batch_needs_cache_refresh = False
+        self._update_board_clip_mode_ui()
+        self._refresh_board_clip_dialog_state()
+
+    def _stop_board_clip_batch_mode(self, message=None):
+        if not self.board_clip_batch_mode and not self.board_clip_batch_paths:
+            if message:
+                self.status_var.set(message)
+            return
+
+        captured_total = max(
+            self.board_clip_batch_captured_count,
+            self.board_clip_batch_processed + len(self.board_clip_batch_pending_jobs),
+        )
+        self.board_clip_batch_mode = False
+        self.board_clip_batch_paths = []
+        self.board_clip_batch_cursor = -1
+        if captured_total > 0:
+            self.board_clip_batch_total = captured_total
+        else:
+            self.board_clip_batch_total = 0
+        self._update_board_clip_mode_ui()
+        self._refresh_board_clip_dialog_state()
+
+        if not self.board_clip_batch_pending_jobs and self.board_clip_batch_job_after_id is None:
+            self._finalize_board_clip_batch_jobs()
+        elif message:
+            self.status_var.set(message)
+
+    def _advance_board_clip_batch_capture(self):
+        if not self.board_clip_batch_mode:
+            return False
+
+        next_cursor = self.board_clip_batch_cursor + 1
+        if next_cursor >= len(self.board_clip_batch_paths):
+            return False
+
+        next_path = self.board_clip_batch_paths[next_cursor]
+        self.board_clip_batch_cursor = next_cursor
+        if next_path not in self.filtered_image_paths:
+            self._stop_board_clip_batch_mode("4-point all stopped because the next filtered image is no longer available.")
+            return False
+
+        self.load_image(self.filtered_image_paths.index(next_path))
+        if self.current_file_path != next_path or not self.current_image:
+            self._stop_board_clip_batch_mode("4-point all stopped because the next image could not be loaded.")
+            return False
+
+        self._start_board_clip_guide_draw(0, mode="corners")
+        self.board_clip_quick_draw = True
+        self._update_board_clip_mode_ui()
+        self._refresh_board_clip_dialog_state()
+        self.status_var.set(
+            f"4-point all: image {self.board_clip_batch_cursor + 1}/{self.board_clip_batch_total}. "
+            "Click corner 1 of 4. Esc stops."
+        )
+        return True
+
+    def _queue_board_clip_batch_job(self, img_path, corners, previous_region=None, base_annotations=None, loaded_label_format=None):
+        self.board_clip_batch_pending_jobs.append(
+            {
+                "img_path": img_path,
+                "corners": [list(point) for point in corners[:4]],
+                "previous_region": self._clone_board_clip_region_snapshot(previous_region),
+                "base_annotations": self._copy_annotations(base_annotations) if base_annotations is not None else None,
+                "loaded_label_format": loaded_label_format,
+            }
+        )
+        self.board_clip_batch_captured_count = max(
+            self.board_clip_batch_captured_count,
+            self.board_clip_batch_processed + len(self.board_clip_batch_pending_jobs),
+        )
+        if self.board_clip_batch_job_after_id is None:
+            self.board_clip_batch_job_after_id = self.root.after(1, self._process_board_clip_batch_jobs)
+        self._update_board_clip_mode_ui()
+        self._refresh_board_clip_dialog_state()
+
+    def _process_board_clip_batch_jobs(self):
+        self.board_clip_batch_job_after_id = None
+        if not self.board_clip_batch_pending_jobs:
+            if not self.board_clip_batch_mode:
+                self._finalize_board_clip_batch_jobs()
+            return
+
+        job = self.board_clip_batch_pending_jobs.pop(0)
+        try:
+            _, _, _, annotations_changed, _ = self._apply_quick_board_clip_to_image_path(
+                job["img_path"],
+                job["corners"],
+                previous_region=job["previous_region"],
+                base_annotations=job["base_annotations"],
+                loaded_label_format=job["loaded_label_format"],
+            )
+            if annotations_changed:
+                self.board_clip_batch_needs_cache_refresh = True
+        except Exception as exc:
+            self.status_var.set(f"4-point all failed on {os.path.basename(job['img_path'])}: {exc}")
+        finally:
+            self.board_clip_batch_processed += 1
+            self._update_board_clip_mode_ui()
+            self._refresh_board_clip_dialog_state()
+
+        if self.board_clip_batch_pending_jobs:
+            self.board_clip_batch_job_after_id = self.root.after(1, self._process_board_clip_batch_jobs)
+        elif not self.board_clip_batch_mode:
+            self._finalize_board_clip_batch_jobs()
+
+    def _finalize_board_clip_batch_jobs(self):
+        if self.board_clip_batch_mode or self.board_clip_batch_pending_jobs or self.board_clip_batch_job_after_id is not None:
+            return
+
+        finished_total = max(self.board_clip_batch_total, self.board_clip_batch_processed)
+        if self.board_clip_batch_needs_cache_refresh:
+            self._build_annotation_cache_and_stats()
+            self._refresh_file_list()
+        elif self.current_image:
+            self._update_current_image_stats()
+        if self.current_image and self.board_clip_draw_mode is None:
+            self.redraw()
+
+        status_message = None
+        if finished_total > 0:
+            status_message = f"4-point all finished: {self.board_clip_batch_processed}/{finished_total} image(s) processed."
+
+        self._reset_board_clip_batch_state()
+        if status_message:
+            self.status_var.set(status_message)
+
+    def _apply_quick_board_clip_to_image_path(
+        self,
+        img_path,
+        corners,
+        previous_region=None,
+        base_annotations=None,
+        loaded_label_format=None,
+    ):
+        if not img_path:
+            return False, {"clipped": 0, "removed": 0}, False, False, False
+
+        fitted_corners = self._fit_board_clip_corners_to_oriented_box(corners)
+        if len(fitted_corners) < 4:
+            return False, {"clipped": 0, "removed": 0}, False, False, False
+
+        if previous_region is None:
+            previous_region = self._copy_board_clip_region_snapshot(img_path)
+        else:
+            previous_region = self._clone_board_clip_region_snapshot(previous_region)
+
+        if base_annotations is None:
+            previous_annotations, lbl_path = self._load_annotations_for_image_path(img_path)
+        else:
+            previous_annotations = self._copy_annotations(base_annotations)
+            lbl_path = self._get_label_path(img_path)
+        previous_annotations = self._copy_annotations(previous_annotations)
+
+        existing_format = loaded_label_format
+        if existing_format is None:
+            existing_format = LABEL_FORMAT_SEGMENT if any(self._is_polygon_annotation(ann) for ann in previous_annotations) else LABEL_FORMAT_DETECT
+
+        self._set_board_clip_corners_for_image(fitted_corners, img_path=img_path)
+
+        new_annotations = self._copy_annotations(previous_annotations)
+        parent_changed = False
+        fit_changed = False
+        stats = {"clipped": 0, "removed": 0}
+
+        if self.board_clip_quick_sync_parent:
+            parent_ann = self._build_board_clip_parent_from_corners(fitted_corners)
+            if parent_ann is not None:
+                new_annotations, parent_changed = self._replace_board_clip_parent_annotation(new_annotations, parent_ann)
+
+        if self.board_clip_quick_apply_on_corners and self._quick_board_clip_target_class_ids():
+            fit_source_annotations = self._copy_annotations(new_annotations)
+            new_annotations, stats = self._run_with_board_clip_target_mode(
+                "quick",
+                lambda annotations=new_annotations: self._apply_board_clip_constraints(
+                    annotations,
+                    img_path=img_path,
+                    remove_outside=self.board_clip_remove_outside,
+                ),
+            )
+            fit_changed = self._annotation_list_differs(fit_source_annotations, new_annotations)
+
+        annotations_changed = self._annotation_list_differs(previous_annotations, new_annotations)
+        region_changed = previous_region != self._copy_board_clip_region_snapshot(img_path)
+
+        if region_changed or annotations_changed:
+            self._push_annotation_undo_snapshot(
+                img_path,
+                previous_annotations,
+                board_clip_region=previous_region,
+            )
+
+        if annotations_changed:
+            self._write_annotations_to_label_path(lbl_path, new_annotations, loaded_label_format=existing_format)
+            self.image_to_classes_cache[os.path.normpath(img_path)] = set(int(ann[0]) for ann in new_annotations)
+
+        if img_path == self.current_file_path and self.current_image and not self.annotations_dirty:
+            if annotations_changed:
+                self.annotations = self._copy_annotations(new_annotations)
+                self.annotations_dirty = False
+            if region_changed or annotations_changed:
+                self.redraw()
+                self._refresh_board_clip_dialog_state()
+
+        return fit_changed, stats, parent_changed, annotations_changed, region_changed
 
     def _load_annotations_for_image_path(self, img_path):
         lbl_path = self._get_label_path(img_path)
@@ -5313,6 +6023,168 @@ class AnnotatorApp:
         )
         self.status_var.set(
             f"Converted {annotations_converted} segmentation annotation(s) across {files_converted} file(s)"
+        )
+
+    def convert_dataset_oriented_box_labels_to_detect(self):
+        if not self.workspace_path:
+            messagebox.showerror("Error", "No workspace loaded.")
+            return
+
+        self._save_current_annotations_if_dirty()
+        summary = self._scan_workspace_label_formats()
+        label_paths = summary["label_paths"]
+
+        obb_annotations = 0
+        convertible_files = 0
+        skipped_files = []
+
+        for lbl_path in label_paths:
+            try:
+                annotations = self._load_annotations_from_file(lbl_path)
+            except Exception as exc:
+                skipped_files.append(f"{os.path.basename(lbl_path)}: {exc}")
+                continue
+
+            file_obb_count = 0
+            has_other_polygons = False
+            for ann in annotations:
+                if not self._is_polygon_annotation(ann):
+                    continue
+                if self._is_oriented_box_annotation(ann):
+                    file_obb_count += 1
+                else:
+                    has_other_polygons = True
+
+            if file_obb_count <= 0:
+                continue
+
+            obb_annotations += file_obb_count
+            if has_other_polygons:
+                skipped_files.append(
+                    f"{os.path.basename(lbl_path)}: contains non-OBB segmentation rows"
+                )
+            else:
+                convertible_files += 1
+
+        if obb_annotations == 0:
+            messagebox.showinfo(
+                "OBB -> Detect",
+                "No oriented bounding box labels were found.\n\n"
+                "This converter looks for 4-point box-like polygon rows.",
+            )
+            self.status_var.set("No oriented bounding box labels found to convert")
+            return
+
+        if convertible_files == 0:
+            messagebox.showwarning(
+                "OBB -> Detect",
+                "Oriented bounding box rows were found, but every matching file also contains other segmentation polygons.\n\n"
+                "Use Seg -> Detect if you want to flatten those files completely.",
+            )
+            self.status_var.set("OBB -> Detect skipped because matching files still contain segmentation polygons")
+            return
+
+        skip_note = ""
+        if skipped_files:
+            skip_note = (
+                f"\n\n{len(skipped_files)} file(s) with non-OBB segmentation polygons will be skipped."
+            )
+
+        if not messagebox.askyesno(
+            "Convert Oriented Boxes To Detect",
+            f"This will rewrite {obb_annotations} oriented bounding box annotation(s) as YOLO detect boxes across {convertible_files} file(s).\n\n"
+            "Only files that contain detect rows plus 4-point OBB rows will be converted."
+            " Files with other segmentation polygons are skipped so they do not get flattened accidentally.\n"
+            "Backups are saved in .annotator_backups next to each label file."
+            f"{skip_note}\n\nProceed?",
+        ):
+            return
+
+        current_path = self.current_file_path
+        current_index_snapshot = self.current_index
+
+        progress = tb.Toplevel(self.root)
+        progress.title("Convert Oriented Boxes To Detect")
+        progress.geometry("460x140")
+        progress.transient(self.root)
+        progress.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        pb = tb.Progressbar(progress, maximum=max(1, len(label_paths)))
+        pb.pack(fill=X, padx=20, pady=(20, 8))
+        status_lbl = tb.Label(progress, text="Starting...", font=("Consolas", 9))
+        status_lbl.pack(pady=4)
+
+        files_converted = 0
+        annotations_converted = 0
+        errors = []
+
+        for idx, lbl_path in enumerate(label_paths, start=1):
+            try:
+                annotations = self._load_annotations_from_file(lbl_path)
+                has_other_polygons = any(
+                    self._is_polygon_annotation(ann) and not self._is_oriented_box_annotation(ann)
+                    for ann in annotations
+                )
+                if has_other_polygons:
+                    pb["value"] = idx
+                    status_lbl.config(text=f"Processed {idx}/{len(label_paths)}  |  converted {files_converted}")
+                    if idx % 25 == 0 or idx == len(label_paths):
+                        progress.update_idletasks()
+                    continue
+
+                converted_annotations = []
+                file_obb_count = 0
+                for ann in annotations:
+                    if self._is_oriented_box_annotation(ann):
+                        converted_annotations.append(self._clamp_annotation(ann[:5]))
+                        file_obb_count += 1
+                    else:
+                        converted_annotations.append(self._copy_annotation(ann))
+
+                if file_obb_count > 0:
+                    self._write_annotations_atomically(lbl_path, converted_annotations, LABEL_FORMAT_DETECT)
+                    files_converted += 1
+                    annotations_converted += file_obb_count
+            except Exception as exc:
+                errors.append(f"{os.path.basename(lbl_path)}: {exc}")
+
+            pb["value"] = idx
+            status_lbl.config(text=f"Processed {idx}/{len(label_paths)}  |  converted {files_converted}")
+            if idx % 25 == 0 or idx == len(label_paths):
+                progress.update_idletasks()
+
+        progress.destroy()
+
+        result_summary = self._scan_workspace_label_formats()
+        if result_summary["segment_annotations"] == 0:
+            self._set_dataset_label_format(LABEL_FORMAT_DETECT, persist=True, update_ui=True)
+            self.annotation_mode.set(ANNOTATION_MODE_BOX)
+
+        self._build_annotation_cache_and_stats()
+        if current_path and current_path in self.filtered_image_paths:
+            self.load_image(self.filtered_image_paths.index(current_path))
+        elif self.filtered_image_paths:
+            self.load_image(min(current_index_snapshot, len(self.filtered_image_paths) - 1))
+
+        result_message = (
+            f"Converted {annotations_converted} oriented bounding box annotation(s) across {files_converted} file(s)."
+        )
+        if skipped_files:
+            result_message += f"\n\nSkipped {len(skipped_files)} file(s) that still contain non-OBB segmentation polygons."
+            if len(skipped_files) <= 5:
+                result_message += "\n" + "\n".join(skipped_files)
+            else:
+                result_message += "\n" + "\n".join(skipped_files[:5]) + f"\n... and {len(skipped_files) - 5} more"
+        if errors:
+            result_message += f"\n\nErrors: {len(errors)}"
+            if len(errors) <= 5:
+                result_message += "\n" + "\n".join(errors)
+            else:
+                result_message += "\n" + "\n".join(errors[:5]) + f"\n... and {len(errors) - 5} more"
+
+        messagebox.showinfo("OBB Conversion Complete", result_message)
+        self.status_var.set(
+            f"Converted {annotations_converted} oriented bounding box annotation(s) across {files_converted} file(s)"
         )
 
     def on_filter_changed(self, event):
@@ -6426,6 +7298,8 @@ class AnnotatorApp:
             self.save_annotations(force=True)
         elif needs_resave:
             self.save_annotations(force=True)
+
+        self._preview_board_clip_parent_from_saved_corners()
         
         # Maintain class selection when switching images
         if self.classes and 0 <= self.selected_class_id < len(self.classes):
@@ -6951,9 +7825,11 @@ class AnnotatorApp:
             return
 
         show_saved_region = self.board_clip_guides_visible.get()
+        show_saved_corner_overlay = show_saved_region and self.board_clip_corner_guides_visible.get()
+        drawing_corners = self.board_clip_draw_mode == "corners"
         guides = self._get_board_clip_guides_for_image()
         corners = self._get_board_clip_corners_for_image()
-        draft_corners = self.board_clip_corner_draft if self.board_clip_draw_mode == "corners" else []
+        draft_corners = self.board_clip_corner_draft if drawing_corners else []
 
         if show_saved_region:
             colors = ["#00D084", "#FFB020"]
@@ -6965,15 +7841,16 @@ class AnnotatorApp:
                 my = (y1 + y2) / 2
                 self.canvas.create_text(mx, my - 10, text=f"Edge {idx + 1}", fill=color, font=("Arial", 10, "bold"), tags="board_clip_guide")
 
-            ordered_corners = self._order_polygon_clockwise(corners)
-            if ordered_corners:
-                corner_canvas = [self._corner_to_canvas_coords(point) for point in ordered_corners]
-                if len(corner_canvas) >= 2:
-                    flat_points = [coord for point in corner_canvas for coord in point]
-                    self.canvas.create_line(*flat_points, *corner_canvas[0], fill="#5BC0FF", width=3, dash=(8, 4), tags="board_clip_guide")
-                for idx, point in enumerate(corner_canvas):
-                    self.canvas.create_oval(point[0] - 6, point[1] - 6, point[0] + 6, point[1] + 6, fill="#5BC0FF", outline="#FFFFFF", width=2, tags="board_clip_guide")
-                    self.canvas.create_text(point[0] + 12, point[1] - 12, text=f"C{idx + 1}", fill="#5BC0FF", font=("Arial", 10, "bold"), tags="board_clip_guide")
+            if show_saved_corner_overlay and not drawing_corners:
+                ordered_corners = self._order_polygon_clockwise(corners)
+                if ordered_corners:
+                    corner_canvas = [self._corner_to_canvas_coords(point) for point in ordered_corners]
+                    if len(corner_canvas) >= 2:
+                        flat_points = [coord for point in corner_canvas for coord in point]
+                        self.canvas.create_line(*flat_points, *corner_canvas[0], fill="#5BC0FF", width=3, dash=(8, 4), tags="board_clip_guide")
+                    for idx, point in enumerate(corner_canvas):
+                        self.canvas.create_oval(point[0] - 6, point[1] - 6, point[0] + 6, point[1] + 6, fill="#5BC0FF", outline="#FFFFFF", width=2, tags="board_clip_guide")
+                        self.canvas.create_text(point[0] + 12, point[1] - 12, text=f"C{idx + 1}", fill="#5BC0FF", font=("Arial", 10, "bold"), tags="board_clip_guide")
 
         if draft_corners:
             draft_canvas = [self._corner_to_canvas_coords(point) for point in draft_corners]
@@ -7002,8 +7879,12 @@ class AnnotatorApp:
         panel_y2 = panel_y1 + 62
         self.canvas.create_rectangle(panel_x1, panel_y1, panel_x2, panel_y2, fill="#111111", outline="#FF6600", width=2, tags="board_clip_mode")
         if self.board_clip_draw_mode == "corners":
-            title = f"PALLET CORNER MODE  *  Click corner {self.board_clip_draw_slot + 1} of 4"
-            subtitle = "Annotations hidden while drawing. Click each corner around the pallet. Corner 4 refreshes the pallet box. Esc cancels."
+            if self.board_clip_batch_mode and self.board_clip_batch_total > 0:
+                title = f"PALLET 4-POINT ALL  *  Image {self.board_clip_batch_cursor + 1} of {self.board_clip_batch_total}  *  Corner {self.board_clip_draw_slot + 1} of 4"
+                subtitle = "Annotations hidden while drawing. Click each pallet corner, then the app jumps to the next image right away while the fit pass finishes in the background. Esc stops batch capture."
+            else:
+                title = f"PALLET CORNER MODE  *  Click corner {self.board_clip_draw_slot + 1} of 4"
+                subtitle = "Annotations hidden while drawing. Click each corner around the pallet. Corner 4 updates the rotated guide, refreshes the pallet detect box, and runs the quick adjust pass. Esc cancels."
         else:
             title = f"PALLET EDGE MODE  *  Draw edge {self.board_clip_draw_slot + 1} of 2"
             subtitle = "Annotations hidden while drawing. Left-drag along the pallet edge. Esc cancels."
@@ -7148,7 +8029,7 @@ class AnnotatorApp:
         if self.current_image:
             self.redraw()
         if mode == "corners":
-            self.status_var.set("Pallet corner mode: annotations hidden. Click corner 1 of 4.")
+            self.status_var.set("Pallet corner mode: annotations hidden. Click corner 1 of 4. Corner 4 will update the rotated guide, refresh the pallet detect box, and run the quick adjust pass.")
         else:
             self.status_var.set(f"Pallet edge mode: annotations hidden. Draw edge {slot + 1} by click-dragging along the pallet edge.")
         self.canvas.focus_set()
@@ -7156,6 +8037,10 @@ class AnnotatorApp:
     def escape_action(self):
         """Handle Escape key - cancel resize, clear selection and unlock class."""
         if self.board_clip_draw_mode is not None:
+            if self.board_clip_batch_mode:
+                self._stop_board_clip_batch_mode()
+                self._cancel_board_clip_guide_draw("4-point all mode cancelled. Any queued pallet fits will keep finishing.")
+                return
             self._cancel_board_clip_guide_draw("Board clip guide drawing cancelled")
             return
 
@@ -7649,35 +8534,47 @@ class AnnotatorApp:
                 self._update_board_clip_mode_ui()
                 self.redraw()
                 self._refresh_board_clip_dialog_state()
-                self.status_var.set(f"Pallet corner mode: corner {slot + 1} saved. Click corner {slot + 2} of 4.")
+                if self.board_clip_batch_mode and self.board_clip_batch_total > 0:
+                    self.status_var.set(
+                        f"4-point all: image {self.board_clip_batch_cursor + 1}/{self.board_clip_batch_total}, "
+                        f"corner {slot + 1} saved. Click corner {slot + 2} of 4."
+                    )
+                else:
+                    self.status_var.set(f"Pallet corner mode: corner {slot + 1} saved. Click corner {slot + 2} of 4.")
                 return
 
-            corners = self._order_polygon_clockwise(self.board_clip_corner_draft[:4])
-            undo_file_path = self.current_file_path
-            undo_annotations = self._copy_annotations(self.annotations)
-            self._set_board_clip_corners_for_image(corners)
+            corners = self._fit_board_clip_corners_to_oriented_box(self.board_clip_corner_draft[:4])
+            current_img_path = self.current_file_path
+            previous_region = self._copy_board_clip_region_snapshot(current_img_path)
+            current_annotations_snapshot = self._copy_annotations(self.annotations)
+            current_loaded_label_format = self.loaded_label_format
+            batch_mode = self.board_clip_batch_mode and quick_mode
+            if batch_mode and current_img_path:
+                self._set_board_clip_corners_for_image(corners, img_path=current_img_path)
             self._cancel_board_clip_guide_draw()
-            parent_changed, _ = self._sync_board_clip_parent_to_current_corners(push_undo=not quick_mode, save=not quick_mode, redraw=False)
-            self.redraw()
-            self._refresh_board_clip_dialog_state()
+
+            if batch_mode and current_img_path:
+                self._queue_board_clip_batch_job(
+                    current_img_path,
+                    corners,
+                    previous_region=previous_region,
+                    base_annotations=current_annotations_snapshot,
+                    loaded_label_format=current_loaded_label_format,
+                )
+                if self._advance_board_clip_batch_capture():
+                    return
+                remaining_jobs = len(self.board_clip_batch_pending_jobs)
+                self._stop_board_clip_batch_mode()
+                if remaining_jobs > 0:
+                    self.status_var.set(
+                        f"4-point all capture complete. Finishing {remaining_jobs} queued pallet fit job(s) in the background."
+                    )
+                else:
+                    self.status_var.set("4-point all capture complete.")
+                return
 
             if quick_mode:
-                previous_annotations = self._copy_annotations(self.annotations)
-                new_annotations, stats = self._run_with_board_clip_target_mode(
-                    "quick",
-                    lambda: self._apply_board_clip_constraints(self.annotations, img_path=self.current_file_path),
-                )
-                fit_changed = (
-                    len(new_annotations) != len(previous_annotations) or
-                    any(self._annotation_differs(old, new) for old, new in zip(previous_annotations, new_annotations))
-                )
-
-                if parent_changed or fit_changed:
-                    self._push_annotation_undo_snapshot(undo_file_path, undo_annotations)
-                    self.annotations = new_annotations
-                    self.annotations_dirty = True
-                    self.save_annotations()
-                    self.redraw()
+                fit_changed, stats, parent_changed = self._apply_quick_board_clip_from_corners(corners)
 
                 if fit_changed:
                     msg = f"Pallet corners saved; pallet box {'updated' if parent_changed else 'confirmed'}; fitted {self._board_clip_target_summary('quick')}"
@@ -7695,6 +8592,9 @@ class AnnotatorApp:
                     self.status_var.set("Pallet corners saved")
                 return
 
+            self._set_board_clip_corners_for_image(corners)
+            parent_changed, _ = self._sync_board_clip_parent_to_current_corners(push_undo=True, save=True, redraw=False)
+            self.redraw()
             if parent_changed:
                 self.status_var.set("Pallet corners saved; pallet box updated")
             else:
@@ -8172,12 +9072,36 @@ class AnnotatorApp:
     def _board_clip_target_summary(self, mode=None):
         mode = mode or self.board_clip_target_mode
         if mode == "quick":
-            return "configured board/stringer annotations"
+            quick_labels = []
+            if self.board_clip_quick_adjust_boards:
+                quick_labels.append("boards")
+            if self.board_clip_quick_adjust_stringers:
+                quick_labels.append("stringers")
+            if not quick_labels:
+                return "no quick-fit classes selected"
+            return " and ".join(quick_labels)
         if mode == "boards":
             return f"board classes {self._format_board_clip_class_id_summary(self.board_clip_board_class_ids)} only"
         if mode == "stringers":
             return f"stringer classes {self._format_board_clip_class_id_summary(self.board_clip_stringer_class_ids)} only"
         return "all non-container annotations"
+
+    def _board_clip_batch_button_text(self):
+        if self.board_clip_batch_mode and self.board_clip_batch_total > 0:
+            current_idx = min(self.board_clip_batch_total, max(1, self.board_clip_batch_cursor + 1))
+            return f"4 Points All {current_idx}/{self.board_clip_batch_total} (Esc)"
+        if self.board_clip_batch_total > 0 and (self.board_clip_batch_pending_jobs or self.board_clip_batch_job_after_id is not None):
+            completed = min(self.board_clip_batch_total, self.board_clip_batch_processed)
+            return f"Finishing 4-Point All {completed}/{self.board_clip_batch_total}"
+        return "4 Points All (Alt+B)"
+
+    def _quick_board_clip_target_class_ids(self):
+        quick_ids = set()
+        if self.board_clip_quick_adjust_boards:
+            quick_ids.update(int(class_id) for class_id in self.board_clip_board_class_ids)
+        if self.board_clip_quick_adjust_stringers:
+            quick_ids.update(int(class_id) for class_id in self.board_clip_stringer_class_ids)
+        return quick_ids
 
     def _set_board_clip_extend_scope(self, scope, save=True):
         normalized = self._normalize_board_clip_extend_scope(scope, fallback=self.board_clip_extend_scope)
@@ -8351,10 +9275,17 @@ class AnnotatorApp:
         guides = self._get_board_clip_guides_for_image()
         corners = self._get_board_clip_corners_for_image()
         basename = os.path.basename(self.current_file_path)
-        if self.board_clip_draw_mode == "corners" and self.board_clip_draw_slot is not None:
+        if self.board_clip_batch_mode and self.board_clip_draw_mode == "corners" and self.board_clip_draw_slot is not None:
+            status_var.set(
+                f"{basename}: 4-point all {self.board_clip_batch_cursor + 1}/{self.board_clip_batch_total}, "
+                f"corner {self.board_clip_draw_slot + 1}/4"
+            )
+        elif self.board_clip_draw_mode == "corners" and self.board_clip_draw_slot is not None:
             status_var.set(f"{basename}: drawing corner {self.board_clip_draw_slot + 1} of 4")
         elif self.board_clip_draw_mode == "edges" and self.board_clip_draw_slot is not None:
             status_var.set(f"{basename}: drawing edge {self.board_clip_draw_slot + 1} of 2")
+        elif self.board_clip_batch_pending_jobs and self.board_clip_batch_total > 0:
+            status_var.set(f"4-point all finishing: {self.board_clip_batch_processed}/{self.board_clip_batch_total} applied")
         else:
             status_var.set(f"{basename}: {len(corners)}/4 corners, {len(guides)}/2 edges saved")
 
@@ -8362,21 +9293,29 @@ class AnnotatorApp:
         drawing = self.board_clip_draw_mode is not None
         drawing_corners = self.board_clip_draw_mode == "corners" and self.board_clip_draw_slot is not None
         drawing_edges = self.board_clip_draw_mode == "edges" and self.board_clip_draw_slot is not None
-        draw_text = f"Click Corner {self.board_clip_draw_slot + 1}/4" if drawing_corners else "Draw 4 Corners (B)"
-        edge_text = f"Draw Edge {self.board_clip_draw_slot + 1}/2" if drawing_edges else "2 Edge Fallback (Shift+B)"
+        draw_text = f"Click Corner {self.board_clip_draw_slot + 1}/4" if drawing_corners else "4 Corners (B)"
+        edge_text = f"Draw Edge {self.board_clip_draw_slot + 1}/2" if drawing_edges else "2-Edge Fallback"
         left_style = "danger" if drawing_corners else "warning"
         edge_style = "danger" if drawing_edges else "info"
         toolbar_style = "danger-outline-sm" if drawing_corners else "warning-outline-sm"
         edge_toolbar_style = "danger-outline-sm" if drawing_edges else "secondary-outline-sm"
+        batch_busy = self.board_clip_batch_mode or bool(self.board_clip_batch_pending_jobs) or self.board_clip_batch_job_after_id is not None
+        batch_text = self._board_clip_batch_button_text()
+        batch_style = "danger" if self.board_clip_batch_mode else ("secondary" if batch_busy else "warning-outline")
+        batch_state = tk.NORMAL if self.board_clip_batch_mode else (tk.DISABLED if drawing or batch_busy else tk.NORMAL)
 
         if self.board_clip_draw_btn:
             self.board_clip_draw_btn.config(text=draw_text, bootstyle=left_style)
         if self.board_clip_edge_btn:
             self.board_clip_edge_btn.config(text=edge_text, bootstyle=edge_style)
+        if self.board_clip_batch_btn:
+            self.board_clip_batch_btn.config(text=batch_text, bootstyle=batch_style, state=batch_state)
         if self.board_clip_draw_toolbar_btn:
             self.board_clip_draw_toolbar_btn.config(text=draw_text, bootstyle=toolbar_style)
         if self.board_clip_edge_toolbar_btn:
             self.board_clip_edge_toolbar_btn.config(text=edge_text, bootstyle=edge_toolbar_style)
+        if self.board_clip_batch_dialog_btn:
+            self.board_clip_batch_dialog_btn.config(text=batch_text, bootstyle=batch_style, state=batch_state)
         if self.board_clip_current_btn:
             self.board_clip_current_btn.config(state=tk.DISABLED if drawing else tk.NORMAL)
         if self.board_clip_extend_parent_btn:
@@ -8414,7 +9353,7 @@ class AnnotatorApp:
 
         dlg = tb.Toplevel(self.root)
         dlg.title("Pallet Fit")
-        dlg.geometry("420x540")
+        dlg.geometry("470x705")
         dlg.resizable(False, False)
         self.board_clip_dialog = dlg
 
@@ -8427,7 +9366,13 @@ class AnnotatorApp:
             "stringer_summary": tk.StringVar(value=self._format_board_clip_class_id_summary(self.board_clip_stringer_class_ids, include_names=True)),
             "use_guides": tk.BooleanVar(value=self.board_clip_use_guides),
             "extend_to_guides": tk.BooleanVar(value=self.board_clip_extend_to_guides),
+            "remove_outside": tk.BooleanVar(value=self.board_clip_remove_outside),
+            "quick_apply": tk.BooleanVar(value=self.board_clip_quick_apply_on_corners),
+            "quick_sync_parent": tk.BooleanVar(value=self.board_clip_quick_sync_parent),
+            "quick_adjust_boards": tk.BooleanVar(value=self.board_clip_quick_adjust_boards),
+            "quick_adjust_stringers": tk.BooleanVar(value=self.board_clip_quick_adjust_stringers),
             "show_guides": tk.BooleanVar(value=self.board_clip_guides_visible.get()),
+            "show_corner_guides": tk.BooleanVar(value=self.board_clip_corner_guides_visible.get()),
             "guide_status_var": tk.StringVar(value=""),
         }
         self.board_clip_dialog_vars = vars_map
@@ -8441,7 +9386,13 @@ class AnnotatorApp:
             self.board_clip_extend_scope = self._normalize_board_clip_extend_scope(vars_map["extend_scope"].get(), fallback=self.board_clip_extend_scope)
             self.board_clip_use_guides = bool(vars_map["use_guides"].get())
             self.board_clip_extend_to_guides = bool(vars_map["extend_to_guides"].get())
+            self.board_clip_remove_outside = bool(vars_map["remove_outside"].get())
+            self.board_clip_quick_apply_on_corners = bool(vars_map["quick_apply"].get())
+            self.board_clip_quick_sync_parent = bool(vars_map["quick_sync_parent"].get())
+            self.board_clip_quick_adjust_boards = bool(vars_map["quick_adjust_boards"].get())
+            self.board_clip_quick_adjust_stringers = bool(vars_map["quick_adjust_stringers"].get())
             self.board_clip_guides_visible.set(bool(vars_map["show_guides"].get()))
+            self.board_clip_corner_guides_visible.set(bool(vars_map["show_corner_guides"].get()))
             self.save_config()
             self._refresh_board_clip_parent_ui()
             self.redraw()
@@ -8457,9 +9408,12 @@ class AnnotatorApp:
             self.status_var.set("Cleared pallet fit guides for this image")
 
         def close_dialog():
+            if self.board_clip_batch_mode:
+                self._stop_board_clip_batch_mode()
             self._cancel_board_clip_guide_draw()
             self.board_clip_dialog_vars = {}
             self.board_clip_dialog = None
+            self.board_clip_batch_dialog_btn = None
             self.board_clip_extend_parent_dialog_btn = None
             self.board_clip_extend_parent_all_dialog_btn = None
             dlg.destroy()
@@ -8467,69 +9421,190 @@ class AnnotatorApp:
         frame = tb.Frame(dlg, padding=14)
         frame.pack(fill=BOTH, expand=True)
 
-        tb.Label(frame, text="Pallet Fit Constraints", font=("Arial", 13, "bold")).pack(anchor=W, pady=(0, 8))
-        tb.Checkbutton(frame, text="Keep selected annotations inside pallet", variable=vars_map["enabled"],
-                       command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(0, 10))
+        tb.Label(frame, text="Pallet Fit", font=("Arial", 14, "bold")).pack(anchor=W, pady=(0, 4))
+        tb.Label(
+            frame,
+            text="Press B, click the 4 pallet corners, and the app will save a rotated guide for fitting while still refreshing the pallet itself as a normal detect rectangle. Boards/stringers use the rotated guide, and the whole step stays undoable.",
+            wraplength=430,
+            justify=LEFT,
+            foreground="#888",
+        ).pack(anchor=W, pady=(0, 10))
 
-        row = tb.Frame(frame)
+        tb.Checkbutton(
+            frame,
+            text="Enable pallet-fit constraints",
+            variable=vars_map["enabled"],
+            command=save_settings,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=(0, 10))
+
+        classes_card = tb.Labelframe(frame, text="Class Mapping", padding=10)
+        classes_card.pack(fill=X, pady=(0, 10))
+
+        row = tb.Frame(classes_card)
         row.pack(fill=X, pady=3)
-        tb.Label(row, text="Pallet class", width=14, anchor=W).pack(side=LEFT)
-        parent_combo = tb.Combobox(row, values=class_choices, textvariable=vars_map["parent"], state="readonly", width=20)
+        tb.Label(row, text="Pallet class", width=16, anchor=W).pack(side=LEFT)
+        parent_combo = tb.Combobox(row, values=class_choices, textvariable=vars_map["parent"], state="readonly", width=24)
         parent_combo.pack(side=RIGHT)
         parent_combo.bind("<<ComboboxSelected>>", save_settings)
 
-        target_row = tb.Frame(frame)
+        board_row = tb.Frame(classes_card)
+        board_row.pack(fill=X, pady=3)
+        tb.Label(board_row, text="Board classes", width=16, anchor=W).pack(side=LEFT)
+        tb.Button(
+            board_row,
+            textvariable=vars_map["board_summary"],
+            command=lambda: [self.choose_board_clip_board_classes(), self._refresh_board_clip_dialog_state()],
+            bootstyle="secondary-outline",
+        ).pack(side=RIGHT)
+
+        stringer_row = tb.Frame(classes_card)
+        stringer_row.pack(fill=X, pady=3)
+        tb.Label(stringer_row, text="Stringer classes", width=16, anchor=W).pack(side=LEFT)
+        tb.Button(
+            stringer_row,
+            textvariable=vars_map["stringer_summary"],
+            command=lambda: [self.choose_board_clip_stringer_classes(), self._refresh_board_clip_dialog_state()],
+            bootstyle="secondary-outline",
+        ).pack(side=RIGHT)
+
+        quick_card = tb.Labelframe(frame, text="After Corner 4 (B)", padding=10)
+        quick_card.pack(fill=X, pady=(0, 10))
+        tb.Checkbutton(
+            quick_card,
+            text="Run the auto-fit pass immediately after the 4th corner",
+            variable=vars_map["quick_apply"],
+            command=save_settings,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=(0, 4))
+        tb.Checkbutton(
+            quick_card,
+            text="Refresh the pallet annotation from the fitted 4-corner box",
+            variable=vars_map["quick_sync_parent"],
+            command=save_settings,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=2)
+        tb.Checkbutton(
+            quick_card,
+            text="Adjust board / lead-board classes",
+            variable=vars_map["quick_adjust_boards"],
+            command=save_settings,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=2)
+        tb.Checkbutton(
+            quick_card,
+            text="Adjust stringer classes",
+            variable=vars_map["quick_adjust_stringers"],
+            command=save_settings,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=2)
+        tb.Checkbutton(
+            quick_card,
+            text="Remove adjusted annotations that end up fully outside the pallet",
+            variable=vars_map["remove_outside"],
+            command=save_settings,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=(2, 0))
+
+        guide_card = tb.Labelframe(frame, text="Guides And Manual Actions", padding=10)
+        guide_card.pack(fill=X, pady=(0, 10))
+
+        target_row = tb.Frame(guide_card)
         target_row.pack(fill=X, pady=3)
-        tb.Label(target_row, text="Adjust", width=14, anchor=W).pack(side=LEFT)
-        target_combo = tb.Combobox(target_row, values=self._board_clip_target_choices(), textvariable=vars_map["target_mode"], state="readonly", width=20)
+        tb.Label(target_row, text="Manual fit target", width=16, anchor=W).pack(side=LEFT)
+        target_combo = tb.Combobox(
+            target_row,
+            values=self._board_clip_target_choices(),
+            textvariable=vars_map["target_mode"],
+            state="readonly",
+            width=24,
+        )
         target_combo.pack(side=RIGHT)
         target_combo.bind("<<ComboboxSelected>>", save_settings)
 
-        board_row = tb.Frame(frame)
-        board_row.pack(fill=X, pady=3)
-        tb.Label(board_row, text="Board classes", width=14, anchor=W).pack(side=LEFT)
-        tb.Button(board_row, textvariable=vars_map["board_summary"], command=lambda: [self.choose_board_clip_board_classes(), self._refresh_board_clip_dialog_state()], bootstyle="secondary-outline").pack(side=RIGHT)
-
-        stringer_row = tb.Frame(frame)
-        stringer_row.pack(fill=X, pady=3)
-        tb.Label(stringer_row, text="Stringer classes", width=14, anchor=W).pack(side=LEFT)
-        tb.Button(stringer_row, textvariable=vars_map["stringer_summary"], command=lambda: [self.choose_board_clip_stringer_classes(), self._refresh_board_clip_dialog_state()], bootstyle="secondary-outline").pack(side=RIGHT)
-
-        extend_scope_row = tb.Frame(frame)
-        extend_scope_row.pack(fill=X, pady=(10, 4))
-        tb.Label(extend_scope_row, text="Box extend", width=14, anchor=W).pack(side=LEFT)
+        extend_scope_row = tb.Frame(guide_card)
+        extend_scope_row.pack(fill=X, pady=(3, 6))
+        tb.Label(extend_scope_row, text="X / Alt+X target", width=16, anchor=W).pack(side=LEFT)
         extend_scope_btns = tb.Frame(extend_scope_row)
         extend_scope_btns.pack(side=RIGHT, fill=X, expand=True)
-        tb.Radiobutton(extend_scope_btns, text="All", variable=vars_map["extend_scope"], value="all",
-                       command=save_settings, bootstyle="toolbutton-outline").pack(side=LEFT, expand=True, fill=X, padx=(0, 2))
-        tb.Radiobutton(extend_scope_btns, text="Stringers", variable=vars_map["extend_scope"], value="stringers",
-                       command=save_settings, bootstyle="toolbutton-outline").pack(side=LEFT, expand=True, fill=X, padx=(2, 0))
+        tb.Radiobutton(
+            extend_scope_btns,
+            text="All",
+            variable=vars_map["extend_scope"],
+            value="all",
+            command=save_settings,
+            bootstyle="toolbutton-outline",
+        ).pack(side=LEFT, expand=True, fill=X, padx=(0, 2))
+        tb.Radiobutton(
+            extend_scope_btns,
+            text="Stringers",
+            variable=vars_map["extend_scope"],
+            value="stringers",
+            command=save_settings,
+            bootstyle="toolbutton-outline",
+        ).pack(side=LEFT, expand=True, fill=X, padx=(2, 0))
 
-        tb.Checkbutton(frame, text="Use saved corners or edges when available", variable=vars_map["use_guides"],
-                       command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(8, 4))
-        tb.Checkbutton(frame, text="Extend boxes to saved edges instead of only clipping", variable=vars_map["extend_to_guides"],
-                       command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(0, 4))
-        tb.Checkbutton(frame, text="Show saved pallet guides on canvas", variable=vars_map["show_guides"],
-                       command=save_settings, bootstyle="round-toggle").pack(anchor=W, pady=(0, 10))
+        tb.Checkbutton(
+            guide_card,
+            text="Use saved 4-corner / 2-edge guides when available",
+            variable=vars_map["use_guides"],
+            command=save_settings,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=(0, 4))
+        tb.Checkbutton(
+            guide_card,
+            text="Extend toward the saved pallet-oriented guide instead of only clipping",
+            variable=vars_map["extend_to_guides"],
+            command=save_settings,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=2)
+        tb.Checkbutton(
+            guide_card,
+            text="Show saved pallet guides on the canvas",
+            variable=vars_map["show_guides"],
+            command=save_settings,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=2)
+        tb.Checkbutton(
+            guide_card,
+            text="Show saved 4-point dots + dotted outline",
+            variable=vars_map["show_corner_guides"],
+            command=save_settings,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=2)
 
         tb.Label(frame, textvariable=vars_map["guide_status_var"], font=("Consolas", 9), foreground="#888").pack(anchor=W, pady=(0, 10))
 
         corner_btns = tb.Frame(frame)
         corner_btns.pack(fill=X, pady=(0, 4))
-        tb.Button(corner_btns, text="Draw 4 Corners (B)", command=lambda: [self.start_quick_board_clip_corners(), self._refresh_board_clip_dialog_state()],
-                 bootstyle="warning", width=16).pack(side=LEFT, padx=(0, 4))
-        tb.Button(corner_btns, text="2 Edges (Shift+B)", command=lambda: [self.start_quick_board_clip_guides(), self._refresh_board_clip_dialog_state()],
-                 bootstyle="secondary-outline", width=16).pack(side=LEFT, padx=4)
+        tb.Button(
+            corner_btns,
+            text="4 Corners (B)",
+            command=lambda: [self.start_quick_board_clip_corners(), self._refresh_board_clip_dialog_state()],
+            bootstyle="warning",
+            width=16,
+        ).pack(side=LEFT, padx=(0, 4))
+        self.board_clip_batch_dialog_btn = tb.Button(
+            corner_btns,
+            text=self._board_clip_batch_button_text(),
+            command=lambda: [self.start_quick_board_clip_corners_batch(), self._refresh_board_clip_dialog_state()],
+            bootstyle="warning-outline",
+            width=18,
+        )
+        self.board_clip_batch_dialog_btn.pack(side=LEFT, padx=(0, 4))
 
-        guide_btns = tb.Frame(frame)
-        guide_btns.pack(fill=X, pady=2)
-        tb.Button(guide_btns, text="Set Edge 1", command=lambda: [self._start_board_clip_guide_draw(0, mode="edges"), self._refresh_board_clip_dialog_state()],
-                 bootstyle="success-outline", width=12).pack(side=LEFT, padx=(0, 4))
-        tb.Button(guide_btns, text="Set Edge 2", command=lambda: [self._start_board_clip_guide_draw(1, mode="edges"), self._refresh_board_clip_dialog_state()],
-                 bootstyle="warning-outline", width=12).pack(side=LEFT, padx=4)
-        tb.Button(guide_btns, text="Clear All", command=clear_guides, bootstyle="danger-outline", width=12).pack(side=RIGHT, padx=(4, 0))
+        edge_btns = tb.Frame(frame)
+        edge_btns.pack(fill=X, pady=(0, 4))
+        tb.Button(
+            edge_btns,
+            text="2-Edge Fallback (Shift+B)",
+            command=lambda: [self.start_quick_board_clip_guides(), self._refresh_board_clip_dialog_state()],
+            bootstyle="secondary-outline",
+            width=20,
+        ).pack(side=LEFT, padx=(0, 4))
+        tb.Button(edge_btns, text="Clear Guides", command=clear_guides, bootstyle="danger-outline", width=12).pack(side=RIGHT)
 
-        tb.Button(frame, text="Apply To Current Image", command=self._apply_board_clip_to_current_annotations,
+        tb.Button(frame, text="Fit Current (V)", command=self._apply_board_clip_to_current_annotations,
                  bootstyle="primary").pack(fill=X, pady=(12, 6))
         self.board_clip_extend_parent_dialog_btn = tb.Button(frame, text=self._board_clip_extend_dialog_current_button_text(),
                  command=self.extend_board_clip_to_parent_current_selected, bootstyle="info-outline")
@@ -8540,8 +9615,8 @@ class AnnotatorApp:
 
         tb.Label(
             frame,
-            text="Default setup is class 0 as the container, board classes 1 and 4, and stringer class 2. Adjust controls drive pallet fit. Box extend scope drives the click actions above. Hotkeys: X current all, Shift+X current stringers, Alt+X dataset all, Alt+Shift+X dataset stringers.",
-            wraplength=380,
+            text="Defaults: pallet class 0, board classes 1 and 4, stringer class 2. B keeps the pallet as a normal detect box while the rotated guide drives extension and cleanup. Alt+B runs that same workflow across the filtered list from the current image onward.",
+            wraplength=430,
             justify=LEFT,
             font=("Arial", 9),
             foreground="#888"
