@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Optional PyTorch / Ultralytics backend for `.pt` models.
+# Tested on 2026-04-15.
+ultralytics==8.4.37

@@ -1,0 +1,2 @@
+-r requirements-pt.txt
+-r requirements-tflite.txt

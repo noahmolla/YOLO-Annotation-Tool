@@ -10,6 +10,7 @@ import random
 import threading
 import time
 import math
+import re
 import numpy as np
 import json
 import cv2
@@ -35,7 +36,9 @@ class AnnotatorApp:
         self.root = root
         self.root.title("Modern YOLO Annotator")
         self.root.geometry("1600x900")
-        self.root.state('zoomed') # Maximize on start
+        self._pane_layout_after_id = None
+        self._pane_layout_retries_remaining = 0
+        self._apply_startup_window_state()
         
         # --- Data Model ---
         self.image_paths = []          # List of absolute paths to images
@@ -234,7 +237,116 @@ class AnnotatorApp:
         
         # Restore Config
         self.load_config()
+        self._schedule_main_pane_layout(retries=4)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _apply_startup_window_state(self):
+        """Maximize on platforms that support it without breaking macOS startup layout."""
+        try:
+            windowing_system = str(self.root.tk.call("tk", "windowingsystem")).lower()
+        except tk.TclError:
+            windowing_system = ""
+
+        # macOS Tk often behaves better with an explicit geometry than an eager zoomed state.
+        if windowing_system == "aqua":
+            return
+
+        try:
+            self.root.state("zoomed")
+        except tk.TclError:
+            try:
+                self.root.attributes("-zoomed", True)
+            except tk.TclError:
+                pass
+
+    def _apply_saved_geometry(self, geometry_value):
+        """Clamp restored geometry so configs from another machine do not hide the side panes."""
+        geometry_str = str(geometry_value or "").strip()
+        match = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)?([+-]\d+)?", geometry_str)
+        if not match:
+            return
+
+        screen_w = max(1, self.root.winfo_screenwidth())
+        screen_h = max(1, self.root.winfo_screenheight())
+        usable_h = max(1, screen_h - 60)
+
+        width = int(match.group(1))
+        height = int(match.group(2))
+        x = int(match.group(3)) if match.group(3) else None
+        y = int(match.group(4)) if match.group(4) else None
+
+        min_width = min(screen_w, 1100)
+        min_height = min(usable_h, 720)
+        width = min(max(width, min_width), screen_w)
+        height = min(max(height, min_height), usable_h)
+
+        if x is None or width >= screen_w or x > screen_w - 80 or (x + width) < 80:
+            x = max(0, (screen_w - width) // 2)
+        if y is None or height >= usable_h or y > screen_h - 80 or (y + height) < 80:
+            y = max(0, (usable_h - height) // 2)
+
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _schedule_main_pane_layout(self, retries=3):
+        """Repair collapsed side panes after geometry changes, especially on macOS Tk."""
+        self._pane_layout_retries_remaining = max(self._pane_layout_retries_remaining, retries)
+        if self._pane_layout_after_id is not None:
+            try:
+                self.root.after_cancel(self._pane_layout_after_id)
+            except tk.TclError:
+                pass
+        self._pane_layout_after_id = self.root.after_idle(self._ensure_main_pane_layout)
+
+    def _ensure_main_pane_layout(self):
+        self._pane_layout_after_id = None
+        if not hasattr(self, "panes"):
+            return
+
+        try:
+            self.root.update_idletasks()
+            total_width = self.panes.winfo_width()
+            if total_width <= 1:
+                if self._pane_layout_retries_remaining > 0:
+                    self._pane_layout_retries_remaining -= 1
+                    self._pane_layout_after_id = self.root.after(120, self._ensure_main_pane_layout)
+                return
+
+            min_left = 250
+            min_right = 240
+            target_left = 320
+            target_right = 300
+            min_center = 520
+
+            max_sidebar_total = max(0, total_width - min_center)
+            if max_sidebar_total < (min_left + min_right):
+                left_width = max(180, max_sidebar_total // 2)
+                right_width = max(180, max_sidebar_total - left_width)
+            else:
+                left_width = min(target_left, max_sidebar_total - min_right)
+                right_width = min(target_right, max_sidebar_total - left_width)
+                left_width = max(min_left, left_width)
+                right_width = max(min_right, right_width)
+
+            first_sash = left_width
+            second_sash = max(first_sash + 220, total_width - right_width)
+            second_sash = min(second_sash, total_width - 180)
+
+            if len(self.panes.panes()) >= 3:
+                self.left_panel_container.configure(width=left_width)
+                self.right_panel.configure(width=max(180, total_width - second_sash))
+                self.panes.sashpos(0, first_sash)
+                self.panes.sashpos(1, second_sash)
+
+            self.root.update_idletasks()
+            left_actual = self.left_panel_container.winfo_width()
+            right_actual = self.right_panel.winfo_width()
+            if (left_actual < 180 or right_actual < 180) and self._pane_layout_retries_remaining > 0:
+                self._pane_layout_retries_remaining -= 1
+                self._pane_layout_after_id = self.root.after(120, self._ensure_main_pane_layout)
+            else:
+                self._pane_layout_retries_remaining = 0
+        except tk.TclError:
+            pass
 
     def load_config(self):
         if not os.path.exists(CONFIG_FILE): return
@@ -244,7 +356,7 @@ class AnnotatorApp:
                 
             # Restore Window
             if "geometry" in cfg:
-                self.root.geometry(cfg["geometry"])
+                self._apply_saved_geometry(cfg["geometry"])
             
             # Restore Classes
             if "classes" in cfg and cfg["classes"]:
@@ -358,6 +470,8 @@ class AnnotatorApp:
                 
         except Exception as e:
             print(f"Failed to load config: {e}")
+        finally:
+            self._schedule_main_pane_layout(retries=4)
 
     def save_config(self):
         cfg = {
@@ -801,6 +915,7 @@ class AnnotatorApp:
         
         # --- LEFT PANEL: Controls & Classes ---
         self.left_panel_container = tb.Frame(self.panes, width=320)
+        self.left_panel_container.pack_propagate(False)
         self.panes.add(self.left_panel_container, weight=1)
         left_panel_bg = ttk.Style().lookup("TFrame", "background") or self.root.cget("background")
         self.left_scroll_canvas = tk.Canvas(
@@ -1256,6 +1371,7 @@ class AnnotatorApp:
 
         # --- RIGHT PANEL: File List ---
         self.right_panel = tb.Frame(self.panes, width=300)
+        self.right_panel.pack_propagate(False)
         self.panes.add(self.right_panel, weight=1)
         
         # Filter
@@ -1302,6 +1418,7 @@ class AnnotatorApp:
         
         self.file_list.bind("<<ListboxSelect>>", self.on_file_selected)
         self.file_list.bind("<Button-3>", self.on_file_list_right_click)
+        self._schedule_main_pane_layout(retries=4)
 
     def _on_left_panel_content_configure(self, event=None):
         if not hasattr(self, "left_scroll_canvas") or self.left_scroll_canvas is None:

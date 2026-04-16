@@ -1,227 +1,192 @@
-# 🔧 Installation Guide
+# Installation Guide
 
-This guide covers detailed installation steps for the YOLO Annotator.
+This project now ships with split requirement files so you can install the base app first and then add only the model backends you actually need.
 
----
+If you want the easiest install on both Windows and macOS, start with Python 3.12.
 
-## ⚡ Quick Install (Windows)
+## Requirement Files
+
+| File | Installs | Best use |
+| --- | --- | --- |
+| `requirements.txt` | Base desktop app only | Manual annotation, dataset tools, image triage sorter |
+| `requirements-pt.txt` | Base app + Ultralytics / PyTorch | `.pt` model support |
+| `requirements-tflite.txt` | Base app + TensorFlow | `.tflite` model support |
+| `requirements-full.txt` | Base app + both optional backends | Windows and Apple Silicon Macs using Python 3.10-3.13 |
+
+## Recommended Paths
+
+### Windows or Apple Silicon macOS, full feature set
+
+Use Python 3.12, then:
+
+Windows:
 
 ```powershell
-# 1. Open PowerShell in the yolo_annotator folder
-
-# 2. Create virtual environment
 python -m venv venv
-
-# 3. Activate it
-.\venv\Scripts\Activate
-
-# 4. Install dependencies
-pip install -r requirements.txt
-
-# 5. Run the app
-python main.py
 ```
 
----
-
-## ⚡ Quick Install (macOS)
+macOS:
 
 ```bash
-# 1. Open Terminal in the yolo_annotator folder
-
-# 2. Install Python 3.12 if needed (via Homebrew)
-brew install python@3.12
-
-# 3. Create virtual environment
 python3 -m venv venv
+```
 
-# 4. Activate it
+Activate the venv.
+
+Windows PowerShell:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+
+macOS Terminal:
+
+```bash
 source venv/bin/activate
+```
 
-# 5. Install dependencies
-pip install -r requirements.txt
+Upgrade pip and install everything:
 
-# 6. Run the app
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements-full.txt
 python main.py
 ```
 
-> **Apple Silicon (M1/M2/M3) Note:** If TensorFlow fails to install, replace the tensorflow line in `requirements.txt` with:
-> ```
-> tensorflow-macos>=2.13.0
-> ```
-> Or simply comment out the tensorflow line if you only use `.pt` models.
-
----
-
-## ⚡ Quick Install (Linux)
+### Windows or Apple Silicon macOS, base app only
 
 ```bash
-# 1. Open terminal in the yolo_annotator folder
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python main.py
+```
 
-# 2. Install tkinter if not already installed
-# Ubuntu/Debian:
-sudo apt install python3-tk python3-venv
+Later, add only the backend you need:
 
-# 3. Create virtual environment
+```bash
+python -m pip install -r requirements-pt.txt
+python -m pip install -r requirements-tflite.txt
+```
+
+### macOS Intel
+
+Use Python 3.12.
+
+Base app only:
+
+```bash
 python3 -m venv venv
-
-# 4. Activate it
 source venv/bin/activate
-
-# 5. Install dependencies
-pip install -r requirements.txt
-
-# 6. Run the app
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 python main.py
 ```
 
----
-
-## 🐍 Python Version
-
-| Python Version | Status |
-|:---:|:---:|
-| 3.10 | ✅ Recommended |
-| 3.11 | ✅ Recommended |
-| 3.12 | ✅ Works |
-| 3.13+ | ⚠️ PyTorch works, TensorFlow may not |
-| 3.8, 3.9 | ⚠️ May work but not tested |
-
----
-
-## 📦 What Gets Installed
-
-The `requirements.txt` installs support for **both** model types:
-
-| Package | Purpose | Size |
-|:---|:---|:---|
-| `ultralytics` | PyTorch YOLO models (`.pt`) | ~800MB |
-| `tensorflow` | TFLite models (`.tflite`) | ~500MB |
-| `Pillow`, `numpy`, `opencv-python` | Image processing | ~50MB |
-| `ttkbootstrap` | Modern UI | ~5MB |
-| `PyYAML` | Class definitions | ~1MB |
-
-### PyTorch Only (skip TensorFlow)
-
-If you only use `.pt` models, comment out the tensorflow line in `requirements.txt`:
-```
-# tensorflow>=2.13.0,<2.18.0
-```
-Then run:
-```bash
-pip install -r requirements.txt
-```
-This saves ~500MB and avoids any TensorFlow install issues.
-
----
-
-## 🐛 Troubleshooting
-
-### TensorFlow fails to install
-
-This is the most common issue. Solutions:
-
-1. **Comment it out** — If you only use `.pt` models, just comment the tensorflow line:
-   ```
-   # tensorflow>=2.13.0,<2.18.0
-   ```
-
-2. **Try a specific version:**
-   ```bash
-   # Python 3.10
-   pip install tensorflow==2.15.0
-
-   # Python 3.11
-   pip install tensorflow==2.16.0
-
-   # Python 3.12
-   pip install tensorflow==2.17.0
-   ```
-
-3. **macOS Apple Silicon:**
-   ```bash
-   pip install tensorflow-macos>=2.13.0
-   ```
-
-### "No module named 'ultralytics'"
+If you need `.tflite` support on Intel macOS:
 
 ```bash
-pip install ultralytics
+python -m pip install -r requirements-tflite.txt
 ```
 
-### "Python not found" or wrong version
+This repo does not present a latest-version pip recipe for `.pt` support on Intel Macs because current upstream PyTorch wheels do not offer a clean path there.
 
-1. Download Python 3.10-3.12 from [python.org](https://www.python.org/downloads/)
-2. During installation, check **"Add Python to PATH"**
-3. Verify: `python --version`
+## Python Version Guidance
 
-### Application won't start (macOS)
+| Python | Base app | `.pt` models | `.tflite` models | Notes |
+| --- | --- | --- | --- | --- |
+| 3.12 | Recommended | Recommended | Recommended where supported | Best all-around choice |
+| 3.13 | Good | Good on Windows and Apple Silicon | Good on Windows and Apple Silicon | Still not a fit for Intel Mac TensorFlow |
+| 3.14 | Base app works | Current Windows `.pt` install path tested locally | No TensorFlow wheels in this setup | Use only if you do not need `.tflite` |
 
-macOS may need tkinter installed separately:
+## What the backend files do
+
+### `requirements-pt.txt`
+
+Pins Ultralytics to a tested release:
+
+- `ultralytics==8.4.37`
+
+That leaves PyTorch resolution to pip, which is the least surprising setup on supported platforms.
+
+### `requirements-tflite.txt`
+
+Uses environment markers so pip selects the right TensorFlow line for the current platform:
+
+- TensorFlow 2.21.0 on Windows and Apple Silicon macOS for Python 3.10-3.13
+- TensorFlow 2.16.2 on Intel macOS for Python 3.10-3.12
+
+No more editing requirement files by hand and no more commenting out TensorFlow just to get the app installed.
+
+## Verification
+
+### Base app
+
 ```bash
-brew install python-tk@3.12
-```
-
-### GPU not detected / CUDA errors
-
-For GPU support with PyTorch models:
-1. Install NVIDIA CUDA Toolkit
-2. Install cuDNN
-3. Reinstall PyTorch with CUDA:
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-```
-
-> **Note:** GPU is optional. The app works fine with CPU, just slower for auto-annotation.
-
----
-
-## ✅ Verify Installation
-
-```bash
-# Check Python version (need 3.10-3.12)
 python --version
-
-# Check core dependencies
-python -c "import tkinter; print('Tkinter OK')"
+python -c "import tkinter; print('tkinter OK')"
 python -c "import ttkbootstrap; print('ttkbootstrap OK')"
-python -c "import PIL; print('Pillow OK')"
+python -c "from PIL import Image; print('Pillow OK')"
 python -c "import numpy; print('NumPy OK')"
 python -c "import cv2; print('OpenCV OK')"
 python -c "import yaml; print('PyYAML OK')"
+python -c "import main; print('main import OK')"
+```
 
-# Check model inference (at least one should work)
+### `.pt` backend
+
+```bash
 python -c "from ultralytics import YOLO; print('Ultralytics OK')"
+python -c "from inference import PyTorchYOLOModel; print('PyTorch backend import OK')"
+```
+
+### `.tflite` backend
+
+```bash
 python -c "import tensorflow.lite as tflite; print('TensorFlow Lite OK')"
+python -c "from inference import TFLiteModel; print('TFLite backend import OK')"
 ```
 
----
+## Troubleshooting
 
-## 💻 System Requirements
+### Install fails before downloading large wheels
 
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| **OS** | Windows 10, Ubuntu 20.04, macOS 11 | Windows 11, Ubuntu 22.04, macOS 13+ |
-| **Python** | 3.10 | 3.11 or 3.12 |
-| **RAM** | 4 GB | 8 GB+ |
-| **Storage** | 2 GB | 5 GB+ |
-| **GPU** | Not required | NVIDIA (for faster inference) |
-
----
-
-## 🔄 Updating
+Upgrade pip first:
 
 ```bash
-git pull
-pip install -r requirements.txt --upgrade
+python -m pip install --upgrade pip
 ```
 
----
+Then retry the relevant requirements file.
 
-## 🗑️ Uninstalling
+### `No module named 'ultralytics'`
 
 ```bash
-deactivate
-# Windows: rmdir /s /q yolo_annotator
-# Linux/Mac: rm -rf yolo_annotator
+python -m pip install -r requirements-pt.txt
 ```
+
+### `TFLite runtime not found`
+
+```bash
+python -m pip install -r requirements-tflite.txt
+```
+
+### `ImportError` on macOS Intel when installing `.pt` support
+
+That is an upstream wheel-availability issue, not a repo bug. Stay on the base app or `.tflite` support on Intel macOS unless you want to manage a custom PyTorch install manually.
+
+### `tkinter` import fails on macOS
+
+Use a Python build with Tk included, or install the matching Tk support package for your Python version and verify with:
+
+```bash
+python -c "import tkinter; print('tkinter OK')"
+```
+
+## Research Notes
+
+These packaging choices were made against current upstream compatibility information as of 2026-04-15:
+
+- [PyTorch install docs](https://docs.pytorch.org/get-started/locally/)
+- [PyTorch wheel availability on PyPI](https://pypi.org/project/torch/)
+- [Ultralytics package metadata on PyPI](https://pypi.org/project/ultralytics/)
+- [TensorFlow pip install matrix](https://www.tensorflow.org/install/pip)

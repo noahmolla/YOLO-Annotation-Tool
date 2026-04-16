@@ -1,87 +1,120 @@
-# 🏷️ YOLO Annotator
+# YOLO Annotator
 
-A modern, feature-rich Python application for annotating images using YOLO models. Supports both manual annotation and AI-assisted auto-annotation with TFLite (`.tflite`) and PyTorch (`.pt`) models.
+A desktop annotation tool for YOLO datasets with manual labeling, dataset utilities, and optional auto-annotation backends for both PyTorch (`.pt`) and TensorFlow Lite (`.tflite`) models.
 
-![Python 3.10-3.12](https://img.shields.io/badge/python-3.10--3.12-blue.svg)
-![License AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)
+This repo now uses a split install so the base app is easy to install on both Windows and macOS without forcing every user through the most fragile ML dependencies.
 
----
+## Install
 
-## ✨ Features
+Use Python 3.12 if you want the least friction on both Windows and macOS.
 
-- 🎯 **Auto-annotation** - Use YOLO models to automatically detect and annotate objects
-- ✏️ **Manual annotation** - Intuitive click-and-drag bounding box creation
-- 🎨 **Modern UI** - Dark theme with ttkbootstrap styling
-- ⌨️ **Keyboard shortcuts** - Fast workflow with hotkeys (1-9 for classes, R to repeat, etc.)
-- 💾 **Auto-save** - Annotations saved automatically when navigating
-- 🔍 **Smart filtering** - Filter images by class, annotation status, or custom queries
-- 📊 **Dataset statistics** - View class distribution and annotation progress
-- 📦 **Import/Export** - YOLO zip format support with train/val/test splits
-- 🔄 **Undo/Redo** - Full undo stack for annotation changes (Ctrl+Z / Ctrl+Y)
-- 🖼️ **Gallery view** - Visual thumbnail browser for quick navigation
-- 🔎 **Duplicate finder** - Identify and remove duplicate images
-- ⚙️ **Configurable thresholds** - Per-class confidence and IOU settings
+### 1. Create and activate a virtual environment
 
----
+Windows PowerShell:
 
-## 🚀 Quick Start
-
-### 1. Prerequisites
-
-- **Python 3.10, 3.11, or 3.12** - [Download Python](https://www.python.org/downloads/)
-- **Git** (optional) - For cloning the repository
-
-### 2. Installation
-
-```bash
-# Clone or download this directory
-cd yolo_annotator
-
-# Create virtual environment (recommended)
+```powershell
 python -m venv venv
-
-# Activate virtual environment
-# Windows:
-venv\Scripts\activate
-# macOS/Linux:
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
+.\venv\Scripts\Activate.ps1
 ```
 
-> **Note:** If TensorFlow fails to install (common on Python 3.13+ or Apple Silicon), see [INSTALL.md](INSTALL.md) for workarounds. You can still use `.pt` models without TensorFlow.
+macOS Terminal:
 
-### 3. Run the Application
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### 2. Upgrade pip
+
+```bash
+python -m pip install --upgrade pip
+```
+
+### 3. Install what you need
+
+Base app only, including manual annotation and dataset tools:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Add PyTorch / Ultralytics support for `.pt` models:
+
+```bash
+python -m pip install -r requirements-pt.txt
+```
+
+Add TensorFlow Lite support for `.tflite` models:
+
+```bash
+python -m pip install -r requirements-tflite.txt
+```
+
+Install both optional backends in one step:
+
+```bash
+python -m pip install -r requirements-full.txt
+```
+
+`requirements-full.txt` is the recommended "just give me everything" path on Windows and Apple Silicon Macs when using Python 3.10-3.13. On Python 3.14 it will install everything that is currently available, which means the base app plus `.pt` support but not TensorFlow.
+
+### 4. Launch
 
 ```bash
 python main.py
 ```
 
----
+Windows users can also run `run.bat`. macOS and Linux users can run `./run.sh`.
 
-## 📖 Usage Guide
+## Compatibility
 
-### Loading a Workspace
+As of 2026-04-15, the safest cross-platform choice is still Python 3.12.
 
-1. Click **"Load Workspace"** and select a folder
-2. The app will create/use this structure:
-   ```
-   your_workspace/
-   ├── images/          # Your images go here
-   ├── labels/          # Annotation files (auto-created)
-   └── data.yaml        # Class definitions
-   ```
+| Platform | Base app | `.pt` models | `.tflite` models | Best choice |
+| --- | --- | --- | --- | --- |
+| Windows x86_64 | Yes | Yes | Yes on Python 3.10-3.13 | Python 3.12 + `requirements-full.txt` |
+| macOS Apple Silicon | Yes | Yes | Yes on Python 3.10-3.13 | Python 3.12 + `requirements-full.txt` |
+| macOS Intel | Yes | No easy current pip path for latest PyTorch wheels | Yes on Python 3.10-3.12 | Python 3.12 + `requirements.txt` or `requirements-tflite.txt` |
 
-### Loading Classes
+Why the split install exists:
 
-Classes can be loaded in multiple ways:
-- **From YAML** (recommended): Click "Load Classes" → select a `.yaml` file with a `names` key
-- **From text file**: Click "Load Classes" → select a `.txt` file (one class per line)
-- **Type manually**: Click "Type Classes" → enter comma-separated class names
-- **Auto-detect**: If your workspace has a `data.yaml`, classes load automatically
+- Current Ultralytics releases are pure Python, but PyTorch wheel availability is what decides whether `.pt` support installs cleanly on a given platform.
+- Current TensorFlow wheels support Windows and Apple Silicon on Python 3.10-3.13, while macOS Intel is limited to the older 2.16.2 line.
+- The app itself does not require either backend unless you actually load those model types.
 
-**YAML format example:**
+## Features
+
+- Manual bounding-box annotation with click-and-drag editing
+- Optional AI-assisted auto-annotation from `.pt` and `.tflite` models
+- Undo / redo, gallery view, filtering, and dataset statistics
+- YOLO zip import/export tools with train/val/test handling
+- Duplicate finder, suspicious-label checks, and format repair tools
+- Separate image triage sorter in `pre_annotation_sorter/`
+
+## Usage
+
+### Workspaces
+
+Choose a workspace folder and the app will use this structure:
+
+```text
+your_workspace/
+├── images/
+├── labels/
+└── data.yaml
+```
+
+### Classes
+
+Classes can be loaded from:
+
+- A YAML file with a `names` list
+- A text file with one class per line
+- Manual comma-separated input
+- An existing workspace `data.yaml`
+
+Example YAML:
+
 ```yaml
 names:
   - person
@@ -89,169 +122,81 @@ names:
   - bicycle
 ```
 
-### Loading a Model (Optional)
+### Models
 
-For auto-annotation:
-1. Click **"Load Model"**
-2. Select a YOLO model file:
-   - `.pt` - PyTorch models (YOLOv5, v8, v11, etc.)
-   - `.tflite` - TensorFlow Lite models
+Optional auto-annotation supports:
 
-### Annotating Images
+- `.pt` files through Ultralytics / PyTorch
+- `.tflite` files through TensorFlow Lite
 
-| Action | Method |
-|--------|--------|
-| Create box | Click and drag on canvas |
-| Delete box | Right-click on box |
-| Select class | Click in class list OR press 1-9 keys |
-| Move box | Click and drag existing box |
-| Resize box | Drag box edges/corners |
-| Repeat last box | Press **R** |
-| Auto-annotate | Press **Q** or click "Current" button |
+### Common shortcuts
 
-### Navigation
+| Action | Shortcut |
+| --- | --- |
+| Previous image | `A` or `Left` |
+| Next image | `D` or `Right` |
+| Undo | `Ctrl+Z` |
+| Redo | `Ctrl+Y` |
+| Repeat last box | `R` |
+| Auto-annotate current image | `Q` |
+| Open gallery | `G` |
 
-| Key | Action |
-|-----|--------|
-| **A** / **←** | Previous image |
-| **D** / **→** | Next image |
-| **G** | Open gallery view |
-| **Ctrl+G** | Go to image number |
-| **F5** | Refresh workspace |
+## Troubleshooting
 
-### Editing
+### `No module named 'ultralytics'`
 
-| Key | Action |
-|-----|--------|
-| **Ctrl+Z** | Undo |
-| **Ctrl+Y** | Redo |
-| **Delete** | Delete current image |
-| **Backspace** | Clear annotations for selected class |
-| **Ctrl+Backspace** | Clear ALL annotations |
-| **Escape** | Deselect all |
+Install the `.pt` backend:
 
----
-
-## 📁 Output Format
-
-Annotations are saved in **YOLO format**:
-- Location: `labels/` folder (parallel to `images/`)
-- File format: One `.txt` file per image with same name
-- Content: `class_id x_center y_center width height` (normalized 0-1)
-
-**Example (`image001.txt`):**
-```
-0 0.453125 0.634375 0.21875 0.5125
-1 0.7125 0.34375 0.15 0.2875
-```
-
----
-
-## 🔧 Configuration
-
-The app stores user-specific settings (last workspace, classes, window geometry) in `config.json`, which is generated automatically on first run. See [`config.example.json`](config.example.json) for the format.
-
-### Confidence & IOU Settings
-
-Click **"⚙ Confidence & IOU Settings"** to configure:
-- Default confidence threshold (0.0 - 1.0)
-- Per-class confidence thresholds
-- IOU threshold for NMS
-
-### Model Version
-
-Select the appropriate YOLO version:
-- **Auto** - Automatically detect
-- **v5** - YOLOv5 output format
-- **v8/v11** - YOLOv8/v11 output format
-- **v26** - YOLO26 (latest, NMS-free architecture)
-
-### Inference Size
-
-For PyTorch models, you can configure the inference resolution:
-- **Auto** - Use model default (usually 640)
-- **640** - Standard resolution, faster
-- **1280** - High resolution, better for small objects (recommended for YOLO26)
-- **1024** - Good balance for 1024x1024 images
-- **512/320** - Lower resolution for speed
-
-> **Tip:** When using YOLO26, selecting **1280** inference size often gives better accuracy, even if your images are smaller (e.g., 1024x1024). The model will upscale internally.
-
----
-
-## 🐛 Troubleshooting
-
-### "ModuleNotFoundError: No module named 'tflite_runtime'"
-
-Install TensorFlow or comment it out in `requirements.txt` if you only use `.pt` models:
 ```bash
-pip install tensorflow>=2.13.0,<2.18.0
+python -m pip install -r requirements-pt.txt
 ```
 
-### "No module named 'ultralytics'"
+### `TFLite runtime not found`
 
-Install ultralytics for PyTorch model support:
+Install the `.tflite` backend:
+
 ```bash
-pip install ultralytics
+python -m pip install -r requirements-tflite.txt
 ```
 
-### Application won't start
+### macOS Intel and `.pt` models
 
-1. Make sure you're in a virtual environment
-2. Verify Python version: `python --version` (need 3.10-3.12)
-3. Reinstall requirements: `pip install -r requirements.txt --force-reinstall`
-4. **macOS**: You may need to install tkinter: `brew install python-tk@3.12`
+Current upstream PyTorch pip wheels do not provide a simple latest-version install path for Intel Macs, so this repo does not try to force one. On Intel Macs, use manual annotation or `.tflite` models unless you are prepared to manage a custom PyTorch install yourself.
 
-### TFLite slower than PyTorch
+### `tkinter` is missing on macOS
 
-This is normal. TFLite is optimized for edge devices. For desktop use, PyTorch (`.pt`) models are recommended.
+Verify it first:
 
-For detailed installation help, see [INSTALL.md](INSTALL.md).
+```bash
+python -c "import tkinter; print('tkinter OK')"
+```
 
----
+If that fails, install a Python build that includes Tk support or add the matching Homebrew Tk package for your Python version.
 
-## 📋 System Requirements
+### Clean reinstall
 
-| Requirement | Minimum | Recommended |
-|-------------|---------|-------------|
-| Python | 3.10 | 3.11 or 3.12 |
-| RAM | 4 GB | 8 GB+ |
-| Storage | 500 MB | 2 GB+ |
-| OS | Windows 10, macOS 11, Ubuntu 20.04 | Windows 11, macOS 13+, Ubuntu 22.04 |
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt --force-reinstall
+```
 
----
+Then reinstall `requirements-pt.txt` and/or `requirements-tflite.txt` if you need those backends.
 
-## 🤝 Contributing
+## More Install Detail
 
-Contributions are welcome! Feel free to:
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+See [INSTALL.md](INSTALL.md) for platform-specific notes, verification commands, and the compatibility reasoning behind the split requirement files.
 
----
+## License
 
-## 📜 License
+This project is licensed under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE) for details.
 
-This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** — see the [LICENSE](LICENSE) file for details.
+The AGPL requirement is driven by the optional dependency on [Ultralytics](https://github.com/ultralytics/ultralytics), which is distributed under AGPL-3.0.
 
-This license is required because the project depends on [ultralytics](https://github.com/ultralytics/ultralytics), which is distributed under AGPL-3.0.
-
----
-
-## 👤 Author
-
-Created by **Noah Molla**.
-
-This project was built with the assistance of AI coding tools. All code has been reviewed and tested by the author.
-
----
-
-## 🙏 Credits
+## Credits
 
 Built with:
-- [ttkbootstrap](https://github.com/israel-dryer/ttkbootstrap) - Modern Tkinter themes
-- [ultralytics](https://github.com/ultralytics/ultralytics) - YOLO implementation (AGPL-3.0)
-- [TensorFlow Lite](https://www.tensorflow.org/lite) - Edge inference
-- [Pillow](https://python-pillow.org/) - Image processing
+
+- [ttkbootstrap](https://github.com/israel-dryer/ttkbootstrap)
+- [Ultralytics](https://github.com/ultralytics/ultralytics)
+- [TensorFlow Lite](https://www.tensorflow.org/lite)
+- [Pillow](https://python-pillow.org/)
