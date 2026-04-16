@@ -84,9 +84,11 @@ Why the split install exists:
 
 ## Features
 
-- Manual bounding-box annotation with click-and-drag editing
+- Manual bounding-box annotation with drag, 2-click, and center-stamp workflows
 - Optional AI-assisted auto-annotation from `.pt` and `.tflite` models
 - Undo / redo, gallery view, filtering, and dataset statistics
+- Filled box highlight overlay and dense-object helpers for rapid labeling
+- Dataset-wide AOI polygon cleanup plus AOI-aware auto-annotation constraints
 - YOLO zip import/export tools with train/val/test handling
 - Duplicate finder, suspicious-label checks, and format repair tools
 - Separate image triage sorter in `pre_annotation_sorter/`
@@ -138,6 +140,7 @@ Optional auto-annotation supports:
 | Undo | `Ctrl+Z` |
 | Redo | `Ctrl+Y` |
 | Repeat last box | `R` |
+| Center stamp size down or up | `[` / `]` |
 | Auto-annotate current image | `Q` |
 | Open gallery | `G` |
 
