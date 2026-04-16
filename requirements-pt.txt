@@ -1,0 +1,9 @@
+-r requirements.txt
+
+# Optional PyTorch / Ultralytics backend for `.pt` models.
+# Tested on 2026-04-15.
+ultralytics==8.4.37
+
+# Intel macOS relies on the last readily-available x86_64 PyTorch wheel line.
+torch==2.2.2; sys_platform == "darwin" and platform_machine == "x86_64" and python_version == "3.12"
+torchvision==0.17.2; sys_platform == "darwin" and platform_machine == "x86_64" and python_version == "3.12"

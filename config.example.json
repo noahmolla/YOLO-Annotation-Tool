@@ -15,5 +15,6 @@
     "board_clip_use_guides": true,
     "board_clip_extend_to_guides": true,
     "board_clip_apply_to_auto_annotations": false,
-    "board_clip_guides_visible": true
+    "board_clip_guides_visible": true,
+    "ui_scale": 1.0
 }

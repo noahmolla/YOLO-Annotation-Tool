@@ -1,34 +1,14 @@
-# ============================================
-# YOLO Annotator - Requirements
-# ============================================
-# Requires Python 3.10, 3.11, or 3.12
-# (Python 3.13+ not yet supported by TensorFlow)
-
-# Core Dependencies
-Pillow>=9.0.0
-numpy>=1.21.0
-opencv-python>=4.5.5
-ttkbootstrap>=1.10.0
-PyYAML>=6.0.1
-
-# PyTorch YOLO (.pt models) - RECOMMENDED
-ultralytics>=8.0.0
-
-# TensorFlow Lite (.tflite models)
-# Comment out if you only use .pt models
-tensorflow>=2.13.0,<2.18.0
-
-# ============================================
-# INSTALL
-# ============================================
-# python -m venv venv
-# Windows:    venv\Scripts\activate
-# Mac/Linux:  source venv/bin/activate
-# pip install -r requirements.txt
-# python main.py
+# Base desktop app dependencies.
+# Safe default install for Windows and macOS.
 #
-# NOTES:
-# - If TensorFlow fails, comment it out above.
-#   You can still use .pt models without it.
-# - On macOS with Apple Silicon (M1/M2/M3):
-#   pip install tensorflow-macos  (instead of tensorflow)
+# Optional backends:
+#   python -m pip install -r requirements-pt.txt
+#   python -m pip install -r requirements-tflite.txt
+
+Pillow>=10.0.0
+numpy>=1.26.0
+# Intel macOS is capped at an older OpenCV wheel line on PyPI.
+opencv-python>=4.10.0.84; sys_platform != "darwin" or platform_machine != "x86_64"
+opencv-python==4.6.0.66; sys_platform == "darwin" and platform_machine == "x86_64"
+ttkbootstrap>=1.10.1
+PyYAML>=6.0.1

@@ -1,3 +1,3 @@
 @echo off
-cd /d "C:\Users\noahm\GitHub\scratch"
+cd /d "%~dp0"
 call run.bat

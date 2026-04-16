@@ -17,8 +17,8 @@ class TFLiteModel:
         """
         if tflite is None:
             raise ImportError(
-                "TFLite runtime not found. Install tensorflow or tflite-runtime:\n"
-                "  pip install tensorflow  OR  pip install tflite-runtime"
+                "TFLite runtime not found. Install the optional TFLite backend with:\n"
+                "  python -m pip install -r requirements-tflite.txt"
             )
         num_threads = os.cpu_count() or 4
         self.interpreter = tflite.Interpreter(model_path=model_path, num_threads=num_threads)
@@ -255,7 +255,8 @@ class PyTorchYOLOModel:
             from ultralytics import YOLO
         except ImportError:
             raise ImportError(
-                "ultralytics library not found. Install it with: pip install ultralytics"
+                "Ultralytics is not installed. Install the optional .pt backend with:\n"
+                "  python -m pip install -r requirements-pt.txt"
             )
         
         self.model = YOLO(model_path)
