@@ -53,6 +53,7 @@ datasets/
 *.tmp
 *.temp
 *.log
+.compat-check*/
 
 # OS files
 .DS_Store

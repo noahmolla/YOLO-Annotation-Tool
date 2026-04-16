@@ -39,6 +39,11 @@ class AnnotatorApp:
         self._pane_layout_after_id = None
         self._pane_layout_retries_remaining = 0
         self._apply_startup_window_state()
+        self.base_tk_scaling = self._get_current_tk_scaling()
+        self.ui_scale = 1.0
+        self.min_ui_scale = 0.70
+        self.max_ui_scale = 1.60
+        self.ui_scale_step = 0.10
         
         # --- Data Model ---
         self.image_paths = []          # List of absolute paths to images
@@ -259,6 +264,64 @@ class AnnotatorApp:
             except tk.TclError:
                 pass
 
+    def _get_current_tk_scaling(self):
+        try:
+            return max(0.5, float(self.root.tk.call("tk", "scaling")))
+        except (tk.TclError, TypeError, ValueError):
+            return 1.0
+
+    def _normalize_ui_scale(self, value, fallback=1.0):
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError):
+            normalized = fallback
+        return max(self.min_ui_scale, min(self.max_ui_scale, normalized))
+
+    def _apply_ui_scale(self, scale_value, announce=True):
+        normalized = self._normalize_ui_scale(scale_value, fallback=self.ui_scale)
+        self.ui_scale = normalized
+        target_scaling = self.base_tk_scaling * self.ui_scale
+        try:
+            self.root.tk.call("tk", "scaling", target_scaling)
+        except tk.TclError:
+            return
+
+        if hasattr(self, "stats_current_classes_label") and self.stats_current_classes_label is not None:
+            self.stats_current_classes_label.configure(
+                wraplength=max(180, int(round(250 * self.ui_scale)))
+            )
+
+        self._schedule_main_pane_layout(retries=4)
+        try:
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+
+        # Keep the current image zoom/center stable while the UI layout resizes around it.
+        if self.current_image:
+            self._apply_view_transform()
+            self.redraw()
+
+        if announce and hasattr(self, "status_var") and self.status_var is not None:
+            self.status_var.set(f"UI size {int(round(self.ui_scale * 100))}%")
+
+    def _change_ui_scale(self, delta):
+        stepped = round(self.ui_scale + delta, 2)
+        self._apply_ui_scale(stepped, announce=True)
+        self.save_config()
+        return "break"
+
+    def increase_ui_scale(self, event=None):
+        return self._change_ui_scale(self.ui_scale_step)
+
+    def decrease_ui_scale(self, event=None):
+        return self._change_ui_scale(-self.ui_scale_step)
+
+    def reset_ui_scale(self, event=None):
+        self._apply_ui_scale(1.0, announce=True)
+        self.save_config()
+        return "break"
+
     def _apply_saved_geometry(self, geometry_value):
         """Clamp restored geometry so configs from another machine do not hide the side panes."""
         geometry_str = str(geometry_value or "").strip()
@@ -311,11 +374,11 @@ class AnnotatorApp:
                     self._pane_layout_after_id = self.root.after(120, self._ensure_main_pane_layout)
                 return
 
-            min_left = 250
-            min_right = 240
-            target_left = 320
-            target_right = 300
-            min_center = 520
+            min_left = max(180, int(round(250 * self.ui_scale)))
+            min_right = max(180, int(round(240 * self.ui_scale)))
+            target_left = max(min_left, int(round(320 * self.ui_scale)))
+            target_right = max(min_right, int(round(300 * self.ui_scale)))
+            min_center = max(420, int(round(520 * min(self.ui_scale, 1.15))))
 
             max_sidebar_total = max(0, total_width - min_center)
             if max_sidebar_total < (min_left + min_right):
@@ -348,6 +411,40 @@ class AnnotatorApp:
         except tk.TclError:
             pass
 
+    def _create_collapsible_section(self, parent, title, expanded=False, button_style="secondary-outline", pady=(4, 1)):
+        wrapper = tb.Frame(parent)
+        wrapper.pack(fill=X, pady=pady)
+        expanded_var = tk.BooleanVar(value=expanded)
+        body = tb.Frame(wrapper)
+        toggle_btn = tb.Button(
+            wrapper,
+            text="",
+            command=lambda: self._toggle_collapsible_section(title, expanded_var, toggle_btn, body),
+            bootstyle=button_style,
+        )
+        toggle_btn.pack(fill=X)
+        self._set_collapsible_section_state(title, expanded_var, toggle_btn, body)
+        return body, expanded_var, toggle_btn
+
+    def _toggle_collapsible_section(self, title, expanded_var, toggle_btn, body):
+        expanded_var.set(not expanded_var.get())
+        self._set_collapsible_section_state(title, expanded_var, toggle_btn, body)
+
+    def _set_collapsible_section_state(self, title, expanded_var, toggle_btn, body):
+        if expanded_var.get():
+            toggle_btn.config(text=f"Hide {title}")
+            if not body.winfo_manager():
+                body.pack(fill=X, pady=(4, 0))
+        else:
+            toggle_btn.config(text=f"Show {title}")
+            if body.winfo_manager():
+                body.pack_forget()
+
+        try:
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+
     def load_config(self):
         if not os.path.exists(CONFIG_FILE): return
         try:
@@ -357,6 +454,7 @@ class AnnotatorApp:
             # Restore Window
             if "geometry" in cfg:
                 self._apply_saved_geometry(cfg["geometry"])
+            self._apply_ui_scale(cfg.get("ui_scale", 1.0), announce=False)
             
             # Restore Classes
             if "classes" in cfg and cfg["classes"]:
@@ -505,6 +603,7 @@ class AnnotatorApp:
             "board_clip_guides_visible": self.board_clip_guides_visible.get(),
             "board_clip_corner_guides_visible": self.board_clip_corner_guides_visible.get(),
             "zoom_lock": self.zoom_lock.get(),
+            "ui_scale": self.ui_scale,
         }
         if hasattr(self, 'model_path_str'):
              cfg["model_path"] = self.model_path_str
@@ -941,12 +1040,15 @@ class AnnotatorApp:
         ctrl_frame = tb.Labelframe(self.left_panel, text="Workspace", padding=8)
         ctrl_frame.pack(fill=X, padx=5, pady=3)
         
-        # Load Workspace and Open Folder row
+        # Workspace actions
         ws_row = tb.Frame(ctrl_frame)
         ws_row.pack(fill=X, pady=1)
-        tb.Button(ws_row, text="Load Workspace", command=self.load_workspace_btn, bootstyle="primary", width=12).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
-        tb.Button(ws_row, text="🔄", command=self.refresh_workspace, bootstyle="warning", width=3).pack(side=LEFT, padx=(1,1))
-        tb.Button(ws_row, text="📂", command=self.open_workspace_folder, bootstyle="secondary", width=3).pack(side=LEFT, padx=(1,0))
+        tb.Button(ws_row, text="Load Workspace", command=self.load_workspace_btn, bootstyle="primary").pack(fill=X)
+
+        ws_tools_row = tb.Frame(ctrl_frame)
+        ws_tools_row.pack(fill=X, pady=1)
+        tb.Button(ws_tools_row, text="Refresh", command=self.refresh_workspace, bootstyle="warning", width=10).pack(side=LEFT, expand=True, fill=X, padx=(0, 1))
+        tb.Button(ws_tools_row, text="Open Folder", command=self.open_workspace_folder, bootstyle="secondary", width=12).pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
         
         # Import/Export row
         io_frame = tb.Frame(ctrl_frame)
@@ -992,8 +1094,15 @@ class AnnotatorApp:
         self.btn_auto_all = tb.Button(auto_frame, text="All Images", command=self.auto_annotate_all, bootstyle="danger", width=8)
         self.btn_auto_all.pack(side=LEFT, expand=True, fill=X, padx=(1,0))
 
-        people_frame = tb.Labelframe(model_frame, text="People Multi-Model", padding=8)
-        people_frame.pack(fill=X, pady=(6, 1))
+        tb.Button(model_frame, text="Confidence / IOU Settings", command=self.show_annotation_settings, bootstyle="info").pack(fill=X, pady=(4, 1))
+
+        people_body, self.people_tools_expanded_var, self.people_tools_toggle_btn = self._create_collapsible_section(
+            model_frame,
+            "People Model Tools",
+            expanded=False,
+        )
+        people_frame = tb.Labelframe(people_body, text="People Multi-Model", padding=8)
+        people_frame.pack(fill=X)
 
         self.btn_people_manage = tb.Button(
             people_frame,
@@ -1029,13 +1138,20 @@ class AnnotatorApp:
         )
         self.btn_people_all.pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
         
-        # Settings button
-        tb.Button(model_frame, text="⚙ Confidence & IOU Settings", command=self.show_annotation_settings, bootstyle="info").pack(fill=X, pady=1)
+        clip_body, self.board_clip_tools_expanded_var, self.board_clip_tools_toggle_btn = self._create_collapsible_section(
+            model_frame,
+            "Pallet Fit Tools",
+            expanded=False,
+        )
+        clip_frame = tb.Labelframe(clip_body, text="Pallet Fit", padding=8)
+        clip_frame.pack(fill=X)
 
-        tb.Button(model_frame, text="Pallet Fit Options", command=self.show_board_clip_dialog, bootstyle="secondary").pack(fill=X, pady=1)
-
-        clip_frame = tb.Labelframe(model_frame, text="Pallet Fit", padding=8)
-        clip_frame.pack(fill=X, pady=(4, 1))
+        tb.Button(
+            clip_frame,
+            text="Open Full Pallet Fit Dialog",
+            command=self.show_board_clip_dialog,
+            bootstyle="secondary-outline",
+        ).pack(fill=X, pady=(0, 4))
 
         clip_class_row = tb.Frame(clip_frame)
         clip_class_row.pack(fill=X, pady=(0, 4))
@@ -1081,7 +1197,7 @@ class AnnotatorApp:
 
         tb.Checkbutton(
             clip_frame,
-            text="Show saved 4-point dots + dotted outline",
+            text="Show saved guides on canvas",
             variable=self.board_clip_corner_guides_visible,
             command=self.on_board_clip_corner_guides_visibility_changed,
             bootstyle="round-toggle",
@@ -1193,16 +1309,21 @@ class AnnotatorApp:
 
         tb.Label(
             clip_frame,
-            text="B runs the 4-corner quick fit. Alt+B walks the filtered images from here so you can click 4 corners and jump straight to the next image while the fitting work queues behind you.",
+            text="B starts the 4-corner quick fit. Alt+B walks the filtered images from here so you can click 4 corners and move on while fitting keeps running behind you.",
             wraplength=250,
             justify=LEFT,
             font=("Arial", 8),
             foreground="#888"
         ).pack(anchor=W, pady=(6, 0))
 
-        # Quick Actions Group
-        quick_frame = tb.Labelframe(self.left_panel, text="Quick Actions", padding=8)
-        quick_frame.pack(fill=X, padx=5, pady=3)
+        dataset_tools_body, self.dataset_tools_expanded_var, self.dataset_tools_toggle_btn = self._create_collapsible_section(
+            self.left_panel,
+            "Dataset Tools",
+            expanded=False,
+            pady=(3, 3),
+        )
+        quick_frame = tb.Labelframe(dataset_tools_body, text="Dataset Tools", padding=8)
+        quick_frame.pack(fill=X, padx=5)
         
         # Gallery and Distribution row
         view_row = tb.Frame(quick_frame)
@@ -1221,13 +1342,13 @@ class AnnotatorApp:
         extract_row = tb.Frame(quick_frame)
         extract_row.pack(fill=X, pady=1)
         tb.Button(extract_row, text="Extract Filtered", command=self.extract_filtered_images, bootstyle="success", width=12).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
-        tb.Button(extract_row, text="🔍 Query", command=self.show_query_dialog, bootstyle="primary", width=8).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+        tb.Button(extract_row, text="Query", command=self.show_query_dialog, bootstyle="primary", width=8).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
         
         # Suspicious & YOLO Check row
         check_row = tb.Frame(quick_frame)
         check_row.pack(fill=X, pady=1)
-        tb.Button(check_row, text="🔎 Suspicious", command=self.check_suspicious_annotations_dialog, bootstyle="danger", width=10).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
-        tb.Button(check_row, text="✅ YOLO Check", command=self.yolo_format_check_dialog, bootstyle="success", width=10).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+        tb.Button(check_row, text="Suspicious", command=self.check_suspicious_annotations_dialog, bootstyle="danger", width=10).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
+        tb.Button(check_row, text="YOLO Check", command=self.yolo_format_check_dialog, bootstyle="success", width=10).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
 
         format_row = tb.Frame(quick_frame)
         format_row.pack(fill=X, pady=1)
@@ -1240,7 +1361,7 @@ class AnnotatorApp:
         # 320 Export row
         export_row = tb.Frame(quick_frame)
         export_row.pack(fill=X, pady=1)
-        tb.Button(export_row, text="📦 320px Export", command=self.show_320_export_dialog, bootstyle="warning").pack(fill=X)
+        tb.Button(export_row, text="320px Export", command=self.show_320_export_dialog, bootstyle="warning").pack(fill=X)
         # Rotation row
         rotate_row = tb.Frame(quick_frame)
         rotate_row.pack(fill=X, pady=1)
@@ -1268,19 +1389,30 @@ class AnnotatorApp:
         # Canvas Toolbar
         c_toolbar = tb.Frame(self.center_panel, padding=5)
         c_toolbar.pack(fill=X)
-        
-        # Navigation
-        nav_frame = tb.Frame(c_toolbar)
+
+        toolbar_top = tb.Frame(c_toolbar)
+        toolbar_top.pack(fill=X, pady=(0, 4))
+
+        toolbar_actions = tb.Frame(toolbar_top)
+        toolbar_actions.pack(side=RIGHT)
+
+        self.speed_btn = tb.Button(toolbar_actions, text="Speed: Single", command=self.toggle_nav_speed, bootstyle="secondary-outline", width=12)
+        self.speed_btn.pack(side=RIGHT, padx=(4, 0))
+        tb.Button(toolbar_actions, text="Shortcuts", command=self.show_shortcuts_dialog, bootstyle="secondary-outline").pack(side=RIGHT, padx=4)
+        tb.Button(toolbar_actions, text="Info", command=self.show_image_info, bootstyle="info-outline").pack(side=RIGHT, padx=4)
+        tb.Button(toolbar_actions, text="Repeat + Next", command=self.repeat_and_next, bootstyle="info").pack(side=RIGHT, padx=4)
+        tb.Button(toolbar_actions, text="Reload", command=self.reload_current_image, bootstyle="secondary-outline").pack(side=RIGHT, padx=4)
+        tb.Button(toolbar_actions, text="Save", command=self.save_annotations, bootstyle="success").pack(side=RIGHT, padx=(0, 4))
+
+        nav_frame = tb.Frame(toolbar_top)
         nav_frame.pack(side=LEFT)
         tb.Button(nav_frame, text="< Prev", command=self.prev_image, bootstyle="outline").pack(side=LEFT, padx=1)
         self.lbl_idx = tb.Label(nav_frame, text="0 / 0", font=("Arial", 10, "bold"), width=10, anchor="center")
         self.lbl_idx.pack(side=LEFT, padx=5)
         tb.Button(nav_frame, text="Next >", command=self.next_image, bootstyle="outline").pack(side=LEFT, padx=1)
-        
-        tb.Label(c_toolbar, text="  |  Shortcuts: Wheel zoom, Space reset, A/D, 1-9, R, G, Shift+G, Enter/C", font=("Arial", 9)).pack(side=LEFT, padx=10)
 
-        mode_frame = tb.Frame(c_toolbar)
-        mode_frame.pack(side=LEFT, padx=10)
+        mode_frame = tb.Frame(toolbar_top)
+        mode_frame.pack(side=LEFT, padx=(12, 0))
         tb.Label(mode_frame, text="Mode:").pack(side=LEFT, padx=(0, 4))
         tb.Radiobutton(
             mode_frame,
@@ -1298,12 +1430,15 @@ class AnnotatorApp:
             command=self._on_annotation_mode_changed,
             bootstyle="toolbutton-outline",
         ).pack(side=LEFT, padx=1)
-        tb.Button(mode_frame, text="Close Segment (C)", command=self.finish_pending_segment, bootstyle="success-outline", width=16).pack(side=LEFT, padx=(6, 1))
+        tb.Button(mode_frame, text="Finish Shape (C)", command=self.finish_pending_segment, bootstyle="success-outline", width=14).pack(side=LEFT, padx=(6, 1))
         tb.Button(mode_frame, text="Undo Point", command=self.undo_pending_segment_point, bootstyle="warning-outline", width=10).pack(side=LEFT, padx=1)
 
-        view_frame = tb.Frame(c_toolbar)
-        view_frame.pack(side=LEFT, padx=10)
-        tb.Button(view_frame, text="Reset View (Space)", command=self.reset_zoom_view, bootstyle="secondary-outline", width=16).pack(side=LEFT, padx=(0, 4))
+        toolbar_bottom = tb.Frame(c_toolbar)
+        toolbar_bottom.pack(fill=X)
+
+        view_frame = tb.Frame(toolbar_bottom)
+        view_frame.pack(side=LEFT)
+        tb.Button(view_frame, text="Reset View", command=self.reset_zoom_view, bootstyle="secondary-outline", width=12).pack(side=LEFT, padx=(0, 4))
         tb.Checkbutton(
             view_frame,
             text="Lock Zoom",
@@ -1313,28 +1448,21 @@ class AnnotatorApp:
         ).pack(side=LEFT, padx=4)
         tb.Label(view_frame, textvariable=self.zoom_label_var, font=("Arial", 9, "bold")).pack(side=LEFT, padx=4)
 
-        # Crosshair Toggle
-        tb.Checkbutton(c_toolbar, text="Crosshair", variable=self.show_crosshair, bootstyle="round-toggle").pack(side=LEFT, padx=10)
-        
-        # Click Mode Toggle
-        tb.Checkbutton(c_toolbar, text="Click Mode", variable=self.click_mode, 
-                      command=self._on_click_mode_toggle, bootstyle="round-toggle").pack(side=LEFT, padx=10)
-        
-        # Draw Only Mode Toggle
-        tb.Checkbutton(c_toolbar, text="Draw Only (T)", variable=self.draw_only_mode, 
-                      bootstyle="round-toggle").pack(side=LEFT, padx=5)
-        
-        # Edit Mode Toggle
-        tb.Checkbutton(c_toolbar, text="Edit (E)", variable=self.edit_mode, 
-                      bootstyle="round-toggle").pack(side=LEFT, padx=5)
-        
-        # Show only selected class toggle
-        tb.Checkbutton(c_toolbar, text="Show Only Selected Class (F)", variable=self.show_only_selected_class, 
-                      command=self.redraw, bootstyle="round-toggle").pack(side=LEFT, padx=10)
+        toggle_frame = tb.Frame(toolbar_bottom)
+        toggle_frame.pack(side=LEFT, padx=(12, 0))
+        tb.Checkbutton(toggle_frame, text="Crosshair", variable=self.show_crosshair, bootstyle="round-toggle").pack(side=LEFT, padx=(0, 8))
+        tb.Checkbutton(toggle_frame, text="Click Draw", variable=self.click_mode,
+                      command=self._on_click_mode_toggle, bootstyle="round-toggle").pack(side=LEFT, padx=8)
+        tb.Checkbutton(toggle_frame, text="Draw Only (T)", variable=self.draw_only_mode,
+                      bootstyle="round-toggle").pack(side=LEFT, padx=8)
+        tb.Checkbutton(toggle_frame, text="Edit (E)", variable=self.edit_mode,
+                      bootstyle="round-toggle").pack(side=LEFT, padx=8)
+        tb.Checkbutton(toggle_frame, text="Solo Class (F)", variable=self.show_only_selected_class,
+                      command=self.redraw, bootstyle="round-toggle").pack(side=LEFT, padx=8)
 
-        fmt_frame = tb.Frame(c_toolbar)
-        fmt_frame.pack(side=LEFT, padx=10)
-        tb.Label(fmt_frame, text="Dataset Type:").pack(side=LEFT, padx=(0, 4))
+        fmt_frame = tb.Frame(toolbar_bottom)
+        fmt_frame.pack(side=LEFT, padx=(12, 0))
+        tb.Label(fmt_frame, text="Save As:").pack(side=LEFT, padx=(0, 4))
         self.save_format_combo = tb.Combobox(
             fmt_frame,
             state="readonly",
@@ -1344,24 +1472,12 @@ class AnnotatorApp:
         )
         self.save_format_combo.pack(side=LEFT)
         self.save_format_combo.bind("<<ComboboxSelected>>", self._on_dataset_label_format_changed)
-        
-        # Speed toggle
-        self.speed_btn = tb.Button(c_toolbar, text="Speed: Single", command=self.toggle_nav_speed, bootstyle="secondary-outline", width=12)
-        self.speed_btn.pack(side=RIGHT, padx=5)
-        
-        tb.Button(c_toolbar, text="Repeat & Next (R)", command=self.repeat_and_next, bootstyle="info").pack(side=RIGHT, padx=5)
-        tb.Button(c_toolbar, text="?", command=self.show_shortcuts_dialog, bootstyle="secondary-outline", width=3).pack(side=RIGHT, padx=2)
-        tb.Button(c_toolbar, text="Info", command=self.show_image_info, bootstyle="info-outline-sm").pack(side=RIGHT, padx=5)
-        tb.Button(c_toolbar, text="Clip All", command=self.apply_board_clip_to_dataset, bootstyle="danger-outline-sm").pack(side=RIGHT, padx=5)
-        tb.Button(c_toolbar, text="Clip Here", command=self.apply_board_clip_to_current, bootstyle="success-outline-sm").pack(side=RIGHT, padx=5)
-        self.board_clip_extend_parent_toolbar_btn = tb.Button(c_toolbar, text="Extend To Box (X)", command=self.extend_board_clip_to_parent_current_selected, bootstyle="info-outline-sm")
-        self.board_clip_extend_parent_toolbar_btn.pack(side=RIGHT, padx=5)
-        self.board_clip_edge_toolbar_btn = tb.Button(c_toolbar, text="2 Edges (Shift+B)", command=self.start_quick_board_clip_guides, bootstyle="secondary-outline-sm")
-        self.board_clip_edge_toolbar_btn.pack(side=RIGHT, padx=5)
-        self.board_clip_draw_toolbar_btn = tb.Button(c_toolbar, text="4 Corners (B)", command=self.start_quick_board_clip_corners, bootstyle="warning-outline-sm")
-        self.board_clip_draw_toolbar_btn.pack(side=RIGHT, padx=5)
-        tb.Button(c_toolbar, text="Reload", command=self.reload_current_image, bootstyle="secondary-outline-sm").pack(side=RIGHT, padx=5)
-        tb.Button(c_toolbar, text="Manually Save", command=self.save_annotations, bootstyle="success-sm").pack(side=RIGHT)
+
+        fit_frame = tb.Frame(toolbar_bottom)
+        fit_frame.pack(side=RIGHT)
+        tb.Button(fit_frame, text="Pallet Fit...", command=self.show_board_clip_dialog, bootstyle="secondary-outline").pack(side=RIGHT, padx=(4, 0))
+        self.board_clip_draw_toolbar_btn = tb.Button(fit_frame, text="4 Corners (B)", command=self.start_quick_board_clip_corners, bootstyle="warning-outline-sm")
+        self.board_clip_draw_toolbar_btn.pack(side=RIGHT, padx=4)
 
 
         # Canvas
@@ -1532,11 +1648,18 @@ class AnnotatorApp:
         self.root.bind("C", self.finish_pending_segment)
         self.root.bind("<Shift-BackSpace>", self.undo_pending_segment_point)
         self.root.bind("<space>", self.reset_zoom_view)
-        self.root.bind("<Control-plus>", lambda e: self.zoom_in_hotkey())
-        self.root.bind("<Control-equal>", lambda e: self.zoom_in_hotkey())
-        self.root.bind("<Control-KP_Add>", lambda e: self.zoom_in_hotkey())
-        self.root.bind("<Control-minus>", lambda e: self.zoom_out_hotkey())
-        self.root.bind("<Control-KP_Subtract>", lambda e: self.zoom_out_hotkey())
+        self.root.bind("<Control-plus>", self.increase_ui_scale)
+        self.root.bind("<Control-equal>", self.increase_ui_scale)
+        self.root.bind("<Control-KP_Add>", self.increase_ui_scale)
+        self.root.bind("<Control-minus>", self.decrease_ui_scale)
+        self.root.bind("<Control-KP_Subtract>", self.decrease_ui_scale)
+        self.root.bind("<Control-0>", self.reset_ui_scale)
+        self.root.bind("<Control-KP_0>", self.reset_ui_scale)
+        self.root.bind("<Alt-plus>", lambda e: self.zoom_in_hotkey())
+        self.root.bind("<Alt-equal>", lambda e: self.zoom_in_hotkey())
+        self.root.bind("<Alt-KP_Add>", lambda e: self.zoom_in_hotkey())
+        self.root.bind("<Alt-minus>", lambda e: self.zoom_out_hotkey())
+        self.root.bind("<Alt-KP_Subtract>", lambda e: self.zoom_out_hotkey())
 
         # H for help/shortcuts
         self.root.bind("h", lambda e: self.show_shortcuts_dialog())
@@ -3421,9 +3544,13 @@ class AnnotatorApp:
   G           Open gallery view
   Ctrl+G      Go to image by number
   Mouse Wheel Zoom to cursor
-  Ctrl +/-    Zoom in or out
+  Alt +/-     Zoom in or out
   Space       Reset view to fit
   Middle Drag Pan image
+
+UI
+  Ctrl +/-    Increase or decrease UI size
+  Ctrl+0      Reset UI size to 100%
 
  🎨 ANNOTATION
  1-9         Select class 1-9 (maps to 0-8)
