@@ -1497,8 +1497,16 @@ class AnnotatorApp:
         cls_frame = tb.Labelframe(self.left_panel, text="Classes (0-9)", padding=10)
         cls_frame.pack(fill=BOTH, expand=True, padx=5, pady=5)
         
-        self.cls_list = tk.Listbox(cls_frame, selectmode=tk.SINGLE, 
-                                   bg="#222", fg="#eee", bd=0, highlightthickness=0, font=("Consolas", 10))
+        self.cls_list = tk.Listbox(
+            cls_frame,
+            selectmode=tk.SINGLE,
+            exportselection=False,
+            bg="#222",
+            fg="#eee",
+            bd=0,
+            highlightthickness=0,
+            font=("Consolas", 10),
+        )
         self.cls_list.pack(side=LEFT, fill=BOTH, expand=True)
         
         sbar_cls = tb.Scrollbar(cls_frame, orient=VERTICAL, command=self.cls_list.yview)
@@ -1807,17 +1815,21 @@ class AnnotatorApp:
         self._scroll_left_panel_by_units(1)
         return "break"
 
+    def _hotkey_has_control_modifier(self, event):
+        try:
+            state = int(getattr(event, "state", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        return bool(state & 0x0004)
+
     def _class_id_from_hotkey_event(self, event):
         if self._focus_is_text_input():
             return None
 
-        try:
-            state = int(getattr(event, "state", 0) or 0)
-        except (TypeError, ValueError):
-            state = 0
-
-        # Ignore Ctrl/Alt modified keypresses so UI and app shortcuts keep working.
-        if state & 0x0004 or state & 0x0008:
+        # Ignore Ctrl-modified keypresses so app shortcuts keep working.
+        # Do not treat generic Mod1/NumLock bits like Alt here; some Windows/Tk
+        # setups report digit presses with those bits set, which breaks 0-9.
+        if self._hotkey_has_control_modifier(event):
             return None
 
         keysym = str(getattr(event, "keysym", "") or "")
@@ -1850,6 +1862,90 @@ class AnnotatorApp:
             return
         self.set_class_by_index(class_id)
         return "break"
+
+    def _class_hotkey_sequences(self):
+        sequences = []
+        shifted_symbol_map = {
+            "!": "exclam",
+            "@": "at",
+            "#": "numbersign",
+            "$": "dollar",
+            "%": "percent",
+            "^": "asciicircum",
+            "&": "ampersand",
+            "*": "asterisk",
+            "(": "parenleft",
+            ")": "parenright",
+        }
+        for digit in range(10):
+            sequences.append((f"<KeyPress-{digit}>", digit))
+            sequences.append((f"<KeyPress-KP_{digit}>", digit))
+        for class_id, symbol in enumerate(["!", "@", "#", "$", "%", "^", "&", "*", "(", ")"], start=10):
+            keysym = shifted_symbol_map[symbol]
+            sequences.append((f"<KeyPress-{keysym}>", class_id))
+        return sequences
+
+    def _class_hotkey_release_sequences(self):
+        return [
+            (sequence.replace("<KeyPress-", "<KeyRelease-", 1), class_id)
+            for sequence, class_id in self._class_hotkey_sequences()
+        ]
+
+    def _bind_specific_class_hotkeys_recursive(self, widget):
+        try:
+            for sequence, class_id in self._class_hotkey_sequences():
+                widget.bind(sequence, lambda e, idx=class_id: self._on_specific_class_hotkey(e, idx), add="+")
+        except Exception:
+            return
+        try:
+            children = widget.winfo_children()
+        except Exception:
+            children = []
+        for child in children:
+            self._bind_specific_class_hotkeys_recursive(child)
+
+    def _on_specific_class_hotkey(self, event, class_id):
+        if self._focus_is_text_input():
+            return
+        if self._hotkey_has_control_modifier(event):
+            return
+        if not (0 <= class_id < len(self.classes)):
+            return
+        self.set_class_by_index(class_id)
+        return "break"
+
+    def _bind_class_hotkeys_recursive(self, widget):
+        bindtag_name = "AnnotatorClassHotkeys"
+        try:
+            tags = list(widget.bindtags())
+        except Exception:
+            return
+        if bindtag_name not in tags:
+            widget.bindtags(tuple([bindtag_name] + tags))
+        try:
+            children = widget.winfo_children()
+        except Exception:
+            children = []
+        for child in children:
+            self._bind_class_hotkeys_recursive(child)
+
+    def _bind_global_class_hotkey_release_fallbacks(self):
+        for sequence, class_id in self._class_hotkey_release_sequences():
+            self.root.bind_all(
+                sequence,
+                lambda e, idx=class_id: self._on_specific_class_hotkey(e, idx),
+                add="+",
+            )
+
+    def _restore_shortcut_focus(self):
+        target = getattr(self, "canvas", None) or self.root
+        try:
+            target.focus_force()
+        except Exception:
+            try:
+                target.focus_set()
+            except Exception:
+                pass
 
     def _bind_events(self):
         # Global Keys - use KeyPress/KeyRelease for rapid navigation
@@ -1903,7 +1999,10 @@ class AnnotatorApp:
 
         # Class hotkeys:
         # 0-9 select classes 0-9, numpad mirrors 0-9, and Shift+1..0 selects 10..19.
-        self.root.bind_all("<KeyPress>", self._on_class_hotkey, add="+")
+        self.root.bind_class("AnnotatorClassHotkeys", "<KeyPress>", self._on_class_hotkey, add="+")
+        self._bind_class_hotkeys_recursive(self.root)
+        self._bind_specific_class_hotkeys_recursive(self.root)
+        self._bind_global_class_hotkey_release_fallbacks()
 
         # R for repeat last drawn box
         self.root.bind("r", self.repeat_last_box)
@@ -2110,6 +2209,7 @@ class AnnotatorApp:
                     pass
                 top.destroy()
                 self.background_task_active = False
+                self.root.after_idle(self._restore_shortcut_focus)
 
                 if progress["error"] is not None:
                     try:
@@ -7637,16 +7737,19 @@ UI
             # Auto-redraw if "Show only selected class" is active
             if self.show_only_selected_class.get():
                 self.redraw()
+            self.root.after_idle(self._restore_shortcut_focus)
 
     def set_class_by_index(self, idx):
         if 0 <= idx < len(self.classes):
             self.selected_class_id = idx
             self.cls_list.selection_clear(0, tk.END)
             self.cls_list.selection_set(idx)
+            self.cls_list.see(idx)
             self.status_var.set(f"Selected Class: {self.classes[idx]}")
             # Auto-redraw if "Show only selected class" is active
             if self.show_only_selected_class.get():
                 self.redraw()
+            self.root.after_idle(self._restore_shortcut_focus)
 
     def toggle_nav_speed(self):
         """Toggle between single-step and rapid navigation modes."""
@@ -9045,7 +9148,15 @@ UI
         if widget is None:
             return False
         try:
-            return widget.winfo_class() in {"Entry", "TEntry", "Text", "TCombobox", "Combobox", "Spinbox"}
+            widget_class = widget.winfo_class()
+            if widget_class in {"Entry", "TEntry", "Text", "Spinbox"}:
+                return True
+            if widget_class in {"TCombobox", "Combobox"}:
+                try:
+                    return str(widget.cget("state")).strip().lower() not in {"readonly", "disabled"}
+                except Exception:
+                    return True
+            return False
         except Exception:
             return False
 
