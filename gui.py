@@ -1117,7 +1117,11 @@ class AnnotatorApp:
         io_frame = tb.Frame(ctrl_frame)
         io_frame.pack(fill=X, pady=1)
         tb.Button(io_frame, text="Import", command=self.import_dialog, bootstyle="info", width=8).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
-        tb.Button(io_frame, text="Export", command=self.export_zip_dialog, bootstyle="success", width=8).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+        tb.Button(io_frame, text="Export", command=self.export_zip_dialog, bootstyle="success", width=8).pack(side=LEFT, expand=True, fill=X, padx=(1,1))
+
+        custom_export_row = tb.Frame(ctrl_frame)
+        custom_export_row.pack(fill=X, pady=1)
+        tb.Button(custom_export_row, text="Custom Export", command=self.custom_export_dialog, bootstyle="success-outline").pack(fill=X)
         
         # Classes row
 
@@ -2183,57 +2187,92 @@ class AnnotatorApp:
         thread = threading.Thread(target=worker_wrapper, daemon=True)
         thread.start()
 
-        def poll_progress():
-            if progress["total"] is not None and progress["current"] is not None and progress["total"] > 0:
-                if str(pb.cget("mode")) != "determinate":
+        def close_progress_dialog(clear_active=True):
+            try:
+                if str(pb.cget("mode")) == "indeterminate":
                     pb.stop()
-                    pb.configure(mode="determinate", maximum=max(1.0, progress["total"]))
-                pb["value"] = max(0.0, min(progress["current"], progress["total"]))
-            elif str(pb.cget("mode")) != "indeterminate":
-                pb.configure(mode="indeterminate")
-                pb.start(10)
-
-            lbl_status.config(text=progress["message"] or initial_message)
-            lbl_detail.config(text=progress["detail"] or "")
-
-            if progress["done"]:
-                thread.join(timeout=2)
-                try:
-                    if str(pb.cget("mode")) == "indeterminate":
-                        pb.stop()
-                except Exception:
-                    pass
-                try:
-                    top.grab_release()
-                except Exception:
-                    pass
-                top.destroy()
+            except Exception:
+                pass
+            try:
+                top.grab_release()
+            except Exception:
+                pass
+            try:
+                if top.winfo_exists():
+                    top.destroy()
+            except Exception:
+                pass
+            if clear_active:
                 self.background_task_active = False
                 self.root.after_idle(self._restore_shortcut_focus)
 
-                if progress["error"] is not None:
-                    try:
-                        if on_error:
-                            on_error(progress["error"], progress)
-                        else:
+        def clear_background_task_when_thread_finishes():
+            if thread.is_alive():
+                self.root.after(200, clear_background_task_when_thread_finishes)
+                return
+            self.background_task_active = False
+            self.root.after_idle(self._restore_shortcut_focus)
+
+        def handle_ui_task_error(exc):
+            print(traceback.format_exc())
+            worker_done = progress["done"] or not thread.is_alive()
+            close_progress_dialog(clear_active=worker_done)
+            if not worker_done:
+                clear_background_task_when_thread_finishes()
+            try:
+                if on_error:
+                    on_error(exc, progress)
+                else:
+                    messagebox.showerror(title, str(exc))
+                    self.status_var.set(f"{title} failed")
+            except Exception:
+                print(traceback.format_exc())
+                messagebox.showerror(title, str(exc))
+                self.status_var.set(f"{title} failed")
+
+        def poll_progress():
+            try:
+                if progress["total"] is not None and progress["current"] is not None and progress["total"] > 0:
+                    if str(pb.cget("mode")) != "determinate":
+                        pb.stop()
+                        pb.configure(mode="determinate", maximum=max(1.0, progress["total"]))
+                    pb["value"] = max(0.0, min(progress["current"], progress["total"]))
+                elif str(pb.cget("mode")) != "indeterminate":
+                    pb.configure(mode="indeterminate")
+                    pb.start(10)
+
+                lbl_status.config(text=progress["message"] or initial_message)
+                lbl_detail.config(text=progress["detail"] or "")
+
+                if progress["done"]:
+                    thread.join(timeout=2)
+                    close_progress_dialog(clear_active=True)
+
+                    if progress["error"] is not None:
+                        try:
+                            if on_error:
+                                on_error(progress["error"], progress)
+                            else:
+                                messagebox.showerror(title, str(progress["error"]))
+                                self.status_var.set(f"{title} failed")
+                        except Exception:
+                            print(traceback.format_exc())
                             messagebox.showerror(title, str(progress["error"]))
                             self.status_var.set(f"{title} failed")
-                    except Exception:
-                        print(traceback.format_exc())
-                        messagebox.showerror(title, str(progress["error"]))
-                        self.status_var.set(f"{title} failed")
+                        return
+
+                    if on_success:
+                        try:
+                            on_success(progress["result"], progress)
+                        except Exception as exc:
+                            print(traceback.format_exc())
+                            messagebox.showerror(title, str(exc))
+                            self.status_var.set(f"{title} failed")
                     return
 
-                if on_success:
-                    try:
-                        on_success(progress["result"], progress)
-                    except Exception as exc:
-                        print(traceback.format_exc())
-                        messagebox.showerror(title, str(exc))
-                        self.status_var.set(f"{title} failed")
-                return
-
-            top.after(100, poll_progress)
+                top.after(100, poll_progress)
+            except Exception as exc:
+                handle_ui_task_error(exc)
 
         poll_progress()
         return True
@@ -3633,25 +3672,195 @@ class AnnotatorApp:
             messagebox.showerror("Error", f"Failed to load model:\n{str(e)}")
             self.status_var.set("Model loading failed")
 
+    def _get_selected_file_paths(self):
+        if not hasattr(self, "file_list") or self.file_list is None:
+            return []
+        indices = self.file_list.curselection()
+        valid_indices = sorted({idx for idx in indices if 0 <= idx < len(self.filtered_image_paths)})
+        return [self.filtered_image_paths[idx] for idx in valid_indices]
+
+    def _parse_export_split_settings(self, preset_value, train_text, val_text, test_text):
+        if str(preset_value).strip().lower() == "custom":
+            try:
+                train = float(train_text)
+                val = float(val_text)
+                test = float(test_text)
+            except Exception:
+                raise ValueError("Invalid split values.")
+        else:
+            parts = str(preset_value).split("/")
+            if len(parts) != 3:
+                raise ValueError("Invalid split preset.")
+            train, val, test = [float(part) for part in parts]
+
+        total = train + val + test
+        if total <= 0:
+            raise ValueError("Split values must add up to more than 0.")
+        return train / total, val / total, test / total
+
+    def _parse_export_image_id_range(self, range_text):
+        text = str(range_text).strip()
+        if not text:
+            raise ValueError("Enter an image ID range like 1-50.")
+
+        single_match = re.fullmatch(r"(\d+)", text)
+        if single_match:
+            start = end = int(single_match.group(1))
+        else:
+            range_match = re.fullmatch(r"(\d+)\s*(?:-|:|\.\.)\s*(\d+)", text)
+            if not range_match:
+                raise ValueError("Image ID range must look like 1-50, 10:25, or 42.")
+            start = int(range_match.group(1))
+            end = int(range_match.group(2))
+
+        start = max(1, start)
+        end = max(1, end)
+        if end < start:
+            start, end = end, start
+        return start, end
+
+    def _choose_export_mix_counts(self, available_annotated, available_unannotated, annotated_weight, unannotated_weight):
+        annotated_weight = max(0.0, float(annotated_weight))
+        unannotated_weight = max(0.0, float(unannotated_weight))
+        total_weight = annotated_weight + unannotated_weight
+        if total_weight <= 0:
+            raise ValueError("Annotated/unannotated mix must add up to more than 0.")
+
+        if annotated_weight <= 0:
+            return 0, int(available_unannotated)
+        if unannotated_weight <= 0:
+            return int(available_annotated), 0
+        if available_annotated <= 0:
+            return 0, 0
+
+        annotated_count = int(available_annotated)
+        if available_unannotated <= 0:
+            return annotated_count, 0
+
+        target_unannotated = annotated_count * (unannotated_weight / annotated_weight)
+        chosen_unannotated = int(round(target_unannotated))
+        chosen_unannotated = max(0, min(int(available_unannotated), chosen_unannotated))
+        return annotated_count, chosen_unannotated
+
+    def _resolve_custom_export_selection(
+        self,
+        source_mode,
+        range_text="",
+        annotation_mode="any",
+        mix_annotated_text="80",
+        mix_unannotated_text="20",
+        class_filter_mode="any",
+        class_id=None,
+    ):
+        if source_mode == "all":
+            source_paths = list(self.image_paths)
+        elif source_mode == "filtered":
+            source_paths = list(self.filtered_image_paths)
+        elif source_mode == "selected":
+            source_paths = self._get_selected_file_paths()
+        elif source_mode == "range":
+            start_id, end_id = self._parse_export_image_id_range(range_text)
+            source_paths = [
+                path
+                for path in self.image_paths
+                if start_id <= int(self.image_id_map.get(path, 0)) <= end_id
+            ]
+        else:
+            raise ValueError("Unknown export source.")
+
+        if class_filter_mode not in ("any", "has", "missing", "only"):
+            class_filter_mode = "any"
+        if class_filter_mode != "any" and class_id is None:
+            class_filter_mode = "any"
+
+        candidate_paths = []
+        for path in source_paths:
+            cache = self.image_to_classes_cache.get(os.path.normpath(path), set())
+            if class_filter_mode == "has" and class_id not in cache:
+                continue
+            if class_filter_mode == "missing" and class_id in cache:
+                continue
+            if class_filter_mode == "only" and cache != {class_id}:
+                continue
+            candidate_paths.append(path)
+
+        annotated_paths = []
+        unannotated_paths = []
+        for path in candidate_paths:
+            cache = self.image_to_classes_cache.get(os.path.normpath(path), set())
+            if cache:
+                annotated_paths.append(path)
+            else:
+                unannotated_paths.append(path)
+
+        if annotation_mode == "annotated":
+            selected_paths = list(annotated_paths)
+        elif annotation_mode == "unannotated":
+            selected_paths = list(unannotated_paths)
+        elif annotation_mode == "mix":
+            try:
+                mix_annotated = float(mix_annotated_text)
+                mix_unannotated = float(mix_unannotated_text)
+            except Exception:
+                raise ValueError("Annotated/unannotated mix values must be numeric.")
+            take_annotated, take_unannotated = self._choose_export_mix_counts(
+                len(annotated_paths),
+                len(unannotated_paths),
+                mix_annotated,
+                mix_unannotated,
+            )
+            remaining_annotated = take_annotated
+            remaining_unannotated = take_unannotated
+            selected_paths = []
+            for path in candidate_paths:
+                cache = self.image_to_classes_cache.get(os.path.normpath(path), set())
+                if cache and remaining_annotated > 0:
+                    selected_paths.append(path)
+                    remaining_annotated -= 1
+                elif not cache and remaining_unannotated > 0:
+                    selected_paths.append(path)
+                    remaining_unannotated -= 1
+        else:
+            selected_paths = list(candidate_paths)
+
+        selected_annotated = 0
+        selected_unannotated = 0
+        for path in selected_paths:
+            cache = self.image_to_classes_cache.get(os.path.normpath(path), set())
+            if cache:
+                selected_annotated += 1
+            else:
+                selected_unannotated += 1
+
+        return {
+            "source_mode": source_mode,
+            "source_paths": source_paths,
+            "candidate_paths": candidate_paths,
+            "paths": selected_paths,
+            "source_count": len(source_paths),
+            "candidate_count": len(candidate_paths),
+            "annotated_available": len(annotated_paths),
+            "unannotated_available": len(unannotated_paths),
+            "selected_annotated": selected_annotated,
+            "selected_unannotated": selected_unannotated,
+        }
+
     def export_zip_dialog(self):
         if not self.workspace_path:
             messagebox.showerror("Error", "No workspace loaded.")
             return
-        
-        # Create dialog for export options
+
         dialog = tb.Toplevel(self.root)
         dialog.title("Export YOLO Dataset")
         dialog.geometry("420x430")
         dialog.transient(self.root)
         dialog.grab_set()
-        
+
         tb.Label(dialog, text="Export YOLO Dataset", font=("Arial", 14, "bold")).pack(pady=10)
-        
-        # Split ratios
+
         split_frame = tb.Labelframe(dialog, text="Train/Val/Test Split", padding=10)
         split_frame.pack(fill="x", padx=20, pady=10)
-        
-        # Preset options
+
         preset_var = tk.StringVar(value="85/14/1")
         presets = [
             ("85% / 14% / 1%  (Recommended)", "85/14/1"),
@@ -3659,19 +3868,18 @@ class AnnotatorApp:
             ("70% / 20% / 10% (Large test set)", "70/20/10"),
             ("90% / 9% / 1%   (Maximum training)", "90/9/1"),
         ]
-        
+
         for text, value in presets:
             tb.Radiobutton(split_frame, text=text, variable=preset_var, value=value).pack(anchor="w")
-        
-        # Custom option
+
         custom_frame = tb.Frame(split_frame)
         custom_frame.pack(fill="x", pady=5)
         tb.Radiobutton(custom_frame, text="Custom:", variable=preset_var, value="custom").pack(side="left")
-        
+
         train_var = tk.StringVar(value="70")
         val_var = tk.StringVar(value="20")
         test_var = tk.StringVar(value="10")
-        
+
         tb.Entry(custom_frame, textvariable=train_var, width=4).pack(side="left", padx=2)
         tb.Label(custom_frame, text="/").pack(side="left")
         tb.Entry(custom_frame, textvariable=val_var, width=4).pack(side="left", padx=2)
@@ -3695,44 +3903,33 @@ class AnnotatorApp:
             font=("Arial", 8),
             foreground="#888",
         ).pack(anchor="w", pady=(6, 0))
-        
-        result_var = tk.StringVar()
-        
+
         def do_export():
-            # Get split ratios
-            if preset_var.get() == "custom":
-                try:
-                    train = float(train_var.get())
-                    val = float(val_var.get())
-                    test = float(test_var.get())
-                except:
-                    messagebox.showerror("Error", "Invalid split values")
-                    return
-            else:
-                parts = preset_var.get().split("/")
-                train, val, test = [float(p) for p in parts]
-            
-            # Normalize to ratios
-            total = train + val + test
-            if total <= 0:
-                messagebox.showerror("Error", "Split values must add up to more than 0")
+            try:
+                train_ratio, val_ratio, test_ratio = self._parse_export_split_settings(
+                    preset_var.get(),
+                    train_var.get(),
+                    val_var.get(),
+                    test_var.get(),
+                )
+            except ValueError as exc:
+                messagebox.showerror("Error", str(exc))
                 return
-            train_ratio = train / total
-            val_ratio = val / total
-            test_ratio = test / total
+
+            if self.current_image and self.current_file_path:
+                self.save_annotations(force=True)
 
             if not self._confirm_export_label_compatibility("Export"):
                 return
-            
-            # Get output file
+
             f = filedialog.asksaveasfilename(
-                defaultextension=".zip", 
+                defaultextension=".zip",
                 filetypes=[("Zip File", "*.zip")],
                 parent=dialog
             )
             if not f:
                 return
-            
+
             dialog.destroy()
 
             def worker(update_progress):
@@ -3766,11 +3963,344 @@ class AnnotatorApp:
                 on_success=on_success,
                 on_error=on_error,
             )
-        
-        # Buttons
+
         btn_frame = tb.Frame(dialog)
         btn_frame.pack(pady=15)
-        
+
+        tb.Button(btn_frame, text="Export", command=do_export, bootstyle="success", width=12).pack(side="left", padx=5)
+        tb.Button(btn_frame, text="Cancel", command=dialog.destroy, bootstyle="secondary", width=12).pack(side="left", padx=5)
+
+    def custom_export_dialog(self):
+        if not self.workspace_path:
+            messagebox.showerror("Error", "No workspace loaded.")
+            return
+        if not self.image_paths:
+            messagebox.showerror("Error", "No images in the current workspace.")
+            return
+
+        selected_snapshot = self._get_selected_file_paths()
+        source_var = tk.StringVar(value="all")
+        range_var = tk.StringVar(value="")
+        annotation_mode_options = {
+            "Any images": "any",
+            "Has annotations only": "annotated",
+            "No annotations only": "unannotated",
+            "Custom annotated/unannotated mix": "mix",
+        }
+        annotation_mode_var = tk.StringVar(value="Any images")
+        mix_annotated_var = tk.StringVar(value="80")
+        mix_unannotated_var = tk.StringVar(value="20")
+        class_filter_options = {
+            "Any class state": "any",
+            "Has class": "has",
+            "Missing class": "missing",
+            "Only class": "only",
+        }
+        class_filter_mode_var = tk.StringVar(value="Any class state")
+        preset_var = tk.StringVar(value="85/14/1")
+        train_var = tk.StringVar(value="70")
+        val_var = tk.StringVar(value="20")
+        test_var = tk.StringVar(value="10")
+        test_override_var = tk.BooleanVar(value=False)
+        summary_var = tk.StringVar()
+
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Custom Export YOLO Dataset")
+        dialog.geometry("540x760")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tb.Label(dialog, text="Custom Export YOLO Dataset", font=("Arial", 14, "bold")).pack(pady=10)
+
+        selection_frame = tb.Labelframe(dialog, text="What To Export", padding=10)
+        selection_frame.pack(fill="x", padx=20, pady=(0, 10))
+
+        filtered_label = f"Currently filtered ({len(self.filtered_image_paths)})"
+        if self.filter_mode and self.filter_mode != "All":
+            filtered_label += f" - {self.filter_mode}"
+
+        tb.Radiobutton(selection_frame, text=f"All workspace images ({len(self.image_paths)})", variable=source_var, value="all").pack(anchor="w")
+        tb.Radiobutton(selection_frame, text=filtered_label, variable=source_var, value="filtered").pack(anchor="w")
+        tb.Radiobutton(selection_frame, text=f"Currently selected in list ({len(selected_snapshot)})", variable=source_var, value="selected").pack(anchor="w")
+
+        range_row = tb.Frame(selection_frame)
+        range_row.pack(fill="x", pady=(4, 0))
+        tb.Radiobutton(range_row, text="Image ID range", variable=source_var, value="range").pack(side=LEFT)
+        tb.Label(range_row, text="IDs:", width=4).pack(side=LEFT, padx=(8, 2))
+        range_entry = tb.Entry(range_row, textvariable=range_var, width=16)
+        range_entry.pack(side=LEFT)
+        tb.Label(range_row, text="Use file-list numbers like 1-50 or 0-50.", font=("Arial", 8), foreground="#888").pack(side=LEFT, padx=(8, 0))
+
+        refine_frame = tb.Labelframe(dialog, text="Refine Selection", padding=10)
+        refine_frame.pack(fill="x", padx=20, pady=(0, 10))
+
+        annotation_row = tb.Frame(refine_frame)
+        annotation_row.pack(fill="x", pady=2)
+        tb.Label(annotation_row, text="Annotation filter:", width=18, anchor="w").pack(side=LEFT)
+        annotation_combo = tb.Combobox(
+            annotation_row,
+            textvariable=annotation_mode_var,
+            values=list(annotation_mode_options.keys()),
+            state="readonly",
+            width=28,
+        )
+        annotation_combo.pack(side=LEFT, fill=X, expand=True)
+
+        mix_row = tb.Frame(refine_frame)
+        mix_row.pack(fill="x", pady=2)
+        tb.Label(mix_row, text="Annotated / Unannotated:", width=18, anchor="w").pack(side=LEFT)
+        mix_annotated_entry = tb.Entry(mix_row, textvariable=mix_annotated_var, width=6)
+        mix_annotated_entry.pack(side=LEFT)
+        tb.Label(mix_row, text="/").pack(side=LEFT, padx=3)
+        mix_unannotated_entry = tb.Entry(mix_row, textvariable=mix_unannotated_var, width=6)
+        mix_unannotated_entry.pack(side=LEFT)
+        tb.Label(
+            mix_row,
+            text="Keeps all annotated images, then adds negatives to match this blend as closely as possible.",
+            font=("Arial", 8),
+            foreground="#888",
+        ).pack(side=LEFT, padx=(8, 0))
+
+        class_values = [f"{idx}: {name}" for idx, name in enumerate(self.classes)]
+        class_filter_row = tb.Frame(refine_frame)
+        class_filter_row.pack(fill="x", pady=2)
+        tb.Label(class_filter_row, text="Class filter:", width=18, anchor="w").pack(side=LEFT)
+        class_filter_combo = tb.Combobox(
+            class_filter_row,
+            textvariable=class_filter_mode_var,
+            values=list(class_filter_options.keys()),
+            state="readonly",
+            width=16,
+        )
+        class_filter_combo.pack(side=LEFT, padx=(0, 6))
+        class_choice_combo = tb.Combobox(
+            class_filter_row,
+            values=class_values,
+            state="readonly" if class_values else "disabled",
+            width=24,
+        )
+        if class_values:
+            class_choice_combo.current(0)
+        class_choice_combo.pack(side=LEFT, fill=X, expand=True)
+
+        summary_frame = tb.Labelframe(dialog, text="Selection Summary", padding=10)
+        summary_frame.pack(fill="x", padx=20, pady=(0, 10))
+        tb.Label(
+            summary_frame,
+            textvariable=summary_var,
+            justify=LEFT,
+            anchor="w",
+            font=("Consolas", 9),
+            wraplength=470,
+        ).pack(fill="x")
+
+        split_frame = tb.Labelframe(dialog, text="Train / Val / Test Split", padding=10)
+        split_frame.pack(fill="x", padx=20, pady=(0, 10))
+
+        presets = [
+            ("85% / 14% / 1%  (Recommended)", "85/14/1"),
+            ("80% / 19% / 1%  (More validation)", "80/19/1"),
+            ("70% / 20% / 10% (Large test set)", "70/20/10"),
+            ("90% / 9% / 1%   (Maximum training)", "90/9/1"),
+        ]
+        for text, value in presets:
+            tb.Radiobutton(split_frame, text=text, variable=preset_var, value=value).pack(anchor="w")
+
+        custom_split_row = tb.Frame(split_frame)
+        custom_split_row.pack(fill="x", pady=5)
+        tb.Radiobutton(custom_split_row, text="Custom:", variable=preset_var, value="custom").pack(side=LEFT)
+        tb.Entry(custom_split_row, textvariable=train_var, width=4).pack(side=LEFT, padx=2)
+        tb.Label(custom_split_row, text="/").pack(side=LEFT)
+        tb.Entry(custom_split_row, textvariable=val_var, width=4).pack(side=LEFT, padx=2)
+        tb.Label(custom_split_row, text="/").pack(side=LEFT)
+        tb.Entry(custom_split_row, textvariable=test_var, width=4).pack(side=LEFT, padx=2)
+
+        override_frame = tb.Labelframe(dialog, text="Test Split Override", padding=10)
+        override_frame.pack(fill="x", padx=20, pady=(0, 10))
+        tb.Checkbutton(
+            override_frame,
+            text="Reserve exactly 1 labeled image + label pair for test",
+            variable=test_override_var,
+            bootstyle="round-toggle",
+        ).pack(anchor="w")
+        tb.Label(
+            override_frame,
+            text="Use this when downstream software requires a non-empty test split. The remaining images will be split across train/val only.",
+            wraplength=460,
+            justify=LEFT,
+            font=("Arial", 8),
+            foreground="#888",
+        ).pack(anchor="w", pady=(6, 0))
+
+        def get_selected_class_id():
+            if not class_values:
+                return None
+            idx = class_choice_combo.current()
+            if idx < 0 or idx >= len(self.classes):
+                return None
+            return idx
+
+        def update_control_states(*_):
+            range_entry.config(state="normal" if source_var.get() == "range" else "disabled")
+            current_annotation_mode = annotation_mode_options.get(annotation_mode_var.get(), "any")
+            mix_state = "normal" if current_annotation_mode == "mix" else "disabled"
+            mix_annotated_entry.config(state=mix_state)
+            mix_unannotated_entry.config(state=mix_state)
+            current_class_mode = class_filter_options.get(class_filter_mode_var.get(), "any")
+            class_state = "readonly" if class_values and current_class_mode != "any" else "disabled"
+            class_choice_combo.config(state=class_state)
+            refresh_summary()
+
+        def refresh_summary(*_):
+            try:
+                current_annotation_mode = annotation_mode_options.get(annotation_mode_var.get(), "any")
+                current_class_mode = class_filter_options.get(class_filter_mode_var.get(), "any")
+                selection = self._resolve_custom_export_selection(
+                    source_mode=source_var.get(),
+                    range_text=range_var.get(),
+                    annotation_mode=current_annotation_mode,
+                    mix_annotated_text=mix_annotated_var.get(),
+                    mix_unannotated_text=mix_unannotated_var.get(),
+                    class_filter_mode=current_class_mode,
+                    class_id=get_selected_class_id(),
+                )
+            except ValueError as exc:
+                summary_var.set(f"Selection error: {exc}")
+                return
+
+            source_names = {
+                "all": "All workspace images",
+                "filtered": "Currently filtered images",
+                "selected": "Currently selected images",
+                "range": f"Image IDs {range_var.get().strip() or '(not set)'}",
+            }
+            lines = [
+                f"Source: {source_names.get(source_var.get(), 'Custom selection')}",
+                f"Source size: {selection['source_count']}",
+                f"After source/class filters: {selection['candidate_count']}",
+                f"Annotated available: {selection['annotated_available']}",
+                f"Unannotated available: {selection['unannotated_available']}",
+                f"Exporting: {len(selection['paths'])} images",
+            ]
+
+            if current_annotation_mode == "mix":
+                lines.append(
+                    f"Mix result: all {selection['selected_annotated']} annotated + "
+                    f"{selection['selected_unannotated']} unannotated"
+                )
+            elif current_annotation_mode == "annotated":
+                lines.append("Mode: annotated only")
+            elif current_annotation_mode == "unannotated":
+                lines.append("Mode: unannotated only")
+
+            if source_var.get() == "selected" and selection["source_count"] == 0:
+                lines.append("No images were selected in the file list when this dialog opened.")
+
+            summary_var.set("\n".join(lines))
+
+        def do_export():
+            if self.current_image and self.current_file_path:
+                self.save_annotations(force=True)
+
+            try:
+                train_ratio, val_ratio, test_ratio = self._parse_export_split_settings(
+                    preset_var.get(),
+                    train_var.get(),
+                    val_var.get(),
+                    test_var.get(),
+                )
+                current_annotation_mode = annotation_mode_options.get(annotation_mode_var.get(), "any")
+                current_class_mode = class_filter_options.get(class_filter_mode_var.get(), "any")
+                selection = self._resolve_custom_export_selection(
+                    source_mode=source_var.get(),
+                    range_text=range_var.get(),
+                    annotation_mode=current_annotation_mode,
+                    mix_annotated_text=mix_annotated_var.get(),
+                    mix_unannotated_text=mix_unannotated_var.get(),
+                    class_filter_mode=current_class_mode,
+                    class_id=get_selected_class_id(),
+                )
+            except ValueError as exc:
+                messagebox.showerror("Custom Export", str(exc))
+                return
+
+            selected_paths = list(selection["paths"])
+            if not selected_paths:
+                if source_var.get() == "selected" and selection["source_count"] == 0:
+                    messagebox.showerror("Custom Export", "No images are currently selected in the file list.")
+                else:
+                    messagebox.showerror("Custom Export", "No images matched the export selection.")
+                return
+
+            if not self._confirm_export_label_compatibility("Custom Export"):
+                return
+
+            output_path = filedialog.asksaveasfilename(
+                defaultextension=".zip",
+                filetypes=[("Zip File", "*.zip")],
+                parent=dialog,
+            )
+            if not output_path:
+                return
+
+            dialog.destroy()
+            export_image_paths = selected_paths
+            if (
+                source_var.get() == "all"
+                and current_annotation_mode == "any"
+                and current_class_mode == "any"
+                and len(selected_paths) == len(self.image_paths)
+            ):
+                export_image_paths = None
+
+            def worker(update_progress):
+                update_progress("Exporting dataset...", detail=os.path.basename(output_path))
+                return utils.export_yolo_zip(
+                    self.workspace_path,
+                    output_path,
+                    train_ratio=train_ratio,
+                    val_ratio=val_ratio,
+                    test_ratio=test_ratio,
+                    force_single_test_pair=bool(test_override_var.get()),
+                    image_paths=export_image_paths,
+                )
+
+            def on_success(result, progress):
+                success, msg, stats = result
+                if success:
+                    messagebox.showinfo("Export Complete", msg)
+                    self.status_var.set(f"Exported dataset: {os.path.basename(output_path)}")
+                else:
+                    messagebox.showerror("Export Failed", msg)
+                    self.status_var.set("Export failed")
+
+            def on_error(error, progress):
+                messagebox.showerror("Export Failed", str(error))
+                self.status_var.set("Export failed")
+
+            self._run_background_task(
+                "Custom Export YOLO Dataset",
+                "Exporting dataset...",
+                worker,
+                on_success=on_success,
+                on_error=on_error,
+            )
+
+        for variable in (
+            source_var,
+            range_var,
+            annotation_mode_var,
+            mix_annotated_var,
+            mix_unannotated_var,
+            class_filter_mode_var,
+        ):
+            variable.trace_add("write", update_control_states)
+
+        class_choice_combo.bind("<<ComboboxSelected>>", refresh_summary)
+        update_control_states()
+
+        btn_frame = tb.Frame(dialog)
+        btn_frame.pack(pady=15)
         tb.Button(btn_frame, text="Export", command=do_export, bootstyle="success", width=12).pack(side="left", padx=5)
         tb.Button(btn_frame, text="Cancel", command=dialog.destroy, bootstyle="secondary", width=12).pack(side="left", padx=5)
 
@@ -3811,20 +4341,41 @@ class AnnotatorApp:
         zf = filedialog.askopenfilename(title="Select YOLO Zip to Import", filetypes=[("Zip Files", "*.zip"), ("All Files", "*.*")])
         if not zf: return
 
+        same_workspace = bool(
+            self.workspace_path and
+            os.path.normcase(os.path.abspath(ws)) == os.path.normcase(os.path.abspath(self.workspace_path))
+        )
         preferred_path = None
-        if self.workspace_path and os.path.normcase(os.path.abspath(ws)) == os.path.normcase(os.path.abspath(self.workspace_path)):
+        if same_workspace:
             preferred_path = self.current_file_path
+        old_count = len(self.image_paths) if same_workspace else None
 
         def worker(update_progress):
             update_progress("Importing YOLO zip...", detail=os.path.basename(zf))
-            classes, msg = utils.import_yolo_zip(zf, ws)
+            classes, msg, stats = utils.import_yolo_zip(zf, ws, progress_callback=update_progress)
             if classes is None:
                 raise ValueError(msg)
-            return {"classes": classes, "message": msg}
+            return {"classes": classes, "message": msg, "stats": stats or {}}
 
         def on_success(result, progress):
             messagebox.showinfo("Import Result", result["message"])
-            self.load_workspace(ws, preferred_path=preferred_path)
+            stats = result.get("stats") or {}
+            workspace_changed = bool(
+                stats.get("imported_images") or
+                stats.get("imported_labels") or
+                stats.get("classes_changed")
+            )
+
+            if same_workspace and not workspace_changed:
+                self.status_var.set(result["message"])
+                return
+
+            self.load_workspace(
+                ws,
+                preferred_path=preferred_path,
+                old_count=old_count,
+                refresh=same_workspace,
+            )
 
         def on_error(error, progress):
             messagebox.showerror("Import Error", str(error))
@@ -6492,8 +7043,8 @@ UI
         return fit_changed, stats, parent_changed, annotations_changed, region_changed
 
     def _load_annotations_for_image_path(self, img_path):
-        lbl_path = self._get_label_path(img_path)
-        annotations = self._load_annotations_from_file(self._get_label_read_path(img_path))
+        lbl_path = self._get_label_read_path(img_path)
+        annotations = self._load_annotations_from_file(lbl_path)
         return annotations, lbl_path
 
     def _write_annotations_to_label_path(self, lbl_path, annotations, loaded_label_format=None):
@@ -6906,10 +7457,16 @@ UI
             serialized = self._serialize_annotation(ann, label_format)
             if serialized:
                 lines.append(serialized)
-        content = "\n".join(lines)
-        if content:
-            content += "\n"
+        if not lines:
+            if os.path.exists(lbl_path):
+                self._backup_label_file_if_needed(lbl_path)
+                try:
+                    os.remove(lbl_path)
+                except Exception:
+                    pass
+            return 0
 
+        content = "\n".join(lines) + "\n"
         os.makedirs(os.path.dirname(lbl_path), exist_ok=True)
         self._backup_label_file_if_needed(lbl_path)
         temp_path = lbl_path + ".tmp"
@@ -8989,11 +9546,28 @@ UI
         subdir = os.path.join(dirname, "labels")
         return os.path.join(subdir, rootname + ".txt")
 
+    def _label_path_has_annotations(self, label_path):
+        if not label_path or not os.path.exists(label_path):
+            return False
+        try:
+            with open(label_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if self._parse_annotation_line(line) is not None:
+                        return True
+        except Exception:
+            return False
+        return False
+
     def _get_label_read_path(self, img_path):
         lbl_path = self._get_label_path(img_path)
-        if os.path.exists(lbl_path):
-            return lbl_path
         same_dir = os.path.splitext(img_path)[0] + ".txt"
+        if os.path.exists(lbl_path):
+            if os.path.exists(same_dir):
+                preferred_has_annotations = self._label_path_has_annotations(lbl_path)
+                same_dir_has_annotations = self._label_path_has_annotations(same_dir)
+                if same_dir_has_annotations and not preferred_has_annotations:
+                    return same_dir
+            return lbl_path
         if os.path.exists(same_dir):
             return same_dir
         return lbl_path
@@ -9124,21 +9698,24 @@ UI
                 return
             path = self.filtered_image_paths[self.current_index]
 
-        lbl_path = self._get_label_path(path)
-        
-        # Ensure dir
-        os.makedirs(os.path.dirname(lbl_path), exist_ok=True)
-
+        lbl_path = self._get_label_read_path(path)
+        fallback_label_path = self._get_label_path(path)
         save_format = self._resolve_label_format(self.annotations)
         line_count = self._write_annotations_atomically(lbl_path, self.annotations, save_format)
-        
+
+        if line_count <= 0 and os.path.normcase(os.path.normpath(fallback_label_path)) != os.path.normcase(os.path.normpath(lbl_path)):
+            self._write_annotations_atomically(fallback_label_path, [], save_format)
+
         # Update cache
         cids = set(a[0] for a in self.annotations)
         self.image_to_classes_cache[os.path.normpath(path)] = cids
-        
+
         # Mark as saved
         self.annotations_dirty = False
-        msg = f"Saved {os.path.basename(lbl_path)} ({line_count} annotations, {save_format} format)"
+        if line_count > 0:
+            msg = f"Saved {os.path.basename(lbl_path)} ({line_count} annotations, {save_format} format)"
+        else:
+            msg = f"Cleared labels for {os.path.basename(path)}"
         self.status_var.set(msg)
 
     # --- CANVAS & DRAWING ---
