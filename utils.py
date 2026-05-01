@@ -328,6 +328,66 @@ def _build_single_class_data_yaml(class_name, include_test):
     return "\n".join(yaml_lines) + "\n"
 
 
+def _copy_zip_member_to_path(zip_file, member_name, destination_path):
+    destination_dir = os.path.dirname(destination_path)
+    if destination_dir:
+        os.makedirs(destination_dir, exist_ok=True)
+    with zip_file.open(member_name, "r") as source_handle, open(destination_path, "wb") as dest_handle:
+        shutil.copyfileobj(source_handle, dest_handle, length=1024 * 1024)
+
+
+def _zip_member_matches_file(zip_file, member_name, file_path, block_size=65536):
+    if not os.path.exists(file_path):
+        return False
+
+    try:
+        info = zip_file.getinfo(member_name)
+        if os.path.getsize(file_path) != info.file_size:
+            return False
+
+        with zip_file.open(info, "r") as source_handle, open(file_path, "rb") as existing_handle:
+            while True:
+                source_block = source_handle.read(block_size)
+                existing_block = existing_handle.read(block_size)
+                if source_block != existing_block:
+                    return False
+                if not source_block:
+                    return True
+    except Exception:
+        return False
+
+
+def _zip_text_member_matches_file(zip_file, member_name, file_path):
+    if not os.path.exists(file_path):
+        return False
+
+    try:
+        with zip_file.open(member_name, "r") as source_handle:
+            source_text = source_handle.read().decode("utf-8-sig", errors="replace")
+        with open(file_path, "r", encoding="utf-8", errors="replace") as existing_handle:
+            existing_text = existing_handle.read()
+    except Exception:
+        return False
+
+    normalize = lambda value: value.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+    return normalize(source_text) == normalize(existing_text)
+
+
+def _make_unique_import_filename(directory, desired_name, occupied_stems=None):
+    stem, ext = os.path.splitext(desired_name)
+    candidate = desired_name
+    counter = 1
+    occupied_stems = occupied_stems or set()
+
+    while True:
+        candidate_path = os.path.join(directory, candidate)
+        candidate_stem = os.path.splitext(candidate)[0].lower()
+        if not os.path.exists(candidate_path) and candidate_stem not in occupied_stems:
+            return candidate
+        candidate = f"{stem}_{counter}{ext}"
+        counter += 1
+
+
 def export_single_class_resized_yolo_zip(
     input_zip_path,
     output_zip_path,
@@ -527,6 +587,62 @@ def compute_file_hash(filepath, block_size=65536):
     except:
         return None
 
+
+def _analyze_yolo_label_file(label_path):
+    summary = {
+        "exists": os.path.exists(label_path),
+        "annotation_count": 0,
+        "class_distribution": {},
+    }
+    if not summary["exists"]:
+        return summary
+
+    try:
+        with open(label_path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                parts = line.strip().split()
+                if len(parts) < 5:
+                    continue
+                try:
+                    class_id = int(float(parts[0]))
+                    float(parts[1])
+                    float(parts[2])
+                    float(parts[3])
+                    float(parts[4])
+                except Exception:
+                    continue
+                summary["annotation_count"] += 1
+                summary["class_distribution"][class_id] = summary["class_distribution"].get(class_id, 0) + 1
+    except Exception:
+        return summary
+
+    return summary
+
+
+def _resolve_workspace_label_path(images_src, labels_src, image_filename):
+    name = os.path.splitext(image_filename)[0]
+    preferred_path = os.path.join(labels_src, name + ".txt")
+    same_dir_path = os.path.join(images_src, name + ".txt")
+
+    preferred_exists = os.path.exists(preferred_path)
+    same_dir_exists = os.path.exists(same_dir_path)
+
+    if preferred_exists and same_dir_exists:
+        preferred_summary = _analyze_yolo_label_file(preferred_path)
+        same_dir_summary = _analyze_yolo_label_file(same_dir_path)
+        if same_dir_summary["annotation_count"] > 0 and preferred_summary["annotation_count"] <= 0:
+            return same_dir_path, same_dir_summary
+        return preferred_path, preferred_summary
+
+    if preferred_exists:
+        return preferred_path, _analyze_yolo_label_file(preferred_path)
+
+    if same_dir_exists:
+        return same_dir_path, _analyze_yolo_label_file(same_dir_path)
+
+    return preferred_path, {"exists": False, "annotation_count": 0, "class_distribution": {}}
+
+
 def validate_dataset(workspace_path):
     """
     Validate dataset and return stats and issues.
@@ -594,22 +710,12 @@ def validate_dataset(workspace_path):
     
     # Count labels and annotations
     for img_file in image_files:
-        name = os.path.splitext(img_file)[0]
-        txt_file = name + ".txt"
-        txt_path = os.path.join(labels_src, txt_file)
-        
-        if os.path.exists(txt_path):
+        _, label_summary = _resolve_workspace_label_path(images_src, labels_src, img_file)
+        if label_summary["annotation_count"] > 0:
             stats['images_with_labels'] += 1
-            with open(txt_path, 'r') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 5:
-                        stats['total_annotations'] += 1
-                        try:
-                            cid = int(float(parts[0]))
-                            stats['class_distribution'][cid] = stats['class_distribution'].get(cid, 0) + 1
-                        except:
-                            pass
+            stats['total_annotations'] += label_summary["annotation_count"]
+            for cid, count in label_summary["class_distribution"].items():
+                stats['class_distribution'][cid] = stats['class_distribution'].get(cid, 0) + count
         else:
             stats['images_without_labels'] += 1
     
@@ -619,6 +725,59 @@ def validate_dataset(workspace_path):
     
     return stats, issues, warnings
 
+
+def _resolve_export_image_files(images_src, requested_image_paths=None):
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    available_files = []
+    available_lookup = {}
+
+    for filename in os.listdir(images_src):
+        name, ext = os.path.splitext(filename)
+        if ext.lower() not in exts:
+            continue
+        available_files.append(filename)
+        available_lookup[os.path.normcase(filename)] = filename
+
+    available_files.sort()
+
+    if requested_image_paths is None:
+        return available_files
+
+    resolved_files = []
+    seen = set()
+    for path in requested_image_paths:
+        filename = os.path.basename(str(path))
+        key = os.path.normcase(filename)
+        actual_name = available_lookup.get(key)
+        if not actual_name or key in seen:
+            continue
+        resolved_files.append(actual_name)
+        seen.add(key)
+
+    return resolved_files
+
+
+def _build_export_subset_stats(images_src, labels_src, image_files):
+    stats = {
+        "selected_images": len(image_files),
+        "images_with_labels": 0,
+        "images_without_labels": 0,
+        "total_annotations": 0,
+        "class_distribution": {},
+    }
+
+    for img_file in image_files:
+        _, label_summary = _resolve_workspace_label_path(images_src, labels_src, img_file)
+        if label_summary["annotation_count"] > 0:
+            stats["images_with_labels"] += 1
+            stats["total_annotations"] += label_summary["annotation_count"]
+            for cid, count in label_summary["class_distribution"].items():
+                stats["class_distribution"][cid] = stats["class_distribution"].get(cid, 0) + count
+        else:
+            stats["images_without_labels"] += 1
+
+    return stats
+
 def export_yolo_zip(
     workspace_path,
     zip_out_path,
@@ -626,52 +785,51 @@ def export_yolo_zip(
     val_ratio=0.2,
     test_ratio=0.1,
     force_single_test_pair=False,
+    image_paths=None,
 ):
     """
     Creates a standardized YOLO zip with train/val/test splits.
-    
+
     Args:
         workspace_path: Path to workspace
         zip_out_path: Output zip file path
         train_ratio, val_ratio, test_ratio: Split ratios (should sum to 1.0)
         force_single_test_pair: When True, reserve exactly one labeled image+label pair in test
             and split all remaining items across train/val only.
-    
+        image_paths: Optional iterable of workspace image paths/names to export. When omitted,
+            exports the whole workspace.
+
     Returns:
         (success: bool, message: str, stats: dict)
     """
     images_src = os.path.join(workspace_path, "images")
     labels_src = os.path.join(workspace_path, "labels")
-    
+
     if not os.path.exists(images_src):
         return False, "No images directory found.", {}
-    
-    # Validate first
-    stats, issues, warnings = validate_dataset(workspace_path)
-    
-    if issues:
-        return False, "Issues found:\n" + "\n".join(issues), stats
-    
-    # 1. Gather all images
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-    
-    paired_files = []  # Images with labels
-    unlabeled_files = []  # Images without labels (negative examples)
-    
-    for f in os.listdir(images_src):
-        name, ext = os.path.splitext(f)
-        if ext.lower() in exts:
-            txt_path = os.path.join(labels_src, name + ".txt")
-            if os.path.exists(txt_path):
-                paired_files.append(f)
-            else:
-                unlabeled_files.append(f)
-    
-    # Need at least some images
+
+    dataset_stats, issues, warnings = validate_dataset(workspace_path)
+    fatal_issues = [issue for issue in issues if issue != "No labeled images found"]
+    if fatal_issues:
+        return False, "Issues found:\n" + "\n".join(fatal_issues), dataset_stats
+
+    selected_files = _resolve_export_image_files(images_src, requested_image_paths=image_paths)
+    subset_stats = _build_export_subset_stats(images_src, labels_src, selected_files)
+    subset_mode = image_paths is not None
+
+    paired_files = []
+    unlabeled_files = []
+    for filename in selected_files:
+        _, label_summary = _resolve_workspace_label_path(images_src, labels_src, filename)
+        if label_summary["annotation_count"] > 0:
+            paired_files.append(filename)
+        else:
+            unlabeled_files.append(filename)
+
     all_files = paired_files + unlabeled_files
     if not all_files:
-        return False, "No images found to export.", stats
-    
+        return False, "No images matched the export selection.", subset_stats
+
     try:
         train_files, val_files, test_files = split_yolo_items(
             paired_files,
@@ -682,49 +840,44 @@ def export_yolo_zip(
             force_single_test_pair=force_single_test_pair,
         )
     except ValueError as exc:
-        return False, str(exc), stats
-    
-    # Build temp directory
+        return False, str(exc), subset_stats
+
     temp_root = os.path.join(workspace_path, "temp_export_yolo_bundle")
     if os.path.exists(temp_root):
         shutil.rmtree(temp_root)
     os.makedirs(temp_root)
-    
+
     splits = {
-        'train': train_files,
-        'val': val_files,
-        'test': test_files
+        "train": train_files,
+        "val": val_files,
+        "test": test_files,
     }
-    
+
     for split_name, files in splits.items():
-        if not files: continue
+        if not files:
+            continue
         os.makedirs(os.path.join(temp_root, split_name, "images"), exist_ok=True)
         os.makedirs(os.path.join(temp_root, split_name, "labels"), exist_ok=True)
-        
+
         for img_file in files:
-            # Copy Image
             src_img = os.path.join(images_src, img_file)
             dst_img = os.path.join(temp_root, split_name, "images", img_file)
             shutil.copy2(src_img, dst_img)
-            
-            # Copy or create Label
+
             name = os.path.splitext(img_file)[0]
             txt_file = name + ".txt"
-            src_txt = os.path.join(labels_src, txt_file)
+            src_txt, _ = _resolve_workspace_label_path(images_src, labels_src, img_file)
             dst_txt = os.path.join(temp_root, split_name, "labels", txt_file)
-            
+
             if os.path.exists(src_txt):
                 shutil.copy2(src_txt, dst_txt)
             else:
-                # Create empty label file for negative examples
-                with open(dst_txt, 'w') as f:
-                    pass  # Empty file
-    
-    # Create data.yaml
+                with open(dst_txt, "w", encoding="utf-8") as f:
+                    pass
+
     ws_yaml = os.path.join(workspace_path, "data.yaml")
     classes = load_classes_from_yaml(ws_yaml)
-    
-    # Write YAML manually to get exact format
+
     yaml_lines = [
         "train: ../train/images",
         "val: ../val/images",
@@ -732,17 +885,15 @@ def export_yolo_zip(
     if test_files:
         yaml_lines.append("test: ../test/images")
     yaml_lines.append(f"nc: {len(classes)}")
-    
-    # Format names as ['Class1', 'Class2', ...]
+
     names_str = "[" + ", ".join(f"'{c}'" for c in classes) + "]"
     yaml_lines.append(f"names: {names_str}")
-    
-    with open(os.path.join(temp_root, "data.yaml"), 'w') as f:
+
+    with open(os.path.join(temp_root, "data.yaml"), "w", encoding="utf-8") as f:
         f.write("\n".join(yaml_lines) + "\n")
-        
-    # Zip it
+
     try:
-        with zipfile.ZipFile(zip_out_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(zip_out_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for root, dirs, files in os.walk(temp_root):
                 for file in files:
                     abs_path = os.path.join(root, file)
@@ -750,33 +901,32 @@ def export_yolo_zip(
                     zf.write(abs_path, rel_path)
     except Exception as e:
         shutil.rmtree(temp_root)
-        return False, f"Failed to create zip: {e}", stats
-                
-    # Cleanup
+        return False, f"Failed to create zip: {e}", subset_stats
+
     shutil.rmtree(temp_root)
-    
-    # Build detailed stats
+
     total_exported = len(train_files) + len(val_files) + len(test_files)
     export_stats = {
-        'total_exported': total_exported,
-        'labeled': len(paired_files),
-        'unlabeled': len(unlabeled_files),
-        'train': len(train_files),
-        'val': len(val_files),
-        'test': len(test_files),
-        'force_single_test_pair': bool(force_single_test_pair),
-        'classes': len(classes),
-        'annotations': stats['total_annotations'],
-        'class_distribution': stats['class_distribution'],
-        'duplicate_hashes': len(stats['duplicate_hashes']),
-        'duplicate_stems': len(stats['duplicate_stems']),
-        'warnings': warnings
+        "total_exported": total_exported,
+        "selected_images": subset_stats["selected_images"],
+        "labeled": len(paired_files),
+        "unlabeled": len(unlabeled_files),
+        "train": len(train_files),
+        "val": len(val_files),
+        "test": len(test_files),
+        "force_single_test_pair": bool(force_single_test_pair),
+        "classes": len(classes),
+        "annotations": subset_stats["total_annotations"],
+        "class_distribution": subset_stats["class_distribution"],
+        "duplicate_hashes": len(dataset_stats.get("duplicate_hashes", [])),
+        "duplicate_stems": len(dataset_stats.get("duplicate_stems", [])),
+        "warnings": [] if subset_mode else list(warnings),
     }
-    
-    # Build message
+
     msg_lines = [
-        f"✓ Exported {total_exported} images to {os.path.basename(zip_out_path)}",
+        f"Exported {total_exported} images to {os.path.basename(zip_out_path)}",
         "",
+        f"Selection: {subset_stats['selected_images']} images",
         "Split:",
         f"  Train: {len(train_files)}",
         f"  Val:   {len(val_files)}",
@@ -785,7 +935,7 @@ def export_yolo_zip(
         f"Labeled images: {len(paired_files)}",
         f"Negative examples (no objects): {len(unlabeled_files)}",
         f"Classes: {len(classes)}",
-        f"Total annotations: {stats['total_annotations']}",
+        f"Total annotations: {subset_stats['total_annotations']}",
     ]
 
     if force_single_test_pair:
@@ -796,103 +946,172 @@ def export_yolo_zip(
             "  All remaining items were split across train/val only.",
         ])
 
-    
-    if warnings:
+    if export_stats["warnings"]:
         msg_lines.append("")
-        msg_lines.append(f"Warnings ({len(warnings)}):")
-        for w in warnings[:5]:  # Show first 5
-            msg_lines.append(f"  • {w}")
-        if len(warnings) > 5:
-            msg_lines.append(f"  ... and {len(warnings)-5} more")
-    
+        msg_lines.append(f"Warnings ({len(export_stats['warnings'])}):")
+        for warning in export_stats["warnings"][:5]:
+            msg_lines.append(f"  - {warning}")
+        if len(export_stats["warnings"]) > 5:
+            msg_lines.append(f"  ... and {len(export_stats['warnings']) - 5} more")
+
     return True, "\n".join(msg_lines), export_stats
 
-def import_yolo_zip(zip_path, workspace_path):
+def import_yolo_zip(zip_path, workspace_path, progress_callback=None):
     """
     Imports a YOLO-formatted zip into the workspace.
     Merges all train/val/test images and labels into the flat workspace structure.
     Loads the yaml and returns the class list.
     """
     if not os.path.exists(zip_path):
-        return None, "Zip file not found."
-    
-    # Ensure workspace structure exists
-    images_dst = os.path.join(workspace_path, "images")
-    labels_dst = os.path.join(workspace_path, "labels")
-    yaml_dst = os.path.join(workspace_path, "data.yaml")
-    
-    os.makedirs(images_dst, exist_ok=True)
-    os.makedirs(labels_dst, exist_ok=True)
-    
-    # Extract to temp
-    temp_extract = os.path.join(workspace_path, "temp_import_yolo_bundle")
-    if os.path.exists(temp_extract):
-        shutil.rmtree(temp_extract)
-    os.makedirs(temp_extract)
-    
+        return None, "Zip file not found.", None
+
+    images_dst, labels_dst, yaml_dst = ensure_workspace_structure(workspace_path)
+    existing_classes = load_classes_from_yaml(yaml_dst)
+    occupied_stems = set()
+
+    if os.path.exists(images_dst):
+        for filename in os.listdir(images_dst):
+            stem, ext = os.path.splitext(filename)
+            if ext.lower() in IMAGE_EXTENSIONS:
+                occupied_stems.add(stem.lower())
+
+    if os.path.exists(labels_dst):
+        for filename in os.listdir(labels_dst):
+            stem, ext = os.path.splitext(filename)
+            if ext.lower() == ".txt":
+                occupied_stems.add(stem.lower())
+
+    stats = {
+        "imported_images": 0,
+        "imported_labels": 0,
+        "renamed_images": 0,
+        "attached_labels_to_existing_images": 0,
+        "skipped_duplicate_images": 0,
+        "skipped_duplicate_labels": 0,
+        "skipped_conflicting_labels": 0,
+        "classes_changed": False,
+        "classes": list(existing_classes),
+    }
+
     try:
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extractall(temp_extract)
+        with zipfile.ZipFile(zip_path, "r") as zip_file:
+            splits, yaml_candidates = _index_yolo_zip_splits(zip_file)
+            total_images = sum(len(split_info["images"]) for split_info in splits.values())
+
+            imported_classes = []
+            if yaml_candidates:
+                with zip_file.open(yaml_candidates[0], "r") as yaml_file:
+                    imported_classes = load_classes_from_yaml_content(
+                        yaml_file.read().decode("utf-8-sig", errors="replace")
+                    )
+
+            if imported_classes:
+                stats["classes"] = list(imported_classes)
+                if imported_classes != existing_classes:
+                    save_classes_to_yaml(yaml_dst, imported_classes)
+                    stats["classes_changed"] = True
+
+            processed = 0
+            for split_name in ("train", "val", "test"):
+                labels_by_stem = splits[split_name]["labels"]
+                for image_info in splits[split_name]["images"]:
+                    processed += 1
+                    image_name = image_info["filename"]
+                    image_stem = image_info["stem"]
+                    image_stem_key = image_info["stem_key"]
+                    image_path = os.path.join(images_dst, image_name)
+                    label_entry = labels_by_stem.get(image_stem_key)
+
+                    if progress_callback:
+                        progress_callback(
+                            "Importing YOLO zip...",
+                            detail=f"{processed}/{total_images}: {image_name}",
+                            current=processed - 1,
+                            total=max(1, total_images),
+                        )
+
+                    if os.path.exists(image_path) and _zip_member_matches_file(zip_file, image_info["entry_name"], image_path):
+                        stats["skipped_duplicate_images"] += 1
+
+                        if label_entry:
+                            existing_label_path = os.path.join(labels_dst, f"{image_stem}.txt")
+                            if not os.path.exists(existing_label_path):
+                                _copy_zip_member_to_path(zip_file, label_entry, existing_label_path)
+                                occupied_stems.add(image_stem_key)
+                                stats["imported_labels"] += 1
+                                stats["attached_labels_to_existing_images"] += 1
+                            elif _zip_text_member_matches_file(zip_file, label_entry, existing_label_path):
+                                stats["skipped_duplicate_labels"] += 1
+                            else:
+                                stats["skipped_conflicting_labels"] += 1
+
+                        if progress_callback:
+                            progress_callback(
+                                "Importing YOLO zip...",
+                                detail=f"{processed}/{total_images}: {image_name}",
+                                current=processed,
+                                total=max(1, total_images),
+                            )
+                        continue
+
+                    target_name = image_name
+                    if os.path.exists(image_path) or image_stem_key in occupied_stems:
+                        target_name = _make_unique_import_filename(
+                            images_dst,
+                            image_name,
+                            occupied_stems=occupied_stems,
+                        )
+                        if os.path.normcase(target_name) != os.path.normcase(image_name):
+                            stats["renamed_images"] += 1
+
+                    target_path = os.path.join(images_dst, target_name)
+                    _copy_zip_member_to_path(zip_file, image_info["entry_name"], target_path)
+                    stats["imported_images"] += 1
+
+                    target_stem = os.path.splitext(target_name)[0]
+                    occupied_stems.add(target_stem.lower())
+
+                    if label_entry:
+                        label_path = os.path.join(labels_dst, f"{target_stem}.txt")
+                        _copy_zip_member_to_path(zip_file, label_entry, label_path)
+                        stats["imported_labels"] += 1
+
+                    if progress_callback:
+                        progress_callback(
+                            "Importing YOLO zip...",
+                            detail=f"{processed}/{total_images}: {image_name}",
+                            current=processed,
+                            total=max(1, total_images),
+                        )
     except Exception as e:
-        shutil.rmtree(temp_extract)
-        return None, f"Failed to extract zip: {e}"
-    
-    # Find data.yaml in the extracted content
-    yaml_classes = []
-    for root, dirs, files in os.walk(temp_extract):
-        for f in files:
-            if f == "data.yaml":
-                yaml_src = os.path.join(root, f)
-                yaml_classes = load_classes_from_yaml(yaml_src)
-                # Copy yaml to workspace (will be updated if classes change)
-                shutil.copy2(yaml_src, yaml_dst)
-                break
-        if yaml_classes:
-            break
-    
-    # Merge images and labels from train/val/test
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".JPG", ".JPEG", ".PNG", ".BMP", ".WEBP"}
-    img_count = 0
-    lbl_count = 0
-    
-    for split in ["train", "val", "test"]:
-        # Look for split folder
-        split_path = None
-        for root, dirs, files in os.walk(temp_extract):
-            if os.path.basename(root) == split:
-                split_path = root
-                break
-        
-        if not split_path:
-            continue
-        
-        # Look for images subfolder
-        img_src = os.path.join(split_path, "images")
-        lbl_src = os.path.join(split_path, "labels")
-        
-        if os.path.exists(img_src):
-            for f in os.listdir(img_src):
-                name, ext = os.path.splitext(f)
-                if ext in exts:
-                    src = os.path.join(img_src, f)
-                    dst = os.path.join(images_dst, f)
-                    if not os.path.exists(dst):
-                        shutil.copy2(src, dst)
-                        img_count += 1
-        
-        if os.path.exists(lbl_src):
-            for f in os.listdir(lbl_src):
-                if f.endswith(".txt"):
-                    src = os.path.join(lbl_src, f)
-                    dst = os.path.join(labels_dst, f)
-                    if not os.path.exists(dst):
-                        shutil.copy2(src, dst)
-                        lbl_count += 1
-    
-    # Cleanup
-    shutil.rmtree(temp_extract)
-    
-    return yaml_classes, f"Imported {img_count} images and {lbl_count} labels."
+        return None, f"Failed to import zip: {e}", None
+
+    def format_count(count, singular, plural=None):
+        plural = plural or f"{singular}s"
+        word = singular if int(count) == 1 else plural
+        return f"{count} {word}"
+
+    details = []
+    if stats["renamed_images"] > 0:
+        details.append(f"{format_count(stats['renamed_images'], 'image')} renamed to avoid conflicts")
+    if stats["attached_labels_to_existing_images"] > 0:
+        details.append(
+            f"{format_count(stats['attached_labels_to_existing_images'], 'label')} applied to matching existing images"
+        )
+    if stats["skipped_duplicate_images"] > 0:
+        details.append(f"{format_count(stats['skipped_duplicate_images'], 'identical image')} skipped")
+    if stats["skipped_duplicate_labels"] > 0:
+        details.append(f"{format_count(stats['skipped_duplicate_labels'], 'identical label')} skipped")
+    if stats["skipped_conflicting_labels"] > 0:
+        details.append(f"{format_count(stats['skipped_conflicting_labels'], 'conflicting label')} skipped")
+    if stats["classes_changed"]:
+        details.append("classes updated")
+
+    message = f"Imported {stats['imported_images']} images and {stats['imported_labels']} labels."
+    if details:
+        message += " (" + "; ".join(details) + ")"
+
+    return stats["classes"], message, stats
 
 def reduce_dataset(workspace_path, target_count, method="stratified", action="move", seed=None):
     images_dir = os.path.join(workspace_path, "images")
