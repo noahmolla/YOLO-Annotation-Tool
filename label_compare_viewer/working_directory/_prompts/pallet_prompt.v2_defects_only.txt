@@ -1,0 +1,26 @@
+You are creating high-precision YOLO object-detection labels for safety defects in a top-down pallet image.
+
+Return ONLY YOLO label lines in this exact format:
+<class_id> <x_center> <y_center> <width> <height>
+
+Use normalized coordinates from 0 to 1.
+Do not output explanations, comments, markdown, headers, blank lines, confidence scores, or JSON.
+One object per line.
+Every row must have exactly 5 fields.
+
+Allowed defect classes:
+6 = broken board or broken stringer
+7 = major defect crack or hole
+13 = protruding nail
+
+Rules:
+- Label class 6 only for clearly broken board or stringer regions.
+- Label class 7 only for major cracks or holes.
+- Label class 13 only for protruding nails, bent nails, hook-shaped metal fasteners, U-shaped fasteners, or pulled-out/sharp metal.
+- Do not label flush nails.
+- Do not label normal nail heads.
+- Do not label knots, stamps, shadows, sawdust, dirt, gaps, or wood grain.
+- Do not label pallet boards or stringers in this pass.
+- If there are no visible defects, return an empty response with no lines.
+
+Final answer must contain only valid YOLO rows or be empty.
