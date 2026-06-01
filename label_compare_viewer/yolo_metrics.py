@@ -73,6 +73,16 @@ def truth_label_path_for_image(image_path: Path) -> Path | None:
     same_stem_path = image_path.parent / f"{image_path.stem}.txt"
     if same_stem_path.exists():
         return same_stem_path
+    if image_path.parent.name.lower() == "images":
+        workspace_label_path = image_path.parent.parent / "labels" / f"{image_path.stem}.txt"
+        if workspace_label_path.exists():
+            return workspace_label_path
+    parts = list(image_path.parts)
+    lowered = [part.lower() for part in parts]
+    for index in reversed([idx for idx, part in enumerate(lowered) if part == "images"]):
+        candidate = Path(*parts[:index], "labels", *parts[index + 1 :]).with_suffix(".txt")
+        if candidate.exists():
+            return candidate
     return None
 
 
@@ -290,6 +300,17 @@ def compare_image_to_source(
 ) -> ImageMetrics:
     truth_path = truth_label_path_for_image(image_path)
     source_path = image_path.parent / f"{source_name}.txt"
+    return compare_image_to_label_paths(image_path, source_name, truth_path, source_path, classes, settings)
+
+
+def compare_image_to_label_paths(
+    image_path: Path,
+    source_name: str,
+    truth_path: Path | None,
+    source_path: Path,
+    classes: list[str],
+    settings: dict[str, Any],
+) -> ImageMetrics:
     allowed = set(settings.get("allowed_class_ids", [])) or None
     iou_thresholds = settings.get("iou_thresholds", {})
     tiny_center = settings.get("tiny_object_center_match_px", {})
@@ -431,4 +452,3 @@ def image_metrics_to_row(metric: ImageMetrics) -> dict[str, Any]:
         "truth_missing": metric.truth_missing,
         "source_missing": metric.source_missing,
     }
-

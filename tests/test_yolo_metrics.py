@@ -73,3 +73,17 @@ def test_segmentation_polygon_bbox_scoring(tmp_path):
     metric = compare_image_to_source(image_path, "gpt", ["entire_pallet"], SETTINGS)
     assert metric.tp == 1
 
+
+def test_yolo_workspace_labels_are_truth(tmp_path):
+    workspace = tmp_path / "workspace"
+    images_dir = workspace / "images"
+    labels_dir = workspace / "labels"
+    images_dir.mkdir(parents=True)
+    labels_dir.mkdir()
+    image_path = images_dir / "sample.jpg"
+    Image.new("RGB", (100, 100), "white").save(image_path)
+    (labels_dir / "sample.txt").write_text("0 0.5 0.5 0.4 0.4\n", encoding="utf-8")
+    (images_dir / "gpt.txt").write_text("0 0.5 0.5 0.4 0.4\n", encoding="utf-8")
+    metric = compare_image_to_source(image_path, "gpt", ["entire_pallet"], SETTINGS)
+    assert metric.truth_missing is False
+    assert metric.f1 == 1.0

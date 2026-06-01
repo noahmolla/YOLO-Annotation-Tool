@@ -1,14 +1,27 @@
-try:
-    import tensorflow.lite as tflite
-except ImportError:
-    try:
-        import tflite_runtime.interpreter as tflite
-    except ImportError:
-        tflite = None  # TFLite not available; PyTorchYOLOModel can still be used
-
 import numpy as np
 import cv2
 import os
+import sys
+
+_tflite_import_errors = []
+_TFLITE_BACKEND = ""
+
+try:
+    import ai_edge_litert.interpreter as tflite
+    _TFLITE_BACKEND = "LiteRT"
+except ImportError as exc:
+    _tflite_import_errors.append(f"ai-edge-litert: {exc}")
+    try:
+        import tensorflow.lite as tflite
+        _TFLITE_BACKEND = "TensorFlow Lite"
+    except ImportError as exc:
+        _tflite_import_errors.append(f"tensorflow.lite: {exc}")
+        try:
+            import tflite_runtime.interpreter as tflite
+            _TFLITE_BACKEND = "tflite-runtime"
+        except ImportError as exc:
+            _tflite_import_errors.append(f"tflite-runtime: {exc}")
+            tflite = None  # TFLite not available; PyTorchYOLOModel can still be used
 
 class TFLiteModel:
     def __init__(self, model_path):
@@ -16,8 +29,15 @@ class TFLiteModel:
         Initialize the TFLite interpreter with multi-threaded CPU execution.
         """
         if tflite is None:
+            errors = "\n".join(f"  - {item}" for item in _tflite_import_errors)
             raise ImportError(
-                "TFLite runtime not found. Install the optional TFLite backend with:\n"
+                "TFLite runtime not found for this Python environment.\n"
+                f"Python: {sys.executable}\n"
+                f"Version: {sys.version.split()[0]}\n"
+                f"Import attempts:\n{errors}\n\n"
+                "Install a backend into the same Python used to launch the app:\n"
+                "  python -m pip install ai-edge-litert\n"
+                "or, on Python versions supported by TensorFlow:\n"
                 "  python -m pip install -r requirements-tflite.txt"
             )
         num_threads = os.cpu_count() or 4
@@ -37,7 +57,7 @@ class TFLiteModel:
             image: PIL Image or numpy array (BGR or RGB).
             confidence_threshold: Float, threshold to filter weak detections.
             iou_threshold: Float, IOU threshold for NMS (Non-Maximum Suppression).
-            version: "Auto", "v5", "v8/v11"
+            version: "Auto", "v5", "v8/v11", "v26"
         Returns:
             boxes: List of [x_center, y_center, width, height] (normalized).
             classes: List of class IDs.
@@ -132,7 +152,7 @@ class TFLiteModel:
         # Normalize orientation to [N, 4+classes]
         # v5 outputs [N, Dims], v8/v11 outputs [Dims, N] — transpose if needed
         transpose = False
-        if version == "v8/v11":
+        if version in {"v8/v11", "v26"}:
             if output.shape[0] < output.shape[1]:
                 transpose = True
         elif version == "v5":
@@ -157,7 +177,7 @@ class TFLiteModel:
         
         if version == "v5":
             has_obj_conf = True
-        elif version == "v8/v11":
+        elif version in {"v8/v11", "v26"}:
             has_obj_conf = False
         else:
              # Auto-detect: v5 COCO models have 85 cols (5 + 80), v8 have 84 (4 + 80)

@@ -36,6 +36,7 @@ class LabelReadResult:
     invalid_lines: int = 0
     error: str = ""
     mtime: float | None = None
+    mtime_ns: int | None = None
     size: int | None = None
 
 
@@ -251,6 +252,7 @@ def read_label_file(label_path: str | Path) -> LabelReadResult:
         raw_text,
         invalid_lines=invalid_lines,
         mtime=stat.st_mtime,
+        mtime_ns=stat.st_mtime_ns,
         size=stat.st_size,
     )
 

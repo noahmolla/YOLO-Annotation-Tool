@@ -86,8 +86,10 @@ Why the split install exists:
 
 - Manual bounding-box annotation with drag, 2-click, and center-stamp workflows
 - Optional AI-assisted auto-annotation from `.pt` and `.tflite` models
+- Stack pallet auto-labeling through the Pallet Counter headless API
 - Undo / redo, gallery view, filtering, and dataset statistics
 - Filled box highlight overlay and dense-object helpers for rapid labeling
+- Adjustable rapid navigation delay from the Advanced toolbar option
 - Dataset-wide AOI polygon cleanup plus AOI-aware auto-annotation constraints
 - YOLO zip import/export tools with train/val/test handling
 - Duplicate finder, suspicious-label checks, and format repair tools
@@ -130,6 +132,17 @@ Optional auto-annotation supports:
 
 - `.pt` files through Ultralytics / PyTorch
 - `.tflite` files through TensorFlow Lite
+
+### Stack Pallet Labels
+
+The `Stack Pallet Labels...` auto-annotation action can call the Pallet Counter project at
+`C:\Users\noahm\GitHub\Pallet Counter\pallet counter` and convert its row/edge debug output into YOLO detect labels.
+Set `PALLET_COUNTER_DIR` or choose a different project folder in the dialog if needed.
+
+The default `Layer boxes` mode writes one detect box per pallet row across most of the detected stack crop. The
+`Full edge line boxes` mode expands the Pallet Counter light-edge line geometry from the thin strip to the full stack
+edge for comparison, while the older `Line boxes` and `Point boxes` modes use the Pallet Counter API export directly.
+See `STACK_PALLET_AUTOLABEL.md` for the same functionality as a headless Python API.
 
 ### Common shortcuts
 

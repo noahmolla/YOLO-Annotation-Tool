@@ -21,6 +21,43 @@ def test_image_import_creates_per_image_folder(tmp_path):
         root.destroy()
 
 
+def test_external_edit_mode_keeps_added_image_in_place(tmp_path):
+    viewer_app.CONFIG_PATH = tmp_path / "config.json"
+    viewer_app.DEFAULT_WORKING_DIR = tmp_path / "work"
+    source_dir = tmp_path / "external"
+    source_dir.mkdir()
+    source = source_dir / "pallet 001.jpg"
+    Image.new("RGB", (20, 20), "white").save(source)
+
+    root = tb.Window(themename="darkly")
+    try:
+        app = viewer_app.LabelCompareViewerApp(root)
+        app.external_edit_mode_var.set(True)
+        linked = Path(app._prepare_image_for_add(source))
+        assert linked == source.resolve()
+        assert not (viewer_app.DEFAULT_WORKING_DIR / "pallet_001" / "pallet_001.jpg").exists()
+    finally:
+        root.destroy()
+
+
+def test_reload_keeps_linked_external_images(tmp_path):
+    viewer_app.CONFIG_PATH = tmp_path / "config.json"
+    viewer_app.DEFAULT_WORKING_DIR = tmp_path / "work"
+    source_dir = tmp_path / "external"
+    source_dir.mkdir()
+    source = source_dir / "pallet_001.jpg"
+    Image.new("RGB", (20, 20), "white").save(source)
+
+    root = tb.Window(themename="darkly")
+    try:
+        app = viewer_app.LabelCompareViewerApp(root)
+        app.manual_image_paths = [str(source)]
+        app._refresh_images_from_current_inputs()
+        assert str(source.resolve()) in app.all_image_paths
+    finally:
+        root.destroy()
+
+
 def test_truth_label_can_be_copied_as_truth_txt(tmp_path):
     image_folder = tmp_path / "work" / "pallet_001"
     image_folder.mkdir(parents=True)
