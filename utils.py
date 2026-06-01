@@ -523,13 +523,14 @@ def export_single_class_resized_yolo_zip(
     report("done", stats=stats)
     return stats
 
-def ensure_workspace_structure(root_path):
+def ensure_workspace_structure(root_path, default_classes=None):
     """
     Ensures that the workspace has:
     - images/
     - labels/
     - data.yaml
     """
+    default_classes = list(default_classes or [])
     images_dir = os.path.join(root_path, "images")
     labels_dir = os.path.join(root_path, "labels")
     yaml_path = os.path.join(root_path, "data.yaml")
@@ -543,7 +544,9 @@ def ensure_workspace_structure(root_path):
             'path': '.',  # root
             'train': 'images',
             'val': 'images', 
-            'names': {}
+            'nc': len(default_classes),
+            'names': {i: name for i, name in enumerate(default_classes)}
+            if default_classes else {}
         }
         with open(yaml_path, 'w') as f:
             yaml.dump(default_data, f, sort_keys=False)

@@ -11,17 +11,31 @@ import threading
 import time
 import math
 import re
+import subprocess
+import sys
+import tempfile
 import traceback
 import numpy as np
 import json
 import cv2
 from inference import TFLiteModel
 import utils
+from stack_pallet_autolabel import (
+    DEFAULT_PALLET_COUNTER_DIR,
+    STACK_LABEL_MODE_LAYERS,
+    STACK_LABEL_MODES,
+    StackAutoLabelError,
+    StackAutoLabelOptions,
+    build_stack_pallet_annotations,
+)
 
 # Enable loading of truncated/corrupted images globally
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 CONFIG_FILE = "config.json"
+DEFAULT_RAPID_NAV_DELAY_MS = 50
+MIN_RAPID_NAV_DELAY_MS = 10
+MAX_RAPID_NAV_DELAY_MS = 2000
 ANNOTATION_MODE_BOX = "box"
 ANNOTATION_MODE_SEGMENT = "segment"
 BOX_INPUT_DRAG = "drag"
@@ -103,7 +117,9 @@ class AnnotatorApp:
         self.selected_class_id = 0
         self.filter_mode = "All"        # Filter mode string
         self.custom_query_paths = None  # Set of paths matching last custom query
+        self.frozen_filter_paths = None # Set of paths captured when a normal filter is selected
         self.last_query_conditions = [] # Saved query conditions for re-opening dialog
+        self.last_query_outside_pallet = False # Saved geometry query toggle
         self.suspicious_include_tiny = False  # Whether to flag tiny annotations as suspicious
         self.suspicious_tiny_exclude_classes = set()  # Classes to ignore for tiny check
         
@@ -150,7 +166,7 @@ class AnnotatorApp:
         # Rapid navigation
         self.nav_held_key = None
         self.nav_timer_id = None
-        self.nav_delay = 50  # ms between images when holding key (fast mode)
+        self.nav_delay = DEFAULT_RAPID_NAV_DELAY_MS  # ms between images when holding key (fast mode)
         self.rapid_mode = False  # False = single step, True = rapid scroll
 
         # Crosshair
@@ -308,6 +324,15 @@ class AnnotatorApp:
         except (TypeError, ValueError):
             normalized = fallback
         return max(self.min_ui_scale, min(self.max_ui_scale, normalized))
+
+    def _normalize_rapid_nav_delay_ms(self, value, fallback=None):
+        if fallback is None:
+            fallback = DEFAULT_RAPID_NAV_DELAY_MS
+        try:
+            normalized = int(round(float(value)))
+        except (TypeError, ValueError, tk.TclError):
+            normalized = int(fallback)
+        return max(MIN_RAPID_NAV_DELAY_MS, min(MAX_RAPID_NAV_DELAY_MS, normalized))
 
     def _apply_ui_scale(self, scale_value, announce=True):
         normalized = self._normalize_ui_scale(scale_value, fallback=self.ui_scale)
@@ -487,6 +512,10 @@ class AnnotatorApp:
             if "geometry" in cfg:
                 self._apply_saved_geometry(cfg["geometry"])
             self._apply_ui_scale(cfg.get("ui_scale", 1.0), announce=False)
+            self.nav_delay = self._normalize_rapid_nav_delay_ms(
+                cfg.get("rapid_nav_delay_ms", self.nav_delay),
+                fallback=DEFAULT_RAPID_NAV_DELAY_MS,
+            )
             
             # Restore Classes
             if "classes" in cfg and cfg["classes"]:
@@ -653,6 +682,7 @@ class AnnotatorApp:
             "center_box_height_px": self.center_box_height_px.get(),
             "annotation_fill_enabled": self.annotation_fill_enabled.get(),
             "ui_scale": self.ui_scale,
+            "rapid_nav_delay_ms": self._normalize_rapid_nav_delay_ms(self.nav_delay),
         }
         if hasattr(self, 'model_path_str'):
              cfg["model_path"] = self.model_path_str
@@ -1122,6 +1152,15 @@ class AnnotatorApp:
         custom_export_row = tb.Frame(ctrl_frame)
         custom_export_row.pack(fill=X, pady=1)
         tb.Button(custom_export_row, text="Custom Export", command=self.custom_export_dialog, bootstyle="success-outline").pack(fill=X)
+
+        compare_row = tb.Frame(ctrl_frame)
+        compare_row.pack(fill=X, pady=(4, 1))
+        tb.Button(
+            compare_row,
+            text="Model Compare",
+            command=self.open_model_compare_viewer,
+            bootstyle="info-outline",
+        ).pack(fill=X)
         
         # Classes row
 
@@ -1162,6 +1201,12 @@ class AnnotatorApp:
         self.btn_auto_all.pack(side=LEFT, expand=True, fill=X, padx=(1,0))
 
         tb.Button(model_frame, text="Confidence / IOU Settings", command=self.show_annotation_settings, bootstyle="info").pack(fill=X, pady=(4, 1))
+        tb.Button(
+            model_frame,
+            text="Stack Pallet Labels...",
+            command=self.show_stack_pallet_auto_label_dialog,
+            bootstyle="success-outline",
+        ).pack(fill=X, pady=(4, 1))
 
         people_body, self.people_tools_expanded_var, self.people_tools_toggle_btn = self._create_collapsible_section(
             model_frame,
@@ -1462,6 +1507,23 @@ class AnnotatorApp:
         extract_row.pack(fill=X, pady=1)
         tb.Button(extract_row, text="Extract Filtered", command=self.extract_filtered_images, bootstyle="success", width=12).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
         tb.Button(extract_row, text="Query", command=self.show_query_dialog, bootstyle="primary", width=8).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+
+        pallet_bounds_row = tb.Frame(quick_frame)
+        pallet_bounds_row.pack(fill=X, pady=1)
+        tb.Button(
+            pallet_bounds_row,
+            text="Fix Pallet Current",
+            command=self.fix_current_pallet_bounds_to_objects,
+            bootstyle="info-outline",
+            width=12,
+        ).pack(side=LEFT, expand=True, fill=X, padx=(0, 1))
+        tb.Button(
+            pallet_bounds_row,
+            text="Fix Pallet Query",
+            command=self.fix_active_query_pallet_bounds_to_objects,
+            bootstyle="warning-outline",
+            width=12,
+        ).pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
         
         # Suspicious & YOLO Check row
         check_row = tb.Frame(quick_frame)
@@ -1535,6 +1597,7 @@ class AnnotatorApp:
 
         self.speed_btn = tb.Button(toolbar_actions, text="Speed: Single", command=self.toggle_nav_speed, bootstyle="secondary-outline", width=12)
         self.speed_btn.pack(side=RIGHT, padx=(4, 0))
+        tb.Button(toolbar_actions, text="Advanced", command=self.show_advanced_options_dialog, bootstyle="secondary-outline", width=10).pack(side=RIGHT, padx=(4, 0))
         tb.Button(toolbar_actions, text="Shortcuts", command=self.show_shortcuts_dialog, bootstyle="secondary-outline").pack(side=RIGHT, padx=4)
         tb.Button(toolbar_actions, text="Info", command=self.show_image_info, bootstyle="info-outline").pack(side=RIGHT, padx=4)
         tb.Button(toolbar_actions, text="Repeat + Next", command=self.repeat_and_next, bootstyle="info").pack(side=RIGHT, padx=4)
@@ -1962,25 +2025,25 @@ class AnnotatorApp:
         self.root.bind("<KeyPress-d>", self._on_nav_key_press)
         self.root.bind("<KeyRelease-d>", self._on_nav_key_release)
         
-        self.root.bind("s", lambda e: self.save_annotations())
+        self.root.bind("s", lambda e: self._run_shortcut(lambda _event: self.save_annotations(), e, allow_during_edit=True))
         
         # Del = quick delete image (no prompt, undoable)
-        self.root.bind("<Delete>", lambda e: self.delete_current_image_quick())
+        self.root.bind("<Delete>", lambda e: self._run_shortcut(self.delete_current_image_quick, e))
         
         # Backspace = clear annotations of selected class
-        self.root.bind("<BackSpace>", lambda e: self.clear_class_annotations_quick())
+        self.root.bind("<BackSpace>", lambda e: self._run_shortcut(lambda _event: self.clear_class_annotations_quick(), e))
         
         # Ctrl+Backspace = clear ALL annotations
-        self.root.bind("<Control-BackSpace>", lambda e: self.clear_all_annotations_quick())
+        self.root.bind("<Control-BackSpace>", lambda e: self._run_shortcut(lambda _event: self.clear_all_annotations_quick(), e))
         
-        self.root.bind("g", self._on_g_key)
-        self.root.bind("G", lambda e: self._set_annotation_mode(ANNOTATION_MODE_SEGMENT))
-        self.root.bind("w", lambda e: self._set_annotation_mode(ANNOTATION_MODE_BOX))
-        self.root.bind("<Return>", self.finish_pending_segment)
-        self.root.bind("c", self.finish_pending_segment)
-        self.root.bind("C", self.finish_pending_segment)
-        self.root.bind("<Shift-BackSpace>", self.undo_pending_segment_point)
-        self.root.bind("<space>", self.reset_zoom_view)
+        self.root.bind("g", lambda e: self._run_shortcut(self._on_g_key, e))
+        self.root.bind("G", lambda e: self._run_shortcut(lambda _event: self._set_annotation_mode(ANNOTATION_MODE_SEGMENT), e))
+        self.root.bind("w", lambda e: self._run_shortcut(lambda _event: self._set_annotation_mode(ANNOTATION_MODE_BOX), e))
+        self.root.bind("<Return>", lambda e: self._run_shortcut(self.finish_pending_segment, e, allow_during_edit=True))
+        self.root.bind("c", lambda e: self._run_shortcut(self.finish_pending_segment, e, allow_during_edit=True))
+        self.root.bind("C", lambda e: self._run_shortcut(self.finish_pending_segment, e, allow_during_edit=True))
+        self.root.bind("<Shift-BackSpace>", lambda e: self._run_shortcut(self.undo_pending_segment_point, e, allow_during_edit=True))
+        self.root.bind("<space>", lambda e: self._run_shortcut(self.reset_zoom_view, e, allow_during_edit=True))
         self.root.bind("<Control-plus>", self.increase_ui_scale)
         self.root.bind("<Control-equal>", self.increase_ui_scale)
         self.root.bind("<Control-KP_Add>", self.increase_ui_scale)
@@ -1995,11 +2058,11 @@ class AnnotatorApp:
         self.root.bind("<Alt-KP_Subtract>", lambda e: self.zoom_out_hotkey())
 
         # H for help/shortcuts
-        self.root.bind("h", lambda e: self.show_shortcuts_dialog())
+        self.root.bind("h", lambda e: self._run_shortcut(lambda _event: self.show_shortcuts_dialog(), e))
         
         # Alt+Arrow navigation
-        self.root.bind("<Alt-Left>", self.prev_image)
-        self.root.bind("<Alt-Right>", self.next_image)
+        self.root.bind("<Alt-Left>", lambda e: self._run_shortcut(self.prev_image, e))
+        self.root.bind("<Alt-Right>", lambda e: self._run_shortcut(self.next_image, e))
 
         # Class hotkeys:
         # 0-9 select classes 0-9, numpad mirrors 0-9, and Shift+1..0 selects 10..19.
@@ -2009,50 +2072,50 @@ class AnnotatorApp:
         self._bind_global_class_hotkey_release_fallbacks()
 
         # R for repeat last drawn box
-        self.root.bind("r", self.repeat_last_box)
+        self.root.bind("r", lambda e: self._run_shortcut(self.repeat_last_box, e))
         
         # Y for repeat selected annotations and go to next
-        self.root.bind("y", self.repeat_and_next)
-        self.root.bind("[", lambda e: self.adjust_center_stamp_size(-1))
-        self.root.bind("]", lambda e: self.adjust_center_stamp_size(1))
+        self.root.bind("y", lambda e: self._run_shortcut(self.repeat_and_next, e))
+        self.root.bind("[", lambda e: self._run_shortcut(lambda _event: self.adjust_center_stamp_size(-1), e, allow_during_edit=True))
+        self.root.bind("]", lambda e: self._run_shortcut(lambda _event: self.adjust_center_stamp_size(1), e, allow_during_edit=True))
         
         # Q for quick auto-annotate (all classes, no dialog)
-        self.root.bind("q", lambda e: self.auto_annotate_quick())
-        self.root.bind("b", self.start_quick_board_clip_corners)
-        self.root.bind("B", self.start_quick_board_clip_guides)
-        self.root.bind_all("<Alt-b>", lambda e: self.start_quick_board_clip_corners_batch())
-        self.root.bind_all("<Alt-B>", lambda e: self.start_quick_board_clip_corners_batch())
-        self.root.bind("v", self.apply_board_clip_to_current)
-        self.root.bind("x", self.extend_board_clip_to_parent_current)
-        self.root.bind("X", self.extend_board_clip_stringers_to_parent_current)
-        self.root.bind_all("<Alt-x>", lambda e: self.extend_board_clip_to_parent_dataset())
-        self.root.bind_all("<Alt-X>", lambda e: self.extend_board_clip_stringers_to_parent_dataset())
-        self.root.bind_all("<Alt-Shift-X>", lambda e: self.extend_board_clip_stringers_to_parent_dataset())
+        self.root.bind("q", lambda e: self._run_shortcut(lambda _event: self.auto_annotate_quick(), e))
+        self.root.bind("b", lambda e: self._run_shortcut(self.start_quick_board_clip_corners, e))
+        self.root.bind("B", lambda e: self._run_shortcut(self.start_quick_board_clip_guides, e))
+        self.root.bind_all("<Alt-b>", lambda e: self._run_shortcut(lambda _event: self.start_quick_board_clip_corners_batch(), e))
+        self.root.bind_all("<Alt-B>", lambda e: self._run_shortcut(lambda _event: self.start_quick_board_clip_corners_batch(), e))
+        self.root.bind("v", lambda e: self._run_shortcut(self.apply_board_clip_to_current, e))
+        self.root.bind("x", lambda e: self._run_shortcut(self.extend_board_clip_to_parent_current, e))
+        self.root.bind("X", lambda e: self._run_shortcut(self.extend_board_clip_stringers_to_parent_current, e))
+        self.root.bind_all("<Alt-x>", lambda e: self._run_shortcut(lambda _event: self.extend_board_clip_to_parent_dataset(), e))
+        self.root.bind_all("<Alt-X>", lambda e: self._run_shortcut(lambda _event: self.extend_board_clip_stringers_to_parent_dataset(), e))
+        self.root.bind_all("<Alt-Shift-X>", lambda e: self._run_shortcut(lambda _event: self.extend_board_clip_stringers_to_parent_dataset(), e))
         
         # Ctrl+Z for undo (use bind_all to work regardless of focus)
-        self.root.bind_all("<Control-z>", lambda e: self.undo_action())
-        self.root.bind_all("<Control-Z>", lambda e: self.undo_action())
+        self.root.bind_all("<Control-z>", lambda e: self._run_shortcut(lambda _event: self.undo_action(), e))
+        self.root.bind_all("<Control-Z>", lambda e: self._run_shortcut(lambda _event: self.undo_action(), e))
         
         # Ctrl+Y for redo
-        self.root.bind_all("<Control-y>", lambda e: self.redo_action())
-        self.root.bind_all("<Control-Y>", lambda e: self.redo_action())
+        self.root.bind_all("<Control-y>", lambda e: self._run_shortcut(lambda _event: self.redo_action(), e))
+        self.root.bind_all("<Control-Y>", lambda e: self._run_shortcut(lambda _event: self.redo_action(), e))
         
         # Ctrl+G for go to image number
-        self.root.bind_all("<Control-g>", lambda e: self.go_to_image_dialog())
-        self.root.bind_all("<Control-G>", lambda e: self.go_to_image_dialog())
+        self.root.bind_all("<Control-g>", lambda e: self._run_shortcut(lambda _event: self.go_to_image_dialog(), e))
+        self.root.bind_all("<Control-G>", lambda e: self._run_shortcut(lambda _event: self.go_to_image_dialog(), e))
         
         # Escape to clear selection AND unlock class filter
-        self.root.bind_all("<Escape>", lambda e: self.escape_action())
+        self.root.bind_all("<Escape>", lambda e: self.escape_action() if not self._focus_is_text_input() else None)
         
         # F to toggle show only selected class
-        self.root.bind("f", lambda e: self._toggle_show_only_selected_class())
+        self.root.bind("f", lambda e: self._run_shortcut(lambda _event: self._toggle_show_only_selected_class(), e, allow_during_edit=True))
         
         # T to toggle draw-only mode
-        self.root.bind("t", lambda e: self.draw_only_mode.set(not self.draw_only_mode.get()))
-        self.root.bind("e", lambda e: self._toggle_edit_mode())
+        self.root.bind("t", lambda e: self._run_shortcut(lambda _event: self.draw_only_mode.set(not self.draw_only_mode.get()), e))
+        self.root.bind("e", lambda e: self._run_shortcut(lambda _event: self._toggle_edit_mode(), e))
         
         # F5 to refresh workspace
-        self.root.bind("<F5>", lambda e: self.refresh_workspace())
+        self.root.bind("<F5>", lambda e: self._run_shortcut(lambda _event: self.refresh_workspace(), e))
             
         # Canvas Mouse - Ctrl+Click for multi-selection
         self.canvas.bind("<Control-ButtonPress-1>", self.on_ctrl_click)
@@ -2114,6 +2177,89 @@ class AnnotatorApp:
                 subprocess.run(['explorer', self.workspace_path], check=False)
             except:
                 messagebox.showerror("Error", f"Could not open folder: {e}")
+
+    def open_model_compare_viewer(self):
+        """Launch the Label Compare Viewer directly on its Model Compare tab."""
+        if self.current_image:
+            self.save_annotations()
+
+        app_root = os.path.dirname(os.path.abspath(__file__))
+        package_dir = os.path.join(app_root, "label_compare_viewer")
+        if not os.path.exists(os.path.join(package_dir, "main.py")):
+            messagebox.showerror("Model Compare", f"Could not find:\n{package_dir}")
+            return
+        python_exe = self._model_compare_python_executable(app_root)
+
+        log_handle = None
+        log_path = os.path.join(tempfile.gettempdir(), "yolo_model_compare_viewer_launch.log")
+        try:
+            command = [python_exe, "-m", "label_compare_viewer.main", "--model-compare"]
+            if self.workspace_path:
+                command.extend(["--workspace", self.workspace_path])
+            log_handle = open(log_path, "w", encoding="utf-8")
+            log_handle.write(f"Command: {subprocess.list2cmdline(command)}\n")
+            log_handle.write(f"Working directory: {app_root}\n\n")
+            log_handle.flush()
+            proc = subprocess.Popen(
+                command,
+                cwd=app_root,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+            )
+            self.status_var.set("Opening Model Compare...")
+
+            def check_launch():
+                if log_handle:
+                    try:
+                        log_handle.close()
+                    except Exception:
+                        pass
+                return_code = proc.poll()
+                if return_code is None:
+                    self.status_var.set("Opened Model Compare.")
+                    return
+                details = ""
+                try:
+                    if os.path.exists(log_path):
+                        with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+                            details = handle.read().strip()
+                except Exception:
+                    details = ""
+                if len(details) > 3000:
+                    details = "...\n" + details[-3000:]
+                message = f"Model Compare exited immediately with code {return_code}."
+                if details:
+                    message += f"\n\n{details}"
+                message += f"\n\nLaunch log:\n{log_path}"
+                self.status_var.set("Model Compare failed to open.")
+                messagebox.showerror("Model Compare", message)
+
+            self.root.after(1500, check_launch)
+        except Exception as exc:
+            if log_handle:
+                try:
+                    log_handle.close()
+                except Exception:
+                    pass
+            messagebox.showerror("Model Compare", f"Could not open Model Compare:\n{exc}")
+
+    def _model_compare_python_executable(self, app_root):
+        candidates = []
+        if os.name == "nt":
+            candidates.append(os.path.join(app_root, "venv", "Scripts", "python.exe"))
+        else:
+            candidates.append(os.path.join(app_root, "venv", "bin", "python"))
+        if sys.executable and not getattr(sys, "frozen", False):
+            candidates.append(sys.executable)
+        seen = set()
+        for candidate in candidates:
+            key = os.path.normcase(os.path.abspath(candidate)) if candidate else ""
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            if os.path.exists(candidate):
+                return candidate
+        return sys.executable
 
     def _run_background_task(
         self,
@@ -2380,7 +2526,11 @@ class AnnotatorApp:
                 detail=os.path.basename(workspace_path) or workspace_path,
             )
 
-        img_dir, lbl_dir, yaml_path = utils.ensure_workspace_structure(workspace_path)
+        fallback_classes = list(getattr(self, "classes", []) or [])
+        img_dir, lbl_dir, yaml_path = utils.ensure_workspace_structure(
+            workspace_path,
+            default_classes=fallback_classes,
+        )
         image_paths = self._gather_image_paths(img_dir)
         if not image_paths and os.path.normcase(os.path.abspath(img_dir)) != os.path.normcase(os.path.abspath(workspace_path)):
             image_paths = self._gather_image_paths(workspace_path)
@@ -2414,6 +2564,11 @@ class AnnotatorApp:
         if progress_callback:
             progress_callback("Loading classes...", detail=os.path.basename(yaml_path))
 
+        yaml_classes = utils.load_classes_from_yaml(yaml_path)
+        if not yaml_classes and fallback_classes:
+            utils.save_classes_to_yaml(yaml_path, fallback_classes)
+            yaml_classes = fallback_classes
+
         return {
             "workspace_path": workspace_path,
             "img_dir": img_dir,
@@ -2421,7 +2576,7 @@ class AnnotatorApp:
             "yaml_path": yaml_path,
             "image_paths": image_paths,
             "image_id_map": {path: i + 1 for i, path in enumerate(image_paths)},
-            "classes": utils.load_classes_from_yaml(yaml_path),
+            "classes": yaml_classes,
             "image_to_classes_cache": cache_snapshot["image_to_classes_cache"],
             "cached_stats": cache_snapshot["cached_stats"],
             "dataset_label_format": dataset_label_format,
@@ -2452,6 +2607,7 @@ class AnnotatorApp:
         self.filter_mode = "All"
         self.filter_combo.set("All")
         self.custom_query_paths = None
+        self.frozen_filter_paths = None
         self._refresh_file_list()
 
         if self.filtered_image_paths:
@@ -2540,6 +2696,15 @@ class AnnotatorApp:
 
     def _clear_loaded_image_state(self, clear_canvas=True, reset_view=False, clear_file_selection=True):
         """Clear any loaded image, transient drawing state, and optional canvas/view state."""
+        if (
+            self.current_image
+            and self.current_file_path
+            and self.annotations_dirty
+            and os.path.exists(self.current_file_path)
+        ):
+            # Last-resort guard for callers that are about to invalidate the in-memory annotation list.
+            self.save_annotations(force=True)
+
         if self.temp_box_id and hasattr(self, "canvas") and self.canvas is not None:
             try:
                 self.canvas.delete(self.temp_box_id)
@@ -2621,6 +2786,7 @@ class AnnotatorApp:
         self.filter_mode = "All"
         self.filter_combo.set("All")
         self.custom_query_paths = None
+        self.frozen_filter_paths = None
         
         self._refresh_file_list()
         if self.image_paths:
@@ -2635,6 +2801,7 @@ class AnnotatorApp:
         This is a major performance optimization - we read each label file only once
         instead of twice (once for cache, once for stats).
         """
+        self._save_current_annotations_if_dirty()
         self.image_to_classes_cache = {}
         
         # Stats accumulators
@@ -2654,28 +2821,21 @@ class AnnotatorApp:
             # Normalize path for consistent matching
             norm_path = os.path.normpath(p)
             self.image_to_classes_cache[norm_path] = set()
-            lbl_path = self._get_label_path(p)
-            
-            if os.path.exists(lbl_path):
-                try:
-                    with open(lbl_path, 'r') as f:
-                        content = f.read()
-                    
-                    lines = [l.strip() for l in content.splitlines() if l.strip()]
-                    if lines:
-                        annotated += 1
-                        total_boxes += len(lines)
-                        for line in lines:
-                            parts = line.split()
-                            if parts:
-                                try:
-                                    cid = int(float(parts[0]))
-                                    self.image_to_classes_cache[norm_path].add(cid)
-                                    all_classes.add(cid)
-                                except:
-                                    pass
-                except:
-                    pass  # Skip unreadable files
+            try:
+                annotations, _ = self._load_annotations_for_image_path(p)
+            except Exception:
+                annotations = []
+
+            if annotations:
+                annotated += 1
+                total_boxes += len(annotations)
+                for ann in annotations:
+                    try:
+                        cid = int(ann[0])
+                        self.image_to_classes_cache[norm_path].add(cid)
+                        all_classes.add(cid)
+                    except Exception:
+                        pass
         
         # Update stats display
         total_images = len(self.image_paths)
@@ -2789,12 +2949,51 @@ class AnnotatorApp:
         self.filter_combo['values'] = vals
         self.filter_combo.current(0)
         self.filter_mode = "All"
+        self.frozen_filter_paths = None
         
         if self.classes:
             self.selected_class_id = 0
             self.cls_list.selection_set(0)
         self._refresh_board_clip_parent_ui()
         self._refresh_people_model_ui()
+
+    def _workspace_data_yaml_path(self):
+        if not self.workspace_path:
+            return None
+        return os.path.join(self.workspace_path, "data.yaml")
+
+    def _sync_empty_workspace_yaml_from_current_classes(self):
+        yaml_path = self._workspace_data_yaml_path()
+        if not yaml_path:
+            return []
+
+        yaml_classes = utils.load_classes_from_yaml(yaml_path)
+        if yaml_classes:
+            return yaml_classes
+
+        current_classes = list(getattr(self, "classes", []) or [])
+        if not current_classes:
+            return []
+
+        utils.save_classes_to_yaml(yaml_path, current_classes)
+        if hasattr(self, "status_var"):
+            self.status_var.set(f"Saved {len(current_classes)} classes to workspace data.yaml")
+        return current_classes
+
+    def _confirm_export_has_class_yaml(self, export_name):
+        classes = self._sync_empty_workspace_yaml_from_current_classes()
+        if classes:
+            return True
+
+        proceed = messagebox.askyesno(
+            f"{export_name} Warning",
+            "This export would write data.yaml with nc: 0 because the workspace has no class names.\n\n"
+            "Load a classes file, import a data.yaml, or use Input Classes before exporting if this dataset has labeled objects.\n\n"
+            "Continue exporting anyway?",
+        )
+        if not proceed and hasattr(self, "status_var"):
+            self.status_var.set(f"{export_name} canceled because data.yaml would have nc: 0")
+        return proceed
 
     def _refresh_board_clip_parent_ui(self):
         choices = self._board_clip_class_choices()
@@ -3752,6 +3951,8 @@ class AnnotatorApp:
         class_filter_mode="any",
         class_id=None,
     ):
+        self._flush_current_annotations_to_disk()
+
         if source_mode == "all":
             source_paths = list(self.image_paths)
         elif source_mode == "filtered":
@@ -3916,8 +4117,10 @@ class AnnotatorApp:
                 messagebox.showerror("Error", str(exc))
                 return
 
-            if self.current_image and self.current_file_path:
-                self.save_annotations(force=True)
+            self._flush_current_annotations_to_disk()
+
+            if not self._confirm_export_has_class_yaml("Export"):
+                return
 
             if not self._confirm_export_label_compatibility("Export"):
                 return
@@ -3978,6 +4181,7 @@ class AnnotatorApp:
             messagebox.showerror("Error", "No images in the current workspace.")
             return
 
+        self._flush_current_annotations_to_disk()
         selected_snapshot = self._get_selected_file_paths()
         source_var = tk.StringVar(value="all")
         range_var = tk.StringVar(value="")
@@ -4199,8 +4403,7 @@ class AnnotatorApp:
             summary_var.set("\n".join(lines))
 
         def do_export():
-            if self.current_image and self.current_file_path:
-                self.save_annotations(force=True)
+            self._flush_current_annotations_to_disk()
 
             try:
                 train_ratio, val_ratio, test_ratio = self._parse_export_split_settings(
@@ -4230,6 +4433,9 @@ class AnnotatorApp:
                     messagebox.showerror("Custom Export", "No images are currently selected in the file list.")
                 else:
                     messagebox.showerror("Custom Export", "No images matched the export selection.")
+                return
+
+            if not self._confirm_export_has_class_yaml("Custom Export"):
                 return
 
             if not self._confirm_export_label_compatibility("Custom Export"):
@@ -4714,8 +4920,11 @@ class AnnotatorApp:
 
     def _do_delete_current_image(self):
         """Internal: performs the actual image deletion."""
+        if self.current_image and self.current_file_path:
+            self.save_annotations(force=True)
+
         img_path = self.filtered_image_paths[self.current_index]
-        lbl_path = self._get_label_path(img_path)
+        lbl_path = self._get_label_read_path(img_path)
         next_filtered_index = self.current_index
         
         # Read file contents for undo
@@ -4755,8 +4964,11 @@ class AnnotatorApp:
         if norm_path in self.image_to_classes_cache:
             del self.image_to_classes_cache[norm_path]
         # Remove from custom query paths if active
-        if self.custom_query_paths and img_path in self.custom_query_paths:
+        if self.custom_query_paths is not None and img_path in self.custom_query_paths:
             self.custom_query_paths.discard(img_path)
+        frozen_filter_paths = getattr(self, "frozen_filter_paths", None)
+        if frozen_filter_paths is not None:
+            frozen_filter_paths.discard(img_path)
         
         # Clear state to prevent 'save_annotations' from resurrecting the labels
         self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=False)
@@ -4891,6 +5103,57 @@ UI
             return annotations, self._clone_board_clip_region_snapshot(raw_region)
         return self._copy_annotations(snapshot or []), None
 
+    def _capture_annotation_history_snapshot_for_path(self, file_path):
+        if file_path == self.current_file_path:
+            return self._make_annotation_history_snapshot(file_path, self.annotations)
+
+        annotations, _ = self._load_annotations_for_image_path(file_path)
+        return self._make_annotation_history_snapshot(file_path, annotations)
+
+    def _restore_annotation_history_snapshot_for_path(self, file_path, annotations, board_clip_region):
+        restored_annotations = self._copy_annotations(annotations)
+
+        if file_path == self.current_file_path:
+            self.annotations = restored_annotations
+            self._restore_board_clip_region_snapshot(file_path, board_clip_region)
+            self.save_annotations(force=True)
+            self.redraw()
+            self._refresh_filter_after_current_annotation_change()
+            return "current"
+
+        if file_path in self.filtered_image_paths:
+            idx = self.filtered_image_paths.index(file_path)
+            self.load_image(idx)
+            self.annotations = restored_annotations
+            self._restore_board_clip_region_snapshot(file_path, board_clip_region)
+            self.save_annotations(force=True)
+            self.redraw()
+            self._refresh_filter_after_current_annotation_change()
+            return "visible"
+
+        lbl_path = self._get_label_read_path(file_path)
+        loaded_label_format = (
+            LABEL_FORMAT_SEGMENT
+            if any(self._is_polygon_annotation(ann) for ann in restored_annotations)
+            else LABEL_FORMAT_DETECT
+        )
+        self._write_annotations_to_label_path(
+            lbl_path,
+            restored_annotations,
+            loaded_label_format=loaded_label_format,
+        )
+        self.image_to_classes_cache[os.path.normpath(file_path)] = {
+            int(ann[0]) for ann in restored_annotations
+        }
+        self._restore_board_clip_region_snapshot(file_path, board_clip_region)
+        self._refresh_file_list()
+        if file_path in self.filtered_image_paths:
+            idx = self.filtered_image_paths.index(file_path)
+            self.load_image(idx)
+            return "visible"
+        self._sync_file_list_selection_to_current_path()
+        return "hidden"
+
     def undo_action(self):
         """Undo last action - annotation changes or file deletions."""
         # First try annotation undo (more common)
@@ -4908,32 +5171,27 @@ UI
                 return
 
             old_annotations, old_region = self._unpack_annotation_history_snapshot(snapshot)
-            
-            # Save current state to redo stack BEFORE restoring
-            if self.current_file_path:
-                current_snapshot = self._make_annotation_history_snapshot(self.current_file_path, self.annotations)
-                self.annotation_redo_stack.append((self.current_file_path, current_snapshot))
-            
-            # If we're on the same file, restore annotations
-            if file_path == self.current_file_path:
-                self.annotations = old_annotations
-                self._restore_board_clip_region_snapshot(file_path, old_region)
-                self.save_annotations()
-                self.redraw()
-                self._flash_notification(f"↶ Undo (Ctrl+Y to redo)")
+
+            try:
+                redo_snapshot = self._capture_annotation_history_snapshot_for_path(file_path)
+                self.annotation_redo_stack.append((file_path, redo_snapshot))
+                restore_location = self._restore_annotation_history_snapshot_for_path(
+                    file_path,
+                    old_annotations,
+                    old_region,
+                )
+            except Exception as ex:
+                messagebox.showerror("Undo Error", str(ex))
                 return
+
+            if restore_location == "current":
+                self._flash_notification("Undo (Ctrl+Y to redo)")
+            elif restore_location == "hidden":
+                self._flash_notification(f"Undo on {os.path.basename(file_path)} (hidden by current filter)")
             else:
-                # Different file - reload that file first
-                if file_path in self.filtered_image_paths:
-                    idx = self.filtered_image_paths.index(file_path)
-                    self.load_image(idx)
-                    self.annotations = old_annotations
-                    self._restore_board_clip_region_snapshot(file_path, old_region)
-                    self.save_annotations()
-                    self.redraw()
-                    self._flash_notification(f"↶ Undo on {os.path.basename(file_path)}")
-                    return
-        
+                self._flash_notification(f"Undo on {os.path.basename(file_path)}")
+            return
+
         # Then try file deletion undo
         if self.deleted_files_stack:
             img_path, lbl_path, img_data, lbl_data = self.deleted_files_stack.pop()
@@ -4955,6 +5213,9 @@ UI
                 if img_path not in self.image_paths:
                     self.image_paths.append(img_path)
                     self.image_paths.sort()
+                frozen_filter_paths = getattr(self, "frozen_filter_paths", None)
+                if frozen_filter_paths is not None:
+                    frozen_filter_paths.add(img_path)
                 
                 # Rebuild cache and refresh
                 self._build_annotation_cache()
@@ -4991,28 +5252,26 @@ UI
             return
 
         redo_annotations, redo_region = self._unpack_annotation_history_snapshot(snapshot)
-        
-        # Save current state to undo stack
-        if self.current_file_path:
-            current_snapshot = self._make_annotation_history_snapshot(self.current_file_path, self.annotations)
-            self.annotation_undo_stack.append((self.current_file_path, current_snapshot))
-        
-        # Apply redo
-        if file_path == self.current_file_path:
-            self.annotations = redo_annotations
-            self._restore_board_clip_region_snapshot(file_path, redo_region)
-            self.save_annotations()
-            self.redraw()
-            self._flash_notification(f"↷ Redo")
+
+        try:
+            undo_snapshot = self._capture_annotation_history_snapshot_for_path(file_path)
+            self.annotation_undo_stack.append((file_path, undo_snapshot))
+            restore_location = self._restore_annotation_history_snapshot_for_path(
+                file_path,
+                redo_annotations,
+                redo_region,
+            )
+        except Exception as ex:
+            messagebox.showerror("Redo Error", str(ex))
+            return
+
+        if restore_location == "current":
+            self._flash_notification("Redo")
+        elif restore_location == "hidden":
+            self._flash_notification(f"Redo on {os.path.basename(file_path)} (hidden by current filter)")
         else:
-            if file_path in self.filtered_image_paths:
-                idx = self.filtered_image_paths.index(file_path)
-                self.load_image(idx)
-                self.annotations = redo_annotations
-                self._restore_board_clip_region_snapshot(file_path, redo_region)
-                self.save_annotations()
-                self.redraw()
-                self._flash_notification(f"↷ Redo on {os.path.basename(file_path)}")
+            self._flash_notification(f"Redo on {os.path.basename(file_path)}")
+        return
 
     def _push_annotation_undo(self):
         """Save current annotation state for undo."""
@@ -5085,7 +5344,7 @@ UI
                 continue
             annotations, board_clip_region = self._unpack_annotation_history_snapshot(entry.get("snapshot"))
             self._restore_board_clip_region_snapshot(file_path, board_clip_region)
-            lbl_path = self._get_label_path(file_path)
+            lbl_path = self._get_label_read_path(file_path)
             self._write_annotations_to_label_path(
                 lbl_path,
                 annotations,
@@ -5111,18 +5370,17 @@ UI
         total_boxes = 0
         
         for p in self.image_paths:
-            lbl_path = self._get_label_path(p)
-            if os.path.exists(lbl_path):
-                with open(lbl_path, 'r') as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if parts:
-                            try:
-                                cid = int(float(parts[0]))
-                                class_counts[cid] = class_counts.get(cid, 0) + 1
-                                total_boxes += 1
-                            except:
-                                pass
+            try:
+                annotations, _ = self._load_annotations_for_image_path(p)
+            except Exception:
+                annotations = []
+            for ann in annotations:
+                try:
+                    cid = int(ann[0])
+                    class_counts[cid] = class_counts.get(cid, 0) + 1
+                    total_boxes += 1
+                except Exception:
+                    pass
         
         # Build summary text
         lines = [f"Total Images: {len(self.image_paths)}", f"Total Annotations: {total_boxes}", ""]
@@ -5147,12 +5405,43 @@ UI
 
     # --- NAVIGATION ---
 
+    def _filter_value_is_all(self, filter_mode=None):
+        return (filter_mode if filter_mode is not None else self.filter_mode) == "All"
+
+    def _filter_value_is_query(self, filter_mode=None):
+        value = filter_mode if filter_mode is not None else self.filter_mode
+        return value in ("Custom Query", "🔍 Query Active") or "Query Active" in str(value)
+
+    def _normal_filter_snapshot_active(self):
+        return (
+            getattr(self, "frozen_filter_paths", None) is not None
+            and not self._filter_value_is_all()
+            and not self._filter_value_is_query()
+        )
+
+    def _capture_current_normal_filter_snapshot(self):
+        if self._filter_value_is_all() or self._filter_value_is_query():
+            self.frozen_filter_paths = None
+            return
+        self.frozen_filter_paths = {
+            img_path
+            for img_path in self.image_paths
+            if self._image_matches_filter_live(img_path)
+        }
+
     def _refresh_file_list(self):
         """Refresh the file list with current filter. Optimized for large datasets."""
         self.filtered_image_paths = []
+        frozen_filter_paths = getattr(self, "frozen_filter_paths", None)
         
         # First pass: filter images (fast, no UI updates)
         for p in self.image_paths:
+            if self._normal_filter_snapshot_active():
+                if p not in frozen_filter_paths:
+                    continue
+                self.filtered_image_paths.append(p)
+                continue
+
             # Use normalized path for cache lookup
             cache = self.image_to_classes_cache.get(os.path.normpath(p), set())
             
@@ -5161,7 +5450,7 @@ UI
                 pass  # No filter
             elif self.filter_mode in ("Custom Query", "🔍 Query Active"):
                 # Custom query - use saved path set
-                if self.custom_query_paths and p not in self.custom_query_paths:
+                if self.custom_query_paths is not None and p not in self.custom_query_paths:
                     continue
             elif self.filter_mode == "Unannotated":
                 if cache:  # Has annotations, skip
@@ -5213,9 +5502,86 @@ UI
         if names:
             self.file_list.insert(tk.END, *names)
 
-    def _rebuild_after_image_list_change(self, preferred_filtered_index=0, preferred_path=None):
+    def _image_matches_filter_live(self, img_path):
+        if not img_path:
+            return False
+        cache = self.image_to_classes_cache.get(os.path.normpath(img_path), set())
+
+        if self.filter_mode == "All":
+            return True
+        if self.filter_mode in ("Custom Query", "🔍 Query Active"):
+            return self.custom_query_paths is None or img_path in self.custom_query_paths
+        if self.filter_mode == "Unannotated":
+            return not cache
+        if self.filter_mode == "Overlapping":
+            return self._image_has_overlaps(img_path)
+        if self.filter_mode == "Suspicious":
+            return self._image_has_suspicious_annotations(img_path)
+        if self.filter_mode.startswith("Has: "):
+            try:
+                return self.classes.index(self.filter_mode[5:]) in cache
+            except Exception:
+                return False
+        if self.filter_mode.startswith("Missing: "):
+            try:
+                return self.classes.index(self.filter_mode[9:]) not in cache
+            except Exception:
+                return False
+        if self.filter_mode.startswith("Only: "):
+            try:
+                class_id = self.classes.index(self.filter_mode[6:])
+                return bool(cache) and cache == {class_id}
+            except Exception:
+                return False
+        return True
+
+    def _image_matches_current_filter(self, img_path):
+        if self._normal_filter_snapshot_active():
+            return img_path in getattr(self, "frozen_filter_paths", set())
+        return self._image_matches_filter_live(img_path)
+
+    def _sync_file_list_selection_to_current_path(self):
+        current_path = self.current_file_path
+        if not current_path or current_path not in self.filtered_image_paths:
+            return False
+
+        idx = self.filtered_image_paths.index(current_path)
+        self.current_index = idx
+        if hasattr(self, "lbl_idx") and self.lbl_idx is not None:
+            img_id = self.image_id_map.get(current_path, idx + 1)
+            self.lbl_idx.config(text=f"#{img_id} ({idx + 1}/{len(self.filtered_image_paths)})")
+        try:
+            self.file_list.selection_clear(0, tk.END)
+            self.file_list.selection_set(idx)
+            self.file_list.see(idx)
+        except Exception:
+            pass
+        return True
+
+    def _refresh_filter_after_current_annotation_change(self, preferred_filtered_index=None):
+        current_path = self.current_file_path
+        if not current_path:
+            return
+
+        if self._custom_query_filter_active():
+            self._refresh_file_list()
+            self._sync_file_list_selection_to_current_path()
+            return
+
+        if self._image_matches_current_filter(current_path):
+            self._refresh_file_list()
+            self._sync_file_list_selection_to_current_path()
+            return
+
+        next_index = self.current_index if preferred_filtered_index is None else preferred_filtered_index
+        self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=False)
+        self._rebuild_after_image_list_change(preferred_filtered_index=next_index)
+
+    def _rebuild_after_image_list_change(self, preferred_filtered_index=0, preferred_path=None, refresh_filter_snapshot=False):
         self.image_id_map = {path: i + 1 for i, path in enumerate(self.image_paths)}
         self._build_annotation_cache_and_stats()
+        if refresh_filter_snapshot:
+            self._capture_current_normal_filter_snapshot()
         self._refresh_file_list()
 
         if self.filtered_image_paths:
@@ -5229,11 +5595,7 @@ UI
 
     def _image_has_overlaps(self, img_path):
         """Check if an image has overlapping annotations."""
-        lbl_path = self._get_label_path(img_path)
-        if not os.path.exists(lbl_path):
-            return False
-
-        annotations = [ann[1:5] for ann in self._load_annotations_from_file(lbl_path)]
+        annotations = [ann[1:5] for ann in self._load_annotations_for_image_path(img_path)[0]]
         
         # Check all pairs for overlap
         for i in range(len(annotations)):
@@ -5241,6 +5603,341 @@ UI
                 if self._boxes_overlap(annotations[i], annotations[j]):
                     return True
         return False
+
+    def _annotation_contains_center_point(self, container_ann, center_point):
+        """Return True when a normalized center point is inside an annotation shape."""
+        x, y = float(center_point[0]), float(center_point[1])
+        if self._is_polygon_annotation(container_ann):
+            polygon = self._annotation_points(container_ann)
+            if len(polygon) >= 3:
+                return self._point_in_polygon((x, y), polygon)
+
+        left, top, right, bottom = self._ann_to_bounds(container_ann)
+        return left <= x <= right and top <= y <= bottom
+
+    def _non_pallet_centers_outside_pallet_indices(self, annotations, pallet_class_id=AUTO_PALLET_CLASS_ID):
+        """Find non-pallet annotations whose centers are outside every pallet annotation."""
+        pallet_class_id = int(pallet_class_id)
+        pallet_annotations = [
+            ann for ann in annotations
+            if len(ann) >= 5 and int(ann[0]) == pallet_class_id
+        ]
+        outside_indices = []
+
+        for idx, ann in enumerate(annotations):
+            if len(ann) < 5 or int(ann[0]) == pallet_class_id:
+                continue
+            center = (float(ann[1]), float(ann[2]))
+            if not any(self._annotation_contains_center_point(pallet_ann, center) for pallet_ann in pallet_annotations):
+                outside_indices.append(idx)
+
+        return outside_indices
+
+    def _image_has_non_pallet_center_outside_pallet(self, img_path, pallet_class_id=AUTO_PALLET_CLASS_ID):
+        annotations, _ = self._load_annotations_for_image_path(img_path)
+        return bool(self._non_pallet_centers_outside_pallet_indices(annotations, pallet_class_id=pallet_class_id))
+
+    def _annotation_outer_bounds(self, ann):
+        if len(ann) < 5:
+            return None
+        left, top, right, bottom = self._ann_to_bounds(ann)
+        left, right = sorted((max(0.0, min(1.0, float(left))), max(0.0, min(1.0, float(right)))))
+        top, bottom = sorted((max(0.0, min(1.0, float(top))), max(0.0, min(1.0, float(bottom)))))
+        if right - left <= 1e-9 or bottom - top <= 1e-9:
+            return None
+        return left, top, right, bottom
+
+    def _object_outer_bounds_for_pallet(self, annotations, pallet_class_id=AUTO_PALLET_CLASS_ID):
+        pallet_class_id = int(pallet_class_id)
+        union_bounds = None
+        object_count = 0
+
+        for ann in annotations:
+            if len(ann) < 5 or int(ann[0]) == pallet_class_id:
+                continue
+            bounds = self._annotation_outer_bounds(ann)
+            if bounds is None:
+                continue
+            left, top, right, bottom = bounds
+            object_count += 1
+            if union_bounds is None:
+                union_bounds = [left, top, right, bottom]
+            else:
+                union_bounds[0] = min(union_bounds[0], left)
+                union_bounds[1] = min(union_bounds[1], top)
+                union_bounds[2] = max(union_bounds[2], right)
+                union_bounds[3] = max(union_bounds[3], bottom)
+
+        return (tuple(union_bounds) if union_bounds else None), object_count
+
+    def _build_pallet_annotation_from_object_outer_bounds(self, annotations, pallet_class_id=AUTO_PALLET_CLASS_ID):
+        bounds, object_count = self._object_outer_bounds_for_pallet(
+            annotations,
+            pallet_class_id=pallet_class_id,
+        )
+        if bounds is None:
+            return None, object_count, None
+        return self._bounds_to_ann(int(pallet_class_id), bounds), object_count, bounds
+
+    def _fix_pallet_annotation_to_object_bounds(self, annotations, pallet_class_id=AUTO_PALLET_CLASS_ID):
+        replacement_ann, object_count, bounds = self._build_pallet_annotation_from_object_outer_bounds(
+            annotations,
+            pallet_class_id=pallet_class_id,
+        )
+        if replacement_ann is None:
+            return self._copy_annotations(annotations), False, {
+                "object_count": object_count,
+                "replaced_count": 0,
+                "bounds": bounds,
+            }
+
+        updated, changed, replaced_count = self._replace_annotations_for_class(
+            annotations,
+            int(pallet_class_id),
+            [replacement_ann],
+        )
+        return updated, changed, {
+            "object_count": object_count,
+            "replaced_count": replaced_count,
+            "bounds": bounds,
+        }
+
+    def _annotation_class_counts_for_image(self, img_path):
+        counts = {}
+        try:
+            annotations, _ = self._load_annotations_for_image_path(img_path)
+            for ann in annotations:
+                cid = int(ann[0])
+                counts[cid] = counts.get(cid, 0) + 1
+        except Exception:
+            pass
+        return counts
+
+    def _evaluate_annotation_query_condition(self, cond, class_counts):
+        try:
+            cls_name = cond.get("class", "")
+            cls_id = self.classes.index(cls_name)
+            op = cond.get("op", "=")
+            target = int(cond.get("count", 0))
+            actual = class_counts.get(cls_id, 0)
+
+            if op == "=":
+                return actual == target
+            if op == "!=":
+                return actual != target
+            if op == "<":
+                return actual < target
+            if op == ">":
+                return actual > target
+            if op == "<=":
+                return actual <= target
+            if op == ">=":
+                return actual >= target
+        except Exception:
+            return False
+        return False
+
+    def _image_matches_annotation_query(self, img_path, query_conditions=None, outside_pallet=False):
+        query_conditions = list(query_conditions or [])
+        if not query_conditions and not outside_pallet:
+            return False
+
+        if query_conditions:
+            class_counts = self._annotation_class_counts_for_image(img_path)
+            result = None
+            for cond in query_conditions:
+                cond_result = self._evaluate_annotation_query_condition(cond, class_counts)
+                logic = cond.get("logic", "")
+                if result is None:
+                    result = cond_result
+                elif logic == "AND":
+                    result = result and cond_result
+                elif logic == "OR":
+                    result = result or cond_result
+            result = bool(result)
+        else:
+            result = True
+
+        if result and outside_pallet:
+            result = self._image_has_non_pallet_center_outside_pallet(
+                img_path,
+                pallet_class_id=AUTO_PALLET_CLASS_ID,
+            )
+        return bool(result)
+
+    def _find_annotation_query_matches(self, query_conditions=None, outside_pallet=False):
+        self._flush_current_annotations_to_disk()
+        return [
+            img_path for img_path in self.image_paths
+            if self._image_matches_annotation_query(
+                img_path,
+                query_conditions=query_conditions,
+                outside_pallet=outside_pallet,
+            )
+        ]
+
+    def fix_current_pallet_bounds_to_objects(self, event=None):
+        """Replace class 0 on the current image with one bbox around all non-class-0 outer edges."""
+        if not self.current_image or not self.current_file_path:
+            messagebox.showinfo("Fix Pallet Bounds", "Load an image first.")
+            return
+
+        updated_annotations, changed, info = self._fix_pallet_annotation_to_object_bounds(
+            self.annotations,
+            pallet_class_id=AUTO_PALLET_CLASS_ID,
+        )
+        if info["object_count"] <= 0:
+            self.status_var.set("Fix Pallet Bounds: no non-class-0 objects on this image")
+            return
+        if not changed:
+            self.status_var.set("Fix Pallet Bounds: class 0 already surrounds all object outer edges")
+            return
+
+        self._push_annotation_undo()
+        self.annotations = updated_annotations
+        self.annotations_dirty = True
+        self.save_annotations(force=True)
+        self.redraw()
+        self._build_annotation_cache_and_stats()
+        self._flash_notification("Fixed class 0 pallet bounds")
+        self.status_var.set(
+            f"Fix Pallet Bounds: updated class 0 around {info['object_count']} object(s)"
+        )
+
+    def _custom_query_filter_active(self):
+        val = self.filter_mode
+        try:
+            combo_val = self.filter_combo.get()
+        except Exception:
+            combo_val = ""
+        return (
+            val in ("Custom Query", "🔍 Query Active")
+            or combo_val == "🔍 Query Active"
+        ) and self.custom_query_paths is not None
+
+    def _active_query_image_paths(self):
+        if not self._custom_query_filter_active():
+            return []
+        if self.filtered_image_paths:
+            return list(self.filtered_image_paths)
+        query_paths = set(self.custom_query_paths or [])
+        return [path for path in self.image_paths if path in query_paths]
+
+    def fix_active_query_pallet_bounds_to_objects(self):
+        """Batch-fix class 0 pallet bounds for the currently active custom query."""
+        if not self.image_paths:
+            messagebox.showinfo("Fix Pallet Query", "Load a workspace first.")
+            return
+        if not self._custom_query_filter_active():
+            messagebox.showinfo("Fix Pallet Query", "Apply a Query filter first, then run this on the active query.")
+            return
+
+        paths = self._active_query_image_paths()
+        if not paths:
+            messagebox.showinfo("Fix Pallet Query", "The active query has no images to fix.")
+            return
+
+        if self.current_image and self.current_file_path and self.annotations_dirty:
+            self.save_annotations(force=True)
+
+        if not messagebox.askyesno(
+            "Fix Pallet Query",
+            (
+                f"Update class 0 pallet bounds for {len(paths)} active-query image(s)?\n\n"
+                "Each changed image will get one class 0 box that surrounds the outer edges of all non-class-0 "
+                "annotations. Images with no non-class-0 annotations are skipped.\n\n"
+                "This is undoable with Ctrl+Z."
+            ),
+        ):
+            return
+
+        current_path = self.current_file_path
+        preferred_index = self.current_index
+        progress = tb.Toplevel(self.root)
+        progress.title("Fix Pallet Query")
+        progress.geometry("480x145")
+        progress.transient(self.root)
+        progress.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        pb = tb.Progressbar(progress, maximum=max(1, len(paths)))
+        pb.pack(fill=X, padx=20, pady=(20, 8))
+        status_lbl = tb.Label(progress, text="Starting...", font=("Consolas", 9))
+        status_lbl.pack(pady=4)
+
+        changed_images = 0
+        unchanged_images = 0
+        skipped_images = 0
+        total_objects = 0
+        undo_entries = []
+        errors = []
+
+        for idx, img_path in enumerate(paths, start=1):
+            try:
+                annotations, lbl_path = self._load_annotations_for_image_path(img_path)
+                existing_format = (
+                    LABEL_FORMAT_SEGMENT
+                    if any(self._is_polygon_annotation(ann) for ann in annotations)
+                    else LABEL_FORMAT_DETECT
+                )
+                new_annotations, changed, info = self._fix_pallet_annotation_to_object_bounds(
+                    annotations,
+                    pallet_class_id=AUTO_PALLET_CLASS_ID,
+                )
+                if info["object_count"] <= 0:
+                    skipped_images += 1
+                elif changed:
+                    undo_entries.append({
+                        "file_path": img_path,
+                        "snapshot": self._make_annotation_history_snapshot(img_path, annotations),
+                        "loaded_label_format": existing_format,
+                    })
+                    self._write_annotations_to_label_path(
+                        lbl_path,
+                        new_annotations,
+                        loaded_label_format=existing_format,
+                    )
+                    self.image_to_classes_cache[os.path.normpath(img_path)] = {
+                        int(ann[0]) for ann in new_annotations
+                    }
+                    changed_images += 1
+                    total_objects += info["object_count"]
+                    if img_path == self.current_file_path:
+                        self.annotations = self._copy_annotations(new_annotations)
+                        self.annotations_dirty = False
+                else:
+                    unchanged_images += 1
+            except Exception as exc:
+                errors.append(f"{os.path.basename(img_path)}: {exc}")
+
+            pb["value"] = idx
+            status_lbl.config(text=f"Processed {idx}/{len(paths)}  |  updated {changed_images}")
+            if idx % 20 == 0 or idx == len(paths):
+                progress.update_idletasks()
+
+        progress.destroy()
+
+        if undo_entries:
+            self._push_annotation_undo_batch(undo_entries)
+
+        self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=False)
+        self._rebuild_after_image_list_change(
+            preferred_filtered_index=preferred_index,
+            preferred_path=current_path,
+        )
+
+        msg = (
+            f"Fix Pallet Query: updated {changed_images}, already OK {unchanged_images}, "
+            f"skipped {skipped_images}"
+        )
+        if total_objects:
+            msg += f" across {total_objects} object(s)"
+        if errors:
+            messagebox.showwarning(
+                "Fix Pallet Query",
+                "\n".join(errors[:8]) + ("\n..." if len(errors) > 8 else ""),
+            )
+            msg += f", {len(errors)} error(s)"
+        self.status_var.set(msg)
 
     def _boxes_overlap(self, box1, box2, threshold=0.3):
         """Check if two boxes overlap significantly (IoU > threshold)."""
@@ -6987,7 +7684,7 @@ UI
             previous_annotations, lbl_path = self._load_annotations_for_image_path(img_path)
         else:
             previous_annotations = self._copy_annotations(base_annotations)
-            lbl_path = self._get_label_path(img_path)
+            lbl_path = self._get_label_read_path(img_path)
         previous_annotations = self._copy_annotations(previous_annotations)
 
         existing_format = loaded_label_format
@@ -7492,9 +8189,23 @@ UI
             self.loaded_label_format = detected_format
         return annotations
 
+    def _flush_current_annotations_to_disk(self):
+        current_image = getattr(self, "current_image", None)
+        current_path = getattr(self, "current_file_path", None)
+        if not current_image or not current_path:
+            return False
+        if not os.path.exists(current_path):
+            return False
+        self.save_annotations(force=True)
+        return True
+
     def _save_current_annotations_if_dirty(self):
-        if self.current_image and self.current_file_path and self.annotations_dirty:
-            self.save_annotations(force=True)
+        if (
+            getattr(self, "current_image", None)
+            and getattr(self, "current_file_path", None)
+            and getattr(self, "annotations_dirty", False)
+        ):
+            self._flush_current_annotations_to_disk()
 
     def _classify_annotation_collection_format(self, annotations):
         has_detect = False
@@ -7572,7 +8283,7 @@ UI
             messagebox.showerror("Error", "No workspace loaded.")
             return
 
-        self._save_current_annotations_if_dirty()
+        self._flush_current_annotations_to_disk()
         self.status_var.set("Checking dataset label type...")
         self.root.update_idletasks()
 
@@ -7581,7 +8292,7 @@ UI
         self.status_var.set(f"Dataset label type: {self._dataset_format_label(summary['dataset_format'])}")
 
     def _confirm_export_label_compatibility(self, export_name):
-        self._save_current_annotations_if_dirty()
+        self._flush_current_annotations_to_disk()
         summary = self._scan_workspace_label_formats()
         dataset_format = summary["dataset_format"]
 
@@ -7611,7 +8322,7 @@ UI
             messagebox.showerror("Error", "No workspace loaded.")
             return
 
-        self._save_current_annotations_if_dirty()
+        self._flush_current_annotations_to_disk()
         summary = self._scan_workspace_label_formats()
 
         if summary["segment_annotations"] == 0:
@@ -7712,7 +8423,7 @@ UI
             messagebox.showerror("Error", "No workspace loaded.")
             return
 
-        self._save_current_annotations_if_dirty()
+        self._flush_current_annotations_to_disk()
         summary = self._scan_workspace_label_formats()
         label_paths = summary["label_paths"]
 
@@ -7876,20 +8587,24 @@ UI
             current_path = self.filtered_image_paths[self.current_index]
 
         # Save before list changes/invalidation
-        if self.current_image:
-            self.save_annotations()
+        self._flush_current_annotations_to_disk()
         self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=False)
 
         val = self.filter_combo.get()
         self.filter_mode = val
+        self.frozen_filter_paths = None
         
         # Clear custom query paths when switching to a normal filter
-        if val != "🔍 Query Active":
+        if not self._filter_value_is_query(val):
             self.custom_query_paths = None
         
         # Rebuild cache to ensure filter uses fresh annotation data
         # This is crucial for filters like "Unannotated" and "Missing: X" to work correctly
-        self._rebuild_after_image_list_change(preferred_filtered_index=0, preferred_path=current_path)
+        self._rebuild_after_image_list_change(
+            preferred_filtered_index=0,
+            preferred_path=current_path,
+            refresh_filter_snapshot=True,
+        )
 
     def on_file_selected(self, event):
         sel = self.file_list.curselection()
@@ -7949,7 +8664,7 @@ UI
         
         deleted = 0
         for img_path in paths_to_delete:
-            lbl_path = self._get_label_path(img_path)
+            lbl_path = self._get_label_read_path(img_path)
             
             # Read file contents for undo
             img_data = None
@@ -7985,8 +8700,11 @@ UI
                 norm_path = os.path.normpath(img_path)
                 if norm_path in self.image_to_classes_cache:
                     del self.image_to_classes_cache[norm_path]
-                if self.custom_query_paths and img_path in self.custom_query_paths:
+                if self.custom_query_paths is not None and img_path in self.custom_query_paths:
                     self.custom_query_paths.discard(img_path)
+                frozen_filter_paths = getattr(self, "frozen_filter_paths", None)
+                if frozen_filter_paths is not None:
+                    frozen_filter_paths.discard(img_path)
             except Exception as ex:
                 print(f"Error deleting {img_path}: {ex}")
         
@@ -8014,7 +8732,7 @@ UI
         for idx in indices:
             if 0 <= idx < len(self.filtered_image_paths):
                 img_path = self.filtered_image_paths[idx]
-                lbl_path = self._get_label_path(img_path)
+                lbl_path = self._get_label_read_path(img_path)
                 
                 if os.path.exists(lbl_path):
                     try:
@@ -8317,6 +9035,78 @@ UI
         else:
             self.speed_btn.config(text="Speed: Single", bootstyle="secondary-outline")
             self.status_var.set("Navigation: Single step mode")
+
+    def show_advanced_options_dialog(self):
+        """Show advanced app behavior settings."""
+        dlg = tb.Toplevel(self.root)
+        dlg.title("Advanced Options")
+        dlg.geometry("430x220")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        frame = tb.Frame(dlg, padding=14)
+        frame.pack(fill=BOTH, expand=True)
+
+        tb.Label(frame, text="Advanced Options", font=("Arial", 14, "bold")).pack(anchor=W, pady=(0, 10))
+
+        nav_frame = tb.Labelframe(frame, text="Rapid Navigation", padding=10)
+        nav_frame.pack(fill=X, pady=(0, 10))
+
+        delay_var = tk.StringVar(value=str(self._normalize_rapid_nav_delay_ms(self.nav_delay)))
+        rate_var = tk.StringVar()
+
+        row = tb.Frame(nav_frame)
+        row.pack(fill=X)
+        tb.Label(row, text="Delay between images", width=20, anchor=W).pack(side=LEFT)
+        delay_spin = ttk.Spinbox(
+            row,
+            from_=MIN_RAPID_NAV_DELAY_MS,
+            to=MAX_RAPID_NAV_DELAY_MS,
+            increment=10,
+            width=8,
+            textvariable=delay_var,
+        )
+        delay_spin.pack(side=LEFT, padx=(4, 4))
+        tb.Label(row, text="ms").pack(side=LEFT)
+
+        tb.Label(nav_frame, textvariable=rate_var, font=("Consolas", 9), foreground="#888").pack(anchor=W, pady=(6, 0))
+        tb.Label(
+            nav_frame,
+            text=f"Default is {DEFAULT_RAPID_NAV_DELAY_MS} ms.",
+            font=("Arial", 8),
+            foreground="#888",
+        ).pack(anchor=W, pady=(2, 0))
+
+        def update_rate(*_):
+            delay = self._normalize_rapid_nav_delay_ms(delay_var.get(), fallback=self.nav_delay)
+            rate_var.set(f"About {1000.0 / delay:.1f} images/s")
+
+        def apply_settings(close=False):
+            delay = self._normalize_rapid_nav_delay_ms(delay_var.get(), fallback=self.nav_delay)
+            delay_var.set(str(delay))
+            self.nav_delay = delay
+            self.save_config()
+            update_rate()
+            self.status_var.set(f"Rapid navigation delay set to {delay} ms")
+            if close:
+                dlg.destroy()
+
+        def reset_default():
+            delay_var.set(str(DEFAULT_RAPID_NAV_DELAY_MS))
+            apply_settings()
+
+        delay_var.trace_add("write", update_rate)
+        delay_spin.config(command=update_rate)
+        delay_spin.bind("<Return>", lambda _event: apply_settings())
+        delay_spin.bind("<FocusOut>", lambda _event: update_rate())
+        update_rate()
+
+        btn_frame = tb.Frame(frame)
+        btn_frame.pack(fill=X, pady=(4, 0))
+        tb.Button(btn_frame, text="Reset Default", command=reset_default, bootstyle="warning-outline").pack(side=LEFT)
+        tb.Button(btn_frame, text="Cancel", command=dlg.destroy, bootstyle="secondary").pack(side=RIGHT, padx=(6, 0))
+        tb.Button(btn_frame, text="Save", command=lambda: apply_settings(close=True), bootstyle="primary").pack(side=RIGHT)
     
     def _toggle_show_only_selected_class(self):
         """Toggle show only selected class filter."""
@@ -8415,6 +9205,273 @@ UI
             return
         if self._sync_center_stamp_size_from_annotation(self.last_drawn_box, announce=True, persist=True):
             self._flash_notification("Center stamp size seeded from the last box")
+
+    def show_stack_pallet_auto_label_dialog(self):
+        """Configure and run Pallet Counter based stack auto-labeling."""
+        if not self.image_paths and not self.current_image:
+            messagebox.showinfo("Stack Pallet Labels", "Load a workspace or image first.")
+            return
+
+        dlg = tb.Toplevel(self.root)
+        dlg.title("Stack Pallet Labels")
+        dlg.geometry("520x390")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        frame = tb.Frame(dlg, padding=14)
+        frame.pack(fill=BOTH, expand=True)
+
+        tb.Label(frame, text="Stack Pallet Labels", font=("Arial", 14, "bold")).pack(anchor=W, pady=(0, 8))
+        tb.Label(
+            frame,
+            text=(
+                "Uses the Pallet Counter headless API to find pallet rows, then writes YOLO detect boxes. "
+                "Layer boxes use the detected row geometry across the stack crop; full-edge line boxes preserve the "
+                "algorithm's sloped edge lines for comparison."
+            ),
+            wraplength=480,
+            justify=LEFT,
+            foreground="#888",
+        ).pack(anchor=W, pady=(0, 10))
+
+        settings = tb.Labelframe(frame, text="Settings", padding=10)
+        settings.pack(fill=X)
+
+        class_var = tk.StringVar(value=str(self.selected_class_id))
+        mode_var = tk.StringVar(value=STACK_LABEL_MODE_LAYERS)
+        scope_var = tk.StringVar(value="current")
+        replace_var = tk.BooleanVar(value=True)
+        width_var = tk.StringVar(value="0.96")
+        counter_dir_var = tk.StringVar(value=str(DEFAULT_PALLET_COUNTER_DIR))
+
+        row = tb.Frame(settings)
+        row.pack(fill=X, pady=3)
+        tb.Label(row, text="Class ID", width=18, anchor=W).pack(side=LEFT)
+        ttk.Spinbox(row, from_=0, to=999, width=8, textvariable=class_var).pack(side=LEFT)
+
+        row = tb.Frame(settings)
+        row.pack(fill=X, pady=3)
+        tb.Label(row, text="Box mode", width=18, anchor=W).pack(side=LEFT)
+        tb.Combobox(row, textvariable=mode_var, values=STACK_LABEL_MODES, state="readonly", width=18).pack(side=LEFT)
+
+        row = tb.Frame(settings)
+        row.pack(fill=X, pady=3)
+        tb.Label(row, text="Scope", width=18, anchor=W).pack(side=LEFT)
+        tb.Radiobutton(row, text="Current", variable=scope_var, value="current").pack(side=LEFT, padx=(0, 8))
+        tb.Radiobutton(row, text="Filtered", variable=scope_var, value="filtered").pack(side=LEFT, padx=(0, 8))
+        tb.Radiobutton(row, text="All", variable=scope_var, value="all").pack(side=LEFT)
+
+        row = tb.Frame(settings)
+        row.pack(fill=X, pady=3)
+        tb.Label(row, text="Edge span", width=18, anchor=W).pack(side=LEFT)
+        ttk.Spinbox(row, from_=0.02, to=1.0, increment=0.02, width=8, textvariable=width_var).pack(side=LEFT)
+        tb.Label(row, text="of stack width", foreground="#888").pack(side=LEFT, padx=(6, 0))
+
+        tb.Checkbutton(
+            settings,
+            text="Replace existing boxes for this class",
+            variable=replace_var,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=(6, 2))
+
+        project = tb.Labelframe(frame, text="Pallet Counter Project", padding=10)
+        project.pack(fill=X, pady=(10, 0))
+        row = tb.Frame(project)
+        row.pack(fill=X)
+        tb.Entry(row, textvariable=counter_dir_var).pack(side=LEFT, fill=X, expand=True)
+
+        def browse_counter_dir():
+            selected = filedialog.askdirectory(
+                title="Choose Pallet Counter project folder",
+                initialdir=counter_dir_var.get() or str(DEFAULT_PALLET_COUNTER_DIR),
+                parent=dlg,
+            )
+            if selected:
+                counter_dir_var.set(selected)
+
+        tb.Button(row, text="Browse", command=browse_counter_dir, bootstyle="secondary-outline").pack(side=LEFT, padx=(6, 0))
+
+        btn_row = tb.Frame(frame)
+        btn_row.pack(fill=X, pady=(14, 0))
+
+        def parse_options():
+            try:
+                class_id = int(float(class_var.get()))
+                width_fraction = float(width_var.get())
+            except ValueError:
+                messagebox.showerror("Stack Pallet Labels", "Class ID and edge span must be numeric.", parent=dlg)
+                return None
+            return StackAutoLabelOptions(
+                class_id=class_id,
+                mode=mode_var.get(),
+                counter_project_dir=counter_dir_var.get(),
+                layer_width_fraction=width_fraction,
+            )
+
+        def start():
+            options = parse_options()
+            if options is None:
+                return
+            scope = scope_var.get()
+            replace_existing = bool(replace_var.get())
+            dlg.destroy()
+            if scope == "current":
+                self.auto_annotate_stack_pallets_current(options, replace_existing=replace_existing)
+            else:
+                paths = self.filtered_image_paths if scope == "filtered" else self.image_paths
+                self.auto_annotate_stack_pallets_for_paths(paths, options, replace_existing=replace_existing)
+
+        tb.Button(btn_row, text="Cancel", command=dlg.destroy, bootstyle="secondary").pack(side=RIGHT, padx=(6, 0))
+        tb.Button(btn_row, text="Start", command=start, bootstyle="primary").pack(side=RIGHT)
+
+    def _merge_stack_pallet_annotations(self, existing_annotations, generated_annotations, class_id, replace_existing):
+        generated = [self._clamp_annotation(ann) for ann in generated_annotations if ann is not None]
+        if replace_existing:
+            return self._replace_annotations_for_class(existing_annotations, class_id, generated)
+
+        updated = self._copy_annotations(existing_annotations)
+        added = 0
+        for ann in generated:
+            if self._is_duplicate_or_overlapping(ann, updated, iou_threshold=0.85, coord_tolerance=0.005):
+                continue
+            updated.append(self._copy_annotation(ann))
+            added += 1
+        return updated, added > 0, 0
+
+    def auto_annotate_stack_pallets_current(self, options=None, replace_existing=True):
+        if not self.current_image or not self.current_file_path:
+            messagebox.showinfo("Stack Pallet Labels", "Load an image first.")
+            return
+
+        options = options or StackAutoLabelOptions(class_id=self.selected_class_id)
+        try:
+            result = build_stack_pallet_annotations(self.current_file_path, options)
+        except StackAutoLabelError as exc:
+            messagebox.showerror("Stack Pallet Labels", str(exc))
+            return
+        except Exception as exc:
+            messagebox.showerror("Stack Pallet Labels", f"Could not generate stack labels:\n{exc}")
+            return
+
+        if not result.annotations:
+            self.status_var.set("Stack Pallet Labels: no pallet rows were detected.")
+            return
+
+        new_annotations, changed, replaced_count = self._merge_stack_pallet_annotations(
+            self.annotations,
+            result.annotations,
+            options.class_id,
+            replace_existing=replace_existing,
+        )
+        if not changed:
+            self.status_var.set("Stack Pallet Labels: no changes needed.")
+            return
+
+        self._push_annotation_undo()
+        self.annotations = new_annotations
+        lbl_path = self._get_label_read_path(self.current_file_path)
+        self._write_annotations_atomically(lbl_path, self.annotations, LABEL_FORMAT_DETECT)
+        self.image_to_classes_cache[os.path.normpath(self.current_file_path)] = set(int(ann[0]) for ann in self.annotations)
+        self.annotations_dirty = False
+        self.redraw()
+        self._update_stats()
+
+        action = "replaced" if replace_existing else "added"
+        msg = (
+            f"Stack Pallet Labels: {action} class {options.class_id} with {len(result.annotations)} "
+            f"{result.mode.lower()} ({result.confidence} confidence)"
+        )
+        if replace_existing and replaced_count:
+            msg += f", removed {replaced_count} old"
+        if result.recommended_count is not None:
+            msg += f", count {result.recommended_count}"
+        self.status_var.set(msg)
+
+    def auto_annotate_stack_pallets_for_paths(self, image_paths, options=None, replace_existing=True):
+        paths = list(image_paths or [])
+        if not paths:
+            messagebox.showinfo("Stack Pallet Labels", "No images selected for this scope.")
+            return
+
+        options = options or StackAutoLabelOptions(class_id=self.selected_class_id)
+        if self.current_image and self.current_file_path and self.annotations_dirty:
+            self.save_annotations(force=True)
+
+        if not messagebox.askyesno(
+            "Stack Pallet Labels",
+            f"Generate stack pallet labels for {len(paths)} image(s)?\n\n"
+            f"Mode: {options.mode}\nClass: {options.class_id}\n"
+            f"{'Existing boxes for this class will be replaced.' if replace_existing else 'Existing boxes will be kept when they do not overlap.'}",
+        ):
+            return
+
+        progress = tb.Toplevel(self.root)
+        progress.title("Stack Pallet Labels")
+        progress.geometry("500x150")
+        progress.transient(self.root)
+        progress.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        pb = tb.Progressbar(progress, maximum=max(1, len(paths)))
+        pb.pack(fill=X, padx=20, pady=(20, 8))
+        status_lbl = tb.Label(progress, text="Starting...", font=("Consolas", 9))
+        status_lbl.pack(pady=4)
+
+        changed_images = 0
+        total_generated = 0
+        total_replaced = 0
+        errors = []
+        undo_entries = []
+
+        for idx, img_path in enumerate(paths, start=1):
+            try:
+                annotations, lbl_path = self._load_annotations_for_image_path(img_path)
+                existing_format = LABEL_FORMAT_SEGMENT if any(self._is_polygon_annotation(ann) for ann in annotations) else LABEL_FORMAT_DETECT
+                generated = build_stack_pallet_annotations(img_path, options)
+                new_annotations, changed, replaced_count = self._merge_stack_pallet_annotations(
+                    annotations,
+                    generated.annotations,
+                    options.class_id,
+                    replace_existing=replace_existing,
+                )
+                if changed:
+                    undo_entries.append({
+                        "file_path": img_path,
+                        "snapshot": self._make_annotation_history_snapshot(img_path, annotations),
+                        "loaded_label_format": existing_format,
+                    })
+                    self._write_annotations_atomically(lbl_path, new_annotations, LABEL_FORMAT_DETECT)
+                    self.image_to_classes_cache[os.path.normpath(img_path)] = set(int(ann[0]) for ann in new_annotations)
+                    changed_images += 1
+                    total_generated += len(generated.annotations)
+                    total_replaced += replaced_count
+                    if img_path == self.current_file_path:
+                        self.annotations = self._copy_annotations(new_annotations)
+                        self.annotations_dirty = False
+            except Exception as exc:
+                errors.append(f"{os.path.basename(img_path)}: {exc}")
+
+            pb["value"] = idx
+            status_lbl.config(text=f"Processed {idx}/{len(paths)}  |  updated {changed_images}")
+            if idx % 10 == 0 or idx == len(paths):
+                progress.update_idletasks()
+
+        progress.destroy()
+        if undo_entries:
+            self._push_annotation_undo_batch(undo_entries)
+
+        self._build_annotation_cache_and_stats()
+        if self.current_file_path and self.current_file_path in self.filtered_image_paths:
+            self.load_image(self.filtered_image_paths.index(self.current_file_path))
+        elif self.filtered_image_paths:
+            self.load_image(min(self.current_index, len(self.filtered_image_paths) - 1))
+
+        msg = f"Stack Pallet Labels: updated {changed_images}/{len(paths)} image(s), generated {total_generated} boxes"
+        if total_replaced:
+            msg += f", replaced {total_replaced}"
+        if errors:
+            msg += f", {len(errors)} error(s)"
+            messagebox.showwarning("Stack Pallet Labels", "\n".join(errors[:8]) + ("\n..." if len(errors) > 8 else ""))
+        self.status_var.set(msg)
 
     def adjust_center_stamp_size(self, delta):
         if self._focus_is_text_input():
@@ -9144,6 +10201,9 @@ UI
 
     def _on_nav_key_press(self, event):
         """Handle navigation key press - start rapid navigation timer if in rapid mode."""
+        if not self._shortcut_context_is_safe():
+            return "break"
+
         key = event.keysym.lower()
         direction = None
         if key in ('left', 'a'):
@@ -9408,6 +10468,7 @@ UI
                 f"Image #{result} exists but is hidden by the current filter.\n\nClear filter to show all images?"):
                 self.filter_mode = "All"
                 self.filter_combo.set("All")
+                self.frozen_filter_paths = None
                 self._refresh_file_list()
                 if target_path in self.filtered_image_paths:
                     idx = self.filtered_image_paths.index(target_path)
@@ -9737,6 +10798,28 @@ UI
         except Exception:
             return False
 
+    def _annotation_edit_in_progress(self):
+        return bool(
+            self.drag_mode
+            or self.first_click_point
+            or self.pending_segment_points
+            or self.aoi_draw_active
+            or self.board_clip_draw_mode is not None
+            or self.pan_active
+        )
+
+    def _shortcut_context_is_safe(self, allow_during_edit=False):
+        if self._focus_is_text_input():
+            return False
+        if not allow_during_edit and self._annotation_edit_in_progress():
+            return False
+        return True
+
+    def _run_shortcut(self, callback, event=None, allow_during_edit=False):
+        if not self._shortcut_context_is_safe(allow_during_edit=allow_during_edit):
+            return "break"
+        return callback(event)
+
     def _get_canvas_dimensions(self):
         return max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
 
@@ -9937,7 +11020,7 @@ UI
         if 0 <= idx < len(self.filtered_image_paths):
             list_path = self.filtered_image_paths[idx]
         
-        lbl_path = self._get_label_path(path) if path != "None" else "None"
+        lbl_path = self._get_label_read_path(path) if path != "None" else "None"
         
         # Check alignment
         status = "OK"
@@ -11277,23 +12360,40 @@ UI
             # Save for undo BEFORE deleting
             self._push_annotation_undo()
             
+            deleted_class_id = int(self.annotations[hit_index][0])
             del self.annotations[hit_index]
             self.active_annotation_index = -1
+            self.edit_selected_index = -1
+            self.selected_annotations = {
+                idx - 1 if idx > hit_index else idx
+                for idx in self.selected_annotations
+                if idx != hit_index
+            }
             self.annotations_dirty = True
             self.save_annotations()  # IMMEDIATELY save after deleting
             self.redraw()
-            self._flash_notification("Deleted annotation (Ctrl+Z to undo)")
+            self._refresh_filter_after_current_annotation_change()
+            class_name = self.classes[deleted_class_id] if 0 <= deleted_class_id < len(self.classes) else str(deleted_class_id)
+            self._flash_notification(f"Deleted {class_name} annotation (Ctrl+Z to undo)")
             
     def delete_selected_annotation(self, event=None):
         if self.active_annotation_index != -1:
             # Save for undo BEFORE deleting
             self._push_annotation_undo()
             
-            del self.annotations[self.active_annotation_index]
+            hit_index = self.active_annotation_index
+            del self.annotations[hit_index]
             self.active_annotation_index = -1
+            self.edit_selected_index = -1
+            self.selected_annotations = {
+                idx - 1 if idx > hit_index else idx
+                for idx in self.selected_annotations
+                if idx != hit_index
+            }
             self.annotations_dirty = True
             self.save_annotations()  # IMMEDIATELY save after deleting
             self.redraw()
+            self._refresh_filter_after_current_annotation_change()
 
     # --- AUTO ANNOTATION ---
 
@@ -13431,7 +14531,7 @@ UI
                     if os.path.exists(path):
                         os.remove(path)
                         # Also remove label if exists
-                        lbl_path = self._get_label_path(path)
+                        lbl_path = self._get_label_read_path(path)
                         if os.path.exists(lbl_path):
                             os.remove(lbl_path)
                         deleted += 1
@@ -13917,7 +15017,7 @@ UI
             label_text.insert(tk.END, f"# {'─' * 70}\n", "header")
             
             # Read raw label file 
-            lbl_path = self._get_label_path(img_path)
+            lbl_path = self._get_label_read_path(img_path)
             raw_lines = []
             if os.path.exists(lbl_path):
                 with open(lbl_path, 'r') as f:
@@ -14007,6 +15107,7 @@ UI
                 # Switch to All filter first
                 self.filter_combo.set("All")
                 self.filter_mode = "All"
+                self.frozen_filter_paths = None
                 self._build_annotation_cache_and_stats()
                 self._refresh_file_list()
                 if img_path in self.filtered_image_paths:
@@ -14361,6 +15462,10 @@ UI
     
     def extract_filtered_images(self):
         """Extract currently filtered images and labels to a new directory."""
+        self._flush_current_annotations_to_disk()
+        self._build_annotation_cache_and_stats()
+        self._refresh_file_list()
+
         if not self.filtered_image_paths:
             messagebox.showwarning("No Images", "No images to extract. Current filter shows 0 images.")
             return
@@ -14419,7 +15524,7 @@ UI
                 copied_images += 1
                 
                 # Copy label if it exists
-                lbl_path = self._get_label_path(img_path)
+                lbl_path = self._get_label_read_path(img_path)
                 if os.path.exists(lbl_path):
                     lbl_name = os.path.basename(lbl_path)
                     lbl_dest_path = os.path.join(labels_dest, lbl_name)
@@ -14470,13 +15575,13 @@ UI
         
         dialog = tb.Toplevel(self.root)
         dialog.title("Annotation Query - Find Images")
-        dialog.geometry("650x500")
+        dialog.geometry("650x580")
         dialog.transient(self.root)
         dialog.grab_set()
         
         # Header
         tb.Label(dialog, text="🔍 Annotation Query Builder", font=("Arial", 14, "bold")).pack(pady=10)
-        tb.Label(dialog, text="Find images that match conditions on class annotation counts", 
+        tb.Label(dialog, text="Find images that match class-count and pallet-geometry conditions",
                 font=("Arial", 9)).pack()
         
         # Conditions frame with scrolling
@@ -14508,6 +15613,7 @@ UI
         conditions = []
         operators = ["=", "!=", "<", ">", "<=", ">="]
         logic_ops = ["AND", "OR"]
+        outside_pallet_var = tk.BooleanVar(value=bool(getattr(self, "last_query_outside_pallet", False)))
         
         def add_condition(logic="AND"):
             row_frame = tb.Frame(conditions_frame)
@@ -14568,7 +15674,7 @@ UI
                 conditions[-1]['class'].set(saved.get('class', self.classes[0] if self.classes else ''))
                 conditions[-1]['op'].set(saved.get('op', '='))
                 conditions[-1]['count'].set(saved.get('count', '1'))
-        else:
+        elif not outside_pallet_var.get():
             add_condition()
         
         # Add condition buttons
@@ -14582,13 +15688,16 @@ UI
         # Quick presets
         preset_frame = tb.Labelframe(dialog, text="Quick Presets", padding=10)
         preset_frame.pack(fill=X, padx=20, pady=5)
-        
-        def clear_and_add_preset(preset_conditions):
-            # Clear existing
+
+        def clear_conditions():
             for c in conditions[:]:
                 c['frame'].destroy()
                 conditions.remove(c)
-            # Add preset
+            update_scroll_region()
+        
+        def clear_and_add_preset(preset_conditions):
+            outside_pallet_var.set(False)
+            clear_conditions()
             for i, (cls, op, count) in enumerate(preset_conditions):
                 logic = "AND" if i > 0 else ""
                 add_condition(logic)
@@ -14613,6 +15722,27 @@ UI
         tb.Button(preset_row1, text="Unannotated (0 total)",
                  command=lambda: clear_and_add_preset([(self.classes[0], "=", 0)] if self.classes else []),
                  bootstyle="secondary-outline").pack(side=LEFT, padx=2, pady=2)
+
+        geometry_frame = tb.Labelframe(dialog, text="Geometry Checks", padding=10)
+        geometry_frame.pack(fill=X, padx=20, pady=5)
+        pallet_name = self.classes[AUTO_PALLET_CLASS_ID] if len(self.classes) > AUTO_PALLET_CLASS_ID else "pallet"
+
+        def use_outside_pallet_only():
+            clear_conditions()
+            outside_pallet_var.set(True)
+
+        tb.Checkbutton(
+            geometry_frame,
+            text=f"Any non-class-0 box center outside class 0 ({pallet_name})",
+            variable=outside_pallet_var,
+            bootstyle="round-toggle",
+        ).pack(anchor=W)
+        tb.Button(
+            geometry_frame,
+            text="Use Only This Check",
+            command=use_outside_pallet_only,
+            bootstyle="secondary-outline",
+        ).pack(anchor=W, pady=(6, 0))
         
         # Results preview
         result_var = tk.StringVar(value="Click 'Preview' to see matching images")
@@ -14640,44 +15770,48 @@ UI
         
         def get_class_counts(img_path):
             """Get annotation class counts for an image."""
-            lbl_path = self._get_label_path(img_path)
             counts = {}
-            if os.path.exists(lbl_path):
-                try:
-                    with open(lbl_path, 'r') as f:
-                        for line in f:
-                            parts = line.strip().split()
-                            if parts:
-                                try:
-                                    cid = int(parts[0])
-                                    counts[cid] = counts.get(cid, 0) + 1
-                                except:
-                                    pass
-                except:
-                    pass
+            try:
+                annotations, _ = self._load_annotations_for_image_path(img_path)
+                for ann in annotations:
+                    cid = int(ann[0])
+                    counts[cid] = counts.get(cid, 0) + 1
+            except:
+                pass
             return counts
         
         def find_matches():
             """Find all images matching the query."""
-            if not conditions:
+            self._flush_current_annotations_to_disk()
+            use_outside_pallet = outside_pallet_var.get()
+            if not conditions and not use_outside_pallet:
                 return []
             
             matching = []
             for img_path in self.image_paths:
-                class_counts = get_class_counts(img_path)
-                
-                # Evaluate with AND/OR logic
-                result = None
-                for i, cond in enumerate(conditions):
-                    cond_result = evaluate_condition(cond, class_counts)
-                    logic = cond['logic'].get()
-                    
-                    if result is None:
-                        result = cond_result
-                    elif logic == "AND":
-                        result = result and cond_result
-                    elif logic == "OR":
-                        result = result or cond_result
+                if conditions:
+                    class_counts = get_class_counts(img_path)
+
+                    # Evaluate with AND/OR logic
+                    result = None
+                    for i, cond in enumerate(conditions):
+                        cond_result = evaluate_condition(cond, class_counts)
+                        logic = cond['logic'].get()
+
+                        if result is None:
+                            result = cond_result
+                        elif logic == "AND":
+                            result = result and cond_result
+                        elif logic == "OR":
+                            result = result or cond_result
+                else:
+                    result = True
+
+                if result and use_outside_pallet:
+                    result = self._image_has_non_pallet_center_outside_pallet(
+                        img_path,
+                        pallet_class_id=AUTO_PALLET_CLASS_ID,
+                    )
                 
                 if result:
                     matching.append(img_path)
@@ -14693,7 +15827,6 @@ UI
             if not matches:
                 messagebox.showinfo("No Matches", "No images match the query.")
                 return
-            self._save_current_annotations_if_dirty()
             self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=False)
             
             # Save query conditions for re-opening dialog later
@@ -14705,9 +15838,11 @@ UI
                     'op': cond['op'].get(),
                     'count': cond['count'].get()
                 })
+            self.last_query_outside_pallet = outside_pallet_var.get()
             
             # Save matching paths so _refresh_file_list can reapply the filter
             self.custom_query_paths = set(matches)
+            self.frozen_filter_paths = None
             
             # Set filter mode to indicate custom query is active
             self.filter_mode = "Custom Query"

@@ -1,0 +1,47 @@
+You are creating high-precision YOLO object-detection labels for a top-down pallet image.
+
+Return ONLY YOLO label lines in this exact format:
+<class_id> <x_center> <y_center> <width> <height>
+
+Use normalized coordinates from 0 to 1.
+Do not output explanations, comments, markdown, headers, blank lines, confidence scores, or JSON.
+One object per line.
+Every row must have exactly 5 fields.
+
+Allowed classes:
+0 = entire pallet
+1 = regular top deck board
+2 = horizontal stringer
+4 = lead board / outside edge board
+6 = broken board or broken stringer
+7 = major defect crack or hole
+13 = protruding nail
+
+Image and pallet type:
+The image is always top-down.
+The image is expected to be 1024x1024 pixels.
+This pallet is rotated 90 degrees.
+The top deck boards appear vertical in the image and are arranged from left to right.
+This specific pallet type should have exactly 9 top deck-board boxes:
+- far-left lead board / outside edge board = class 4
+- far-right lead board / outside edge board = class 4
+- the 7 boards between them = class 1
+
+Labeling rules:
+- Label the entire visible pallet as class 0.
+- Label every regular top deck board as class 1.
+- Label every horizontal stringer as class 2.
+- Label the outside edge / lead boards as class 4.
+- Label broken board or broken stringer regions as class 6.
+- Label major defect cracks or holes as class 7.
+- Label protruding nails only as class 13.
+- Do not label flush nails unless the prompt is later expanded with a flush nail class.
+- Do not label conveyor rails, machinery, floor, hoses, gloves, warning labels, sawdust, shadows, knots, stamps, or wood grain.
+- Do not invent hidden or occluded objects.
+- Boxes should be tight around the visible object or visible defect.
+- If there are no objects for a class, omit that class.
+
+Final answer must contain only valid YOLO label rows.
+Allowed class IDs are: 0, 1, 2, 4, 6, 7, 13.
+Every row must have exactly five values:
+class_id x_center y_center width height
