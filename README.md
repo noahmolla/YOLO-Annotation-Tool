@@ -132,6 +132,11 @@ Optional auto-annotation supports:
 
 - `.pt` files through Ultralytics / PyTorch
 - `.tflite` files through TensorFlow Lite
+- Built-in best-person annotation uses the Ultralytics YOLO26x COCO model (`yolo26x.pt`) and remaps COCO `person` detections into the loaded dataset class named `Person` / `person`
+- Prompt segmentation in **Auto Segment Tools -> Prompt Segment** uses zero-training Ultralytics models:
+  - `YOLOE-26L/26S/26X` segmentation for text prompts such as `pallet`
+  - optional local `sam3.pt` for SAM 3 concept segmentation
+  - `SAM 2.1` / `MobileSAM` visual-prompt models from a drawn AOI area
 
 ### Stack Pallet Labels
 
@@ -144,17 +149,28 @@ The default `Layer boxes` mode writes one detect box per pallet row across most 
 edge for comparison, while the older `Line boxes` and `Point boxes` modes use the Pallet Counter API export directly.
 See `STACK_PALLET_AUTOLABEL.md` for the same functionality as a headless Python API.
 
+### Prompt Segmentation
+
+Open **Auto Segment Tools -> Prompt Segment**, type the object name, and run **Current** or **All Images**. If the typed
+prompt matches a loaded class name, for example `pallet`, new masks are written to that class automatically. Turn on
+**Limit to AOI area** and use **Draw Area** when you want the model to only consider a region of the image, or when using
+the SAM 2.1 / MobileSAM area-prompt models.
+
+Prompt segmentation writes YOLO segmentation rows. The first run of a YOLOE or SAM model may download weights through
+Ultralytics; SAM 3 requires a local `sam3.pt` file if your environment cannot download it directly.
+
 ### Common shortcuts
 
 | Action | Shortcut |
 | --- | --- |
-| Previous image | `A` or `Left` |
-| Next image | `D` or `Right` |
+| Previous image | `A`, `Left`, or mouse Back over the image canvas |
+| Next image | `D`, `Right`, or mouse Forward over the image canvas |
 | Undo | `Ctrl+Z` |
 | Redo | `Ctrl+Y` |
 | Repeat last box | `R` |
 | Center stamp size down or up | `[` / `]` |
 | Auto-annotate current image | `Q` |
+| Best-person annotate current image | `P` |
 | Open gallery | `G` |
 
 ## Troubleshooting

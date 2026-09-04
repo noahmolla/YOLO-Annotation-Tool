@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import colorchooser, filedialog, messagebox, simpledialog
 from tkinter import ttk
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
@@ -49,6 +49,71 @@ DATASET_SETTINGS_FILE = ".annotator_dataset.json"
 AUTO_PALLET_CLASS_ID = 0
 CURRENT_BOARD_CLIP_HISTORY_REGION = "__CURRENT_BOARD_CLIP_HISTORY_REGION__"
 ANNOTATION_HISTORY_BATCH_KEY = "__BATCH_ANNOTATION_HISTORY__"
+BEST_PERSON_MODEL_NAME = "yolo26x.pt"
+BEST_PERSON_MODEL_LABEL = "YOLO26x COCO"
+BEST_PERSON_MODEL_VERSION = "v26"
+BEST_PERSON_MODEL_IMGSZ = "1280"
+BEST_PERSON_SOURCE_CLASS_ID = 0
+ZERO_SHOT_SEGMENT_MODEL_PRESETS = [
+    {
+        "label": "YOLOE-26L Seg (text, recommended)",
+        "backend": "yoloe",
+        "model": "yoloe-26l-seg.pt",
+        "imgsz": "1024",
+        "needs_aoi": False,
+        "summary": "Text prompt, zero-training instance masks. Good first choice for prompts like pallet, board, crate.",
+    },
+    {
+        "label": "YOLOE-26S Seg (text, fast)",
+        "backend": "yoloe",
+        "model": "yoloe-26s-seg.pt",
+        "imgsz": "768",
+        "needs_aoi": False,
+        "summary": "Faster text-prompted masks when you want a quick pass.",
+    },
+    {
+        "label": "YOLOE-26X Seg (text, max)",
+        "backend": "yoloe",
+        "model": "yoloe-26x-seg.pt",
+        "imgsz": "1280",
+        "needs_aoi": False,
+        "summary": "Largest YOLOE text model. Best quality option, but slow and heavy.",
+    },
+    {
+        "label": "SAM 3 Concept (local sam3.pt)",
+        "backend": "sam3",
+        "model": "sam3.pt",
+        "imgsz": "640",
+        "needs_aoi": False,
+        "summary": "Meta SAM 3 text/exemplar concept segmentation. Requires local sam3.pt weights.",
+    },
+    {
+        "label": "SAM 2.1 Tiny (AOI box)",
+        "backend": "sam_visual",
+        "model": "sam2.1_t.pt",
+        "imgsz": "1024",
+        "needs_aoi": True,
+        "summary": "Fast Segment Anything visual prompt. Draw AOI around the object; prompt is used as the target class.",
+    },
+    {
+        "label": "SAM 2.1 Base (AOI box)",
+        "backend": "sam_visual",
+        "model": "sam2.1_b.pt",
+        "imgsz": "1024",
+        "needs_aoi": True,
+        "summary": "Higher quality Segment Anything visual prompt. Draw AOI around the object.",
+    },
+    {
+        "label": "MobileSAM (AOI box)",
+        "backend": "sam_visual",
+        "model": "mobile_sam.pt",
+        "imgsz": "1024",
+        "needs_aoi": True,
+        "summary": "Small SAM-compatible visual prompt model for area-defined objects.",
+    },
+]
+ZERO_SHOT_SEGMENT_MODEL_LABELS = [preset["label"] for preset in ZERO_SHOT_SEGMENT_MODEL_PRESETS]
+DEFAULT_ZERO_SHOT_SEGMENT_MODEL_LABEL = ZERO_SHOT_SEGMENT_MODEL_PRESETS[0]["label"]
 
 class AnnotatorApp:
     def __init__(self, root):
@@ -71,6 +136,7 @@ class AnnotatorApp:
         
         self.classes = []              # List of class names
         self.class_colors = {}         # Map: class_index (int) -> hex_color (str)
+        self.custom_class_colors = {}  # Map: class name -> user-chosen hex_color (str)
         
         self.annotations = []          # List of [class_id, cx, cy, w, h, optional_meta]
         self.copy_buffer = []          # For copy/paste functionality (future proofing)
@@ -85,6 +151,7 @@ class AnnotatorApp:
         self.people_allow_overlap = False
         self.people_overlap_iou_threshold = 0.30
         self.people_summary_var = tk.StringVar(value="No people models configured.")
+        self.best_people_summary_var = tk.StringVar(value="")
         
         self.current_image = None      # PIL Image
         self.photo_image = None        # ImageTk to prevent GC
@@ -172,6 +239,9 @@ class AnnotatorApp:
         # Crosshair
         self.show_crosshair = tk.BooleanVar(value=True)
         self.crosshair_lines = [] # [h_line_id, v_line_id]
+
+        # Validation review mode: stronger visual bboxes and large visible counts.
+        self.review_mode_enabled = tk.BooleanVar(value=False)
         
         # Show only selected class annotations
         self.show_only_selected_class = tk.BooleanVar(value=False)
@@ -249,6 +319,16 @@ class AnnotatorApp:
         self.auto_pallet_segment_all_btn = None
         self.auto_board_cluster_current_btn = None
         self.auto_board_cluster_all_btn = None
+        self.zero_shot_segment_model_cache = {}
+        self.zero_shot_segment_model_paths = {}
+        self.zero_shot_segment_model_var = tk.StringVar(value=DEFAULT_ZERO_SHOT_SEGMENT_MODEL_LABEL)
+        self.zero_shot_segment_prompt_var = tk.StringVar(value="pallet")
+        self.zero_shot_segment_confidence_var = tk.StringVar(value="0.25")
+        self.zero_shot_segment_max_points_var = tk.StringVar(value="240")
+        self.zero_shot_segment_use_aoi_var = tk.BooleanVar(value=False)
+        self.zero_shot_segment_replace_existing_var = tk.BooleanVar(value=False)
+        self.zero_shot_segment_summary_var = tk.StringVar(value="")
+        self.zero_shot_segment_model_combo = None
         self.board_clip_draw_btn = None
         self.board_clip_edge_btn = None
         self.board_clip_draw_toolbar_btn = None
@@ -277,6 +357,11 @@ class AnnotatorApp:
         self.aoi_dialog_vars = {}
         self.aoi_dataset_btn = None
         self.auto_annotate_aoi_preview_active = False
+        self.copy_zone_polygon_points = []
+        self.copy_zone_pending_points = []
+        self.copy_zone_preview_cursor = None
+        self.copy_zone_draw_active = False
+        self.copy_zone_visible = tk.BooleanVar(value=False)
 
         # --- UI Setup ---
         self._setup_ui()
@@ -334,6 +419,28 @@ class AnnotatorApp:
             normalized = int(fallback)
         return max(MIN_RAPID_NAV_DELAY_MS, min(MAX_RAPID_NAV_DELAY_MS, normalized))
 
+    def _normalize_int_value(self, value, fallback=0, minimum=None, maximum=None):
+        try:
+            normalized = int(float(value))
+        except (TypeError, ValueError):
+            normalized = int(fallback)
+        if minimum is not None:
+            normalized = max(int(minimum), normalized)
+        if maximum is not None:
+            normalized = min(int(maximum), normalized)
+        return normalized
+
+    def _normalize_decimal_string(self, value, fallback="0.0", minimum=None, maximum=None):
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError):
+            normalized = float(fallback)
+        if minimum is not None:
+            normalized = max(float(minimum), normalized)
+        if maximum is not None:
+            normalized = min(float(maximum), normalized)
+        return f"{normalized:.3f}".rstrip("0").rstrip(".")
+
     def _apply_ui_scale(self, scale_value, announce=True):
         normalized = self._normalize_ui_scale(scale_value, fallback=self.ui_scale)
         self.ui_scale = normalized
@@ -347,6 +454,7 @@ class AnnotatorApp:
             self.stats_current_classes_label.configure(
                 wraplength=max(180, int(round(250 * self.ui_scale)))
             )
+        self._update_review_counts_panel()
 
         self._schedule_main_pane_layout(retries=4)
         try:
@@ -502,6 +610,98 @@ class AnnotatorApp:
         except tk.TclError:
             pass
 
+    def _build_zero_shot_segment_controls(self, parent):
+        prompt_frame = tb.Labelframe(parent, text="Prompt Segment", padding=8)
+        prompt_frame.pack(fill=X, pady=(0, 6))
+
+        tb.Label(
+            prompt_frame,
+            textvariable=self.zero_shot_segment_summary_var,
+            wraplength=250,
+            justify=LEFT,
+            font=("Arial", 8),
+            foreground="#888",
+        ).pack(anchor=W, pady=(0, 6))
+
+        model_row = tb.Frame(prompt_frame)
+        model_row.pack(fill=X, pady=(0, 4))
+        tb.Label(model_row, text="Model:", width=8, anchor=W).pack(side=LEFT)
+        self.zero_shot_segment_model_combo = tb.Combobox(
+            model_row,
+            state="readonly",
+            textvariable=self.zero_shot_segment_model_var,
+            values=ZERO_SHOT_SEGMENT_MODEL_LABELS,
+            width=24,
+        )
+        self.zero_shot_segment_model_combo.pack(side=RIGHT, fill=X, expand=True)
+        self.zero_shot_segment_model_combo.bind("<<ComboboxSelected>>", self.on_zero_shot_segment_model_changed)
+
+        prompt_row = tb.Frame(prompt_frame)
+        prompt_row.pack(fill=X, pady=(0, 4))
+        tb.Label(prompt_row, text="Prompt:", width=8, anchor=W).pack(side=LEFT)
+        tb.Entry(prompt_row, textvariable=self.zero_shot_segment_prompt_var, width=18).pack(side=LEFT, fill=X, expand=True)
+        tb.Button(
+            prompt_row,
+            text="Class",
+            command=self.use_selected_class_as_zero_shot_prompt,
+            bootstyle="secondary-outline",
+            width=7,
+        ).pack(side=RIGHT, padx=(4, 0))
+
+        tuning_row = tb.Frame(prompt_frame)
+        tuning_row.pack(fill=X, pady=(0, 4))
+        tb.Label(tuning_row, text="Conf:").pack(side=LEFT)
+        tb.Entry(tuning_row, textvariable=self.zero_shot_segment_confidence_var, width=6).pack(side=LEFT, padx=(3, 8))
+        tb.Label(tuning_row, text="Pts:").pack(side=LEFT)
+        tb.Entry(tuning_row, textvariable=self.zero_shot_segment_max_points_var, width=6).pack(side=LEFT, padx=(3, 0))
+
+        tb.Checkbutton(
+            prompt_frame,
+            text="Limit to AOI area",
+            variable=self.zero_shot_segment_use_aoi_var,
+            command=self.on_zero_shot_segment_option_changed,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=(2, 0))
+        tb.Checkbutton(
+            prompt_frame,
+            text="Replace this class",
+            variable=self.zero_shot_segment_replace_existing_var,
+            command=self.save_config,
+            bootstyle="round-toggle",
+        ).pack(anchor=W, pady=(1, 4))
+
+        area_row = tb.Frame(prompt_frame)
+        area_row.pack(fill=X, pady=(0, 4))
+        tb.Button(
+            area_row,
+            text="Draw Area",
+            command=self.start_aoi_polygon_draw,
+            bootstyle="warning-outline",
+        ).pack(side=LEFT, expand=True, fill=X, padx=(0, 1))
+        tb.Button(
+            area_row,
+            text="Clear Area",
+            command=self.clear_aoi_polygon,
+            bootstyle="danger-outline",
+        ).pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
+
+        action_row = tb.Frame(prompt_frame)
+        action_row.pack(fill=X)
+        tb.Button(
+            action_row,
+            text="Current",
+            command=self.auto_segment_prompt_current,
+            bootstyle="success",
+        ).pack(side=LEFT, expand=True, fill=X, padx=(0, 1))
+        tb.Button(
+            action_row,
+            text="All Images",
+            command=self.auto_segment_prompt_dataset,
+            bootstyle="danger",
+        ).pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
+
+        self._refresh_zero_shot_segment_ui()
+
     def load_config(self):
         if not os.path.exists(CONFIG_FILE): return
         try:
@@ -516,7 +716,8 @@ class AnnotatorApp:
                 cfg.get("rapid_nav_delay_ms", self.nav_delay),
                 fallback=DEFAULT_RAPID_NAV_DELAY_MS,
             )
-            
+            self.custom_class_colors = self._normalize_custom_class_colors(cfg.get("custom_class_colors", {}))
+             
             # Restore Classes
             if "classes" in cfg and cfg["classes"]:
                 self.set_classes(cfg["classes"])
@@ -557,7 +758,45 @@ class AnnotatorApp:
             except (TypeError, ValueError):
                 self.people_overlap_iou_threshold = 0.30
             self.people_overlap_iou_threshold = max(0.0, min(1.0, self.people_overlap_iou_threshold))
+            model_paths = cfg.get("zero_shot_segment_model_paths", {})
+            self.zero_shot_segment_model_paths = {
+                str(label): str(path)
+                for label, path in model_paths.items()
+                if str(label) in ZERO_SHOT_SEGMENT_MODEL_LABELS and str(path).strip()
+            } if isinstance(model_paths, dict) else {}
+            self.zero_shot_segment_model_var.set(
+                self._normalize_zero_shot_segment_model_label(
+                    cfg.get("zero_shot_segment_model", self.zero_shot_segment_model_var.get())
+                )
+            )
+            self.zero_shot_segment_prompt_var.set(
+                str(cfg.get("zero_shot_segment_prompt", self.zero_shot_segment_prompt_var.get())).strip() or "pallet"
+            )
+            self.zero_shot_segment_confidence_var.set(
+                self._normalize_decimal_string(
+                    cfg.get("zero_shot_segment_confidence", self.zero_shot_segment_confidence_var.get()),
+                    fallback="0.25",
+                    minimum=0.0,
+                    maximum=1.0,
+                )
+            )
+            self.zero_shot_segment_max_points_var.set(
+                str(self._normalize_int_value(
+                    cfg.get("zero_shot_segment_max_points", self.zero_shot_segment_max_points_var.get()),
+                    fallback=240,
+                    minimum=12,
+                    maximum=2000,
+                ))
+            )
+            self.zero_shot_segment_use_aoi_var.set(
+                bool(cfg.get("zero_shot_segment_use_aoi", self.zero_shot_segment_use_aoi_var.get()))
+            )
+            self.zero_shot_segment_replace_existing_var.set(
+                bool(cfg.get("zero_shot_segment_replace_existing", self.zero_shot_segment_replace_existing_var.get()))
+            )
+            self._refresh_zero_shot_segment_ui()
             self.zoom_lock.set(bool(cfg.get("zoom_lock", self.zoom_lock.get())))
+            self.review_mode_enabled.set(bool(cfg.get("review_mode_enabled", self.review_mode_enabled.get())))
             saved_box_input_mode = str(cfg.get("box_input_mode", self.box_input_mode.get())).strip().lower()
             if saved_box_input_mode not in {BOX_INPUT_DRAG, BOX_INPUT_TWO_CLICK, BOX_INPUT_CENTER}:
                 saved_box_input_mode = BOX_INPUT_DRAG
@@ -626,6 +865,7 @@ class AnnotatorApp:
             self.board_clip_quick_adjust_stringers = bool(cfg.get("board_clip_quick_adjust_stringers", self.board_clip_quick_adjust_stringers))
             self.board_clip_guides_visible.set(bool(cfg.get("board_clip_guides_visible", self.board_clip_guides_visible.get())))
             self.board_clip_corner_guides_visible.set(bool(cfg.get("board_clip_corner_guides_visible", self.board_clip_corner_guides_visible.get())))
+            self.copy_zone_visible.set(bool(cfg.get("copy_zone_visible", self.copy_zone_visible.get())))
             if hasattr(self, "board_clip_auto_apply_var") and self.board_clip_auto_apply_var is not None:
                 self.board_clip_auto_apply_var.set(self.board_clip_apply_to_auto_annotations)
             self._refresh_board_clip_parent_ui()
@@ -647,6 +887,7 @@ class AnnotatorApp:
         cfg = {
             "geometry": self.root.geometry(),
             "classes": self.classes,
+            "custom_class_colors": self.custom_class_colors,
             "model_version": self.model_ver_combo.get(),
             "last_workspace": self.workspace_path,
             "last_dir": os.path.dirname(self.image_paths[0]) if self.image_paths else "",
@@ -677,10 +918,19 @@ class AnnotatorApp:
             "board_clip_guides_visible": self.board_clip_guides_visible.get(),
             "board_clip_corner_guides_visible": self.board_clip_corner_guides_visible.get(),
             "zoom_lock": self.zoom_lock.get(),
+            "review_mode_enabled": self.review_mode_enabled.get(),
             "box_input_mode": self.box_input_mode.get(),
             "center_box_width_px": self.center_box_width_px.get(),
             "center_box_height_px": self.center_box_height_px.get(),
             "annotation_fill_enabled": self.annotation_fill_enabled.get(),
+            "copy_zone_visible": self.copy_zone_visible.get(),
+            "zero_shot_segment_model": self.zero_shot_segment_model_var.get(),
+            "zero_shot_segment_prompt": self.zero_shot_segment_prompt_var.get(),
+            "zero_shot_segment_confidence": self.zero_shot_segment_confidence_var.get(),
+            "zero_shot_segment_max_points": self.zero_shot_segment_max_points_var.get(),
+            "zero_shot_segment_use_aoi": self.zero_shot_segment_use_aoi_var.get(),
+            "zero_shot_segment_replace_existing": self.zero_shot_segment_replace_existing_var.get(),
+            "zero_shot_segment_model_paths": self.zero_shot_segment_model_paths,
             "ui_scale": self.ui_scale,
             "rapid_nav_delay_ms": self._normalize_rapid_nav_delay_ms(self.nav_delay),
         }
@@ -801,12 +1051,17 @@ class AnnotatorApp:
                 [float(point[0]), float(point[1])]
                 for point in self._aoi_polygon_for_use()
             ]
+            copy_zone_polygon_points = [
+                [float(point[0]), float(point[1])]
+                for point in self._copy_zone_polygon_for_use()
+            ]
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(
                     {
                         "label_format": self.dataset_label_format,
                         "aoi_polygon_points": aoi_polygon_points,
                         "aoi_enforced_class_ids": sorted(self._normalize_aoi_class_ids(self.aoi_enforced_class_ids)),
+                        "copy_zone_polygon_points": copy_zone_polygon_points,
                     },
                     f,
                     indent=2,
@@ -827,6 +1082,7 @@ class AnnotatorApp:
                     label_format = candidate
                 self.aoi_polygon_points = self._sanitize_polygon_points(raw.get("aoi_polygon_points", []))
                 self.aoi_enforced_class_ids = self._normalize_aoi_class_ids(raw.get("aoi_enforced_class_ids", []))
+                self.copy_zone_polygon_points = self._sanitize_polygon_points(raw.get("copy_zone_polygon_points", []))
             except Exception as e:
                 print(f"Failed to load dataset settings: {e}")
 
@@ -1168,6 +1424,7 @@ class AnnotatorApp:
         cls_btn_frame.pack(fill=X, pady=1)
         tb.Button(cls_btn_frame, text="Load Classes", command=self.load_classes_file, bootstyle="secondary", width=10).pack(side=LEFT, expand=True, fill=X, padx=(0,1))
         tb.Button(cls_btn_frame, text="Type Classes", command=self.input_classes_manual, bootstyle="secondary", width=10).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+        tb.Button(cls_btn_frame, text="Class Color", command=self.choose_selected_class_color, bootstyle="secondary-outline", width=11).pack(side=LEFT, expand=True, fill=X, padx=(1,0))
 
         # Model Group
         model_frame = tb.Labelframe(self.left_panel, text="Auto Annotate", padding=8)
@@ -1199,6 +1456,33 @@ class AnnotatorApp:
         self.btn_auto_curr.pack(side=LEFT, expand=True, fill=X, padx=(0,1))
         self.btn_auto_all = tb.Button(auto_frame, text="All Images", command=self.auto_annotate_all, bootstyle="danger", width=8)
         self.btn_auto_all.pack(side=LEFT, expand=True, fill=X, padx=(1,0))
+
+        best_people_frame = tb.Labelframe(model_frame, text="Best Person", padding=8)
+        best_people_frame.pack(fill=X, pady=(5, 1))
+        tb.Label(
+            best_people_frame,
+            textvariable=self.best_people_summary_var,
+            font=("Arial", 8),
+            foreground="#888",
+            wraplength=280,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(0, 4))
+        best_people_btns = tb.Frame(best_people_frame)
+        best_people_btns.pack(fill=X)
+        self.btn_best_people_curr = tb.Button(
+            best_people_btns,
+            text="Person Current (P)",
+            command=self.auto_annotate_best_person_current,
+            bootstyle="info",
+        )
+        self.btn_best_people_curr.pack(side=LEFT, expand=True, fill=X, padx=(0, 1))
+        self.btn_best_people_all = tb.Button(
+            best_people_btns,
+            text="Person All",
+            command=self.auto_annotate_best_person_all,
+            bootstyle="danger-outline",
+        )
+        self.btn_best_people_all.pack(side=LEFT, expand=True, fill=X, padx=(1, 0))
 
         tb.Button(model_frame, text="Confidence / IOU Settings", command=self.show_annotation_settings, bootstyle="info").pack(fill=X, pady=(4, 1))
         tb.Button(
@@ -1382,6 +1666,8 @@ class AnnotatorApp:
         )
         auto_segment_frame = tb.Labelframe(auto_segment_body, text="Auto Segment Tools", padding=8)
         auto_segment_frame.pack(fill=X)
+
+        self._build_zero_shot_segment_controls(auto_segment_frame)
 
         pallet_seg_frame = tb.Labelframe(auto_segment_frame, text="Pallet Segment", padding=8)
         pallet_seg_frame.pack(fill=X, pady=(0, 6))
@@ -1610,6 +1896,9 @@ class AnnotatorApp:
         self.lbl_idx = tb.Label(nav_frame, text="0 / 0", font=("Arial", 10, "bold"), width=10, anchor="center")
         self.lbl_idx.pack(side=LEFT, padx=5)
         tb.Button(nav_frame, text="Next >", command=self.next_image, bootstyle="outline").pack(side=LEFT, padx=1)
+        tb.Button(nav_frame, text="Copy + Next (J)", command=self.copy_current_scope_and_next, bootstyle="info-outline", width=15).pack(side=LEFT, padx=(6, 1))
+        tb.Button(nav_frame, text="Draw Zone", command=self.start_copy_zone_draw, bootstyle="warning-outline", width=10).pack(side=LEFT, padx=1)
+        tb.Button(nav_frame, text="Clear Zone", command=self.clear_copy_zone, bootstyle="danger-outline", width=10).pack(side=LEFT, padx=1)
 
         mode_frame = tb.Frame(toolbar_top)
         mode_frame.pack(side=LEFT, padx=(12, 0))
@@ -1657,6 +1946,10 @@ class AnnotatorApp:
                       bootstyle="round-toggle").pack(side=LEFT, padx=8)
         tb.Checkbutton(toggle_frame, text="Solo Class (F)", variable=self.show_only_selected_class,
                       command=self.redraw, bootstyle="round-toggle").pack(side=LEFT, padx=8)
+        tb.Checkbutton(toggle_frame, text="Review Mode (m)", variable=self.review_mode_enabled,
+                      command=self._on_review_mode_changed, bootstyle="round-toggle").pack(side=LEFT, padx=8)
+        tb.Checkbutton(toggle_frame, text="Show Copy Zone", variable=self.copy_zone_visible,
+                      command=self._on_copy_zone_visibility_changed, bootstyle="round-toggle").pack(side=LEFT, padx=8)
         tb.Checkbutton(toggle_frame, text="Fill Boxes", variable=self.annotation_fill_enabled,
                       command=self.redraw, bootstyle="round-toggle").pack(side=LEFT, padx=8)
 
@@ -1744,9 +2037,23 @@ class AnnotatorApp:
         self.board_clip_draw_toolbar_btn.pack(side=RIGHT, padx=4)
 
 
-        # Canvas
+        # Canvas and review counter panel
         self.canvas_bg = "#1a1a1a"
-        self.canvas = tk.Canvas(self.center_panel, bg=self.canvas_bg, highlightthickness=0)
+        self.canvas_container = tb.Frame(self.center_panel)
+        self.canvas_container.pack(fill=BOTH, expand=True)
+        self.review_counts_panel = tk.Frame(
+            self.canvas_container,
+            bg="#111111",
+            width=360,
+            height=600,
+            highlightthickness=1,
+            highlightbackground="#333333",
+            highlightcolor="#333333",
+        )
+        self.review_counts_panel.pack_propagate(False)
+        self.review_counts_inner = tk.Frame(self.review_counts_panel, bg="#111111")
+        self.review_counts_inner.pack(fill=BOTH, expand=True, padx=18, pady=22)
+        self.canvas = tk.Canvas(self.canvas_container, bg=self.canvas_bg, highlightthickness=0)
         self.canvas.pack(fill=BOTH, expand=True)
 
         # --- RIGHT PANEL: File List ---
@@ -2076,11 +2383,15 @@ class AnnotatorApp:
         
         # Y for repeat selected annotations and go to next
         self.root.bind("y", lambda e: self._run_shortcut(self.repeat_and_next, e))
+        self.root.bind("j", lambda e: self._run_shortcut(self.copy_current_scope_and_next, e))
+        self.root.bind("J", lambda e: self._run_shortcut(self.copy_current_scope_and_next, e))
         self.root.bind("[", lambda e: self._run_shortcut(lambda _event: self.adjust_center_stamp_size(-1), e, allow_during_edit=True))
         self.root.bind("]", lambda e: self._run_shortcut(lambda _event: self.adjust_center_stamp_size(1), e, allow_during_edit=True))
         
         # Q for quick auto-annotate (all classes, no dialog)
         self.root.bind("q", lambda e: self._run_shortcut(lambda _event: self.auto_annotate_quick(), e))
+        self.root.bind("p", lambda e: self._run_shortcut(lambda _event: self.auto_annotate_best_person_current(), e))
+        self.root.bind("P", lambda e: self._run_shortcut(lambda _event: self.auto_annotate_best_person_current(), e))
         self.root.bind("b", lambda e: self._run_shortcut(self.start_quick_board_clip_corners, e))
         self.root.bind("B", lambda e: self._run_shortcut(self.start_quick_board_clip_guides, e))
         self.root.bind_all("<Alt-b>", lambda e: self._run_shortcut(lambda _event: self.start_quick_board_clip_corners_batch(), e))
@@ -2109,6 +2420,9 @@ class AnnotatorApp:
         
         # F to toggle show only selected class
         self.root.bind("f", lambda e: self._run_shortcut(lambda _event: self._toggle_show_only_selected_class(), e, allow_during_edit=True))
+
+        # Lowercase m toggles validation review mode. Lowercase v is already used by pallet-fit actions.
+        self.root.bind("m", lambda e: self._run_shortcut(lambda _event: self._toggle_review_mode(), e, allow_during_edit=True))
         
         # T to toggle draw-only mode
         self.root.bind("t", lambda e: self._run_shortcut(lambda _event: self.draw_only_mode.set(not self.draw_only_mode.get()), e))
@@ -2136,9 +2450,34 @@ class AnnotatorApp:
         self.canvas.bind("<ButtonRelease-2>", self.on_pan_end)
         # Right click to delete under cursor
         self.canvas.bind("<Button-3>", self.on_right_click)
+        self._bind_mouse_navigation()
         
         # Resize event
         self.canvas.bind("<Configure>", self.on_canvas_resize)
+
+    def _bind_mouse_navigation(self):
+        # X11 and newer Tk use 8/9; Windows Tk 8.6 uses 4/5 for XBUTTON1/2.
+        self._mouse_nav_buttons = {8: self.prev_image, 9: self.next_image}
+        self.canvas.bind("<ButtonPress>", self._on_mouse_navigation, add="+")
+        if (self.root.tk.call("tk", "windowingsystem") == "win32"
+                and int(self.root.tk.call("package", "vcompare",
+                                          self.root.tk.call("package", "provide", "Tk"), "8.7")) < 0):
+            self._mouse_nav_buttons.update({4: self.prev_image, 5: self.next_image})
+            # Replace Linux wheel bindings only on legacy Windows Tk.
+            for button in (4, 5):
+                self.canvas.bind(f"<ButtonPress-{button}>", self._on_mouse_navigation)
+
+    def _on_mouse_navigation(self, event):
+        """Navigate once per side-button press using the normal shortcut guards."""
+        try:
+            button = int(event.num)
+        except (AttributeError, TypeError, ValueError):
+            return
+        callback = self._mouse_nav_buttons.get(button)
+        if callback is None:
+            return
+        self._run_shortcut(callback, event)
+        return "break"
 
     def _on_imgsz_changed(self, event=None):
         """Handle inference size change - update model if loaded."""
@@ -2716,6 +3055,9 @@ class AnnotatorApp:
         self.aoi_draw_active = False
         self.aoi_pending_points = []
         self.aoi_preview_cursor = None
+        self.copy_zone_draw_active = False
+        self.copy_zone_pending_points = []
+        self.copy_zone_preview_cursor = None
 
         self.drag_mode = None
         self.current_rect_id = None
@@ -2760,6 +3102,7 @@ class AnnotatorApp:
             self.lbl_idx.config(text="0 / 0")
         if hasattr(self, "stats_current_img_var") and self.stats_current_img_var is not None:
             self._update_current_image_stats()
+        self._update_review_counts_panel()
 
     def _load_images_from_dir(self, d):
         exts = ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"]
@@ -2913,6 +3256,83 @@ class AnnotatorApp:
             lines = [c.strip() for c in s.split(",") if c.strip()]
             self.set_classes(lines)
 
+    def _normalize_hex_color(self, value):
+        if not isinstance(value, str):
+            return None
+        raw = value.strip()
+        if not raw.startswith("#"):
+            raw = f"#{raw}"
+        if len(raw) != 7:
+            return None
+        try:
+            int(raw[1:], 16)
+        except ValueError:
+            return None
+        return raw.upper()
+
+    def _normalize_custom_class_colors(self, raw_colors):
+        if not isinstance(raw_colors, dict):
+            return {}
+        normalized = {}
+        for name, color in raw_colors.items():
+            class_name = str(name).strip()
+            hex_color = self._normalize_hex_color(color)
+            if class_name and hex_color:
+                normalized[class_name] = hex_color
+        return normalized
+
+    def _generated_class_color(self, class_id):
+        random.seed(class_id + 55) # Salt
+        h = random.random()
+        s = 0.7 + random.random() * 0.3
+        v = 0.8 + random.random() * 0.2
+        import colorsys
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        return "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255))
+
+    def _color_for_class(self, class_id, class_name):
+        custom = self.custom_class_colors.get(str(class_name).strip())
+        if custom:
+            return custom
+        return self._generated_class_color(class_id)
+
+    def _refresh_class_list_colors(self):
+        if not hasattr(self, "cls_list") or self.cls_list is None:
+            return
+        for idx in range(len(self.classes)):
+            color = self.class_colors.get(idx, "#FFFFFF")
+            try:
+                self.cls_list.itemconfig(idx, foreground=color)
+            except tk.TclError:
+                pass
+
+    def choose_selected_class_color(self):
+        if not self.classes:
+            messagebox.showinfo("Class Color", "Load or type classes first.", parent=self.root)
+            return
+        selected = self.cls_list.curselection()
+        class_id = selected[0] if selected else self.selected_class_id
+        if not (0 <= class_id < len(self.classes)):
+            return
+        class_name = self.classes[class_id]
+        current_color = self.class_colors.get(class_id, "#FFFFFF")
+        _rgb, hex_color = colorchooser.askcolor(
+            color=current_color,
+            title=f"Choose color for {class_name}",
+            parent=self.root,
+        )
+        hex_color = self._normalize_hex_color(hex_color)
+        if not hex_color:
+            return
+        self.custom_class_colors[str(class_name).strip()] = hex_color
+        self.class_colors[class_id] = hex_color
+        self._refresh_class_list_colors()
+        if self.current_image:
+            self.redraw()
+        self._update_review_counts_panel()
+        self.save_config()
+        self.status_var.set(f"Class color set: {class_name} {hex_color}")
+
     def set_classes(self, class_list, update_yaml=True):
         self.classes = class_list
         
@@ -2923,22 +3343,12 @@ class AnnotatorApp:
 
         self.cls_list.delete(0, tk.END)
         self.class_colors = {}
-        
+         
         for i, c in enumerate(self.classes):
             self.cls_list.insert(tk.END, f"{i}: {c}")
-            # Generate vibrant color
-            random.seed(i+55) # Salt
-            
-            # Simple HSL gen
-            h = random.random()
-            s = 0.7 + random.random()*0.3
-            v = 0.8 + random.random()*0.2
-            
-            # Convert to RGB hex
-            import colorsys
-            r, g, b = colorsys.hsv_to_rgb(h, s, v)
-            hex_col = "#%02x%02x%02x" % (int(r*255), int(g*255), int(b*255))
+            hex_col = self._color_for_class(i, c)
             self.class_colors[i] = hex_col
+        self._refresh_class_list_colors()
             
         # Update filter list with advanced options
         base_vals = ["All", "Unannotated", "Overlapping", "Suspicious"]
@@ -3170,6 +3580,9 @@ class AnnotatorApp:
 
     def _default_people_target_class_id(self):
         preferred_names = ("person", "people", "human")
+        exact_person_class_id = self._person_label_class_id()
+        if exact_person_class_id is not None:
+            return exact_person_class_id
         for preferred in preferred_names:
             for idx, name in enumerate(self.classes):
                 if str(name).strip().lower() == preferred:
@@ -3181,6 +3594,24 @@ class AnnotatorApp:
         if self.classes and 0 <= self.selected_class_id < len(self.classes):
             return int(self.selected_class_id)
         return 0
+
+    def _person_label_class_id(self):
+        for idx, name in enumerate(self.classes):
+            if str(name).strip().lower() == "person":
+                return idx
+        return None
+
+    def _require_person_label_class_id(self):
+        class_id = self._person_label_class_id()
+        if class_id is not None:
+            return class_id
+        messagebox.showerror(
+            "Person Class Not Found",
+            "Load a class list or data.yaml that contains a class named Person before using Best Person annotation.",
+            parent=self.root,
+        )
+        self.status_var.set("Best person auto-annotate needs a Person class in the loaded labels")
+        return None
 
     def _resolved_people_target_class_id(self):
         try:
@@ -3203,6 +3634,26 @@ class AnnotatorApp:
         if self.classes and 0 <= class_id < len(self.classes):
             return f"{class_id}: {self.classes[class_id]}"
         return str(class_id)
+
+    def _best_people_model_entry(self):
+        return self._normalize_people_model_entry(
+            {
+                "path": BEST_PERSON_MODEL_NAME,
+                "version": BEST_PERSON_MODEL_VERSION,
+                "imgsz": BEST_PERSON_MODEL_IMGSZ,
+                "person_class_id": BEST_PERSON_SOURCE_CLASS_ID,
+                "enabled": True,
+            }
+        )
+
+    def _is_managed_people_model_ref(self, model_path):
+        return str(model_path or "").strip().lower() == BEST_PERSON_MODEL_NAME.lower()
+
+    def _model_path_available(self, model_path):
+        return bool(model_path) and (
+            os.path.exists(model_path)
+            or self._is_managed_people_model_ref(model_path)
+        )
 
     def _normalize_people_model_entry(self, entry):
         if not isinstance(entry, dict):
@@ -3257,6 +3708,20 @@ class AnnotatorApp:
             if self.people_allow_overlap
             else f"overlap blocked (IoU {self.people_overlap_iou_threshold:.2f})"
         )
+        if hasattr(self, "best_people_summary_var") and self.best_people_summary_var is not None:
+            exact_person_class_id = self._person_label_class_id()
+            if exact_person_class_id is None:
+                best_summary = (
+                    f"{BEST_PERSON_MODEL_LABEL} needs a loaded dataset class named Person. "
+                    f"First run downloads {BEST_PERSON_MODEL_NAME}."
+                )
+            else:
+                best_summary = (
+                    f"{BEST_PERSON_MODEL_LABEL} -> dataset class "
+                    f"{self._format_people_target_choice(exact_person_class_id)}. "
+                    f"First run downloads {BEST_PERSON_MODEL_NAME}."
+                )
+            self.best_people_summary_var.set(best_summary)
         if enabled_models:
             summary = (
                 f"{len(enabled_models)} enabled people model(s). "
@@ -3297,7 +3762,7 @@ class AnnotatorApp:
         return imgsz, str(imgsz)
 
     def _load_inference_model_from_path(self, model_path, version="Auto", imgsz_value="Auto"):
-        if not model_path or not os.path.exists(model_path):
+        if not model_path or not self._model_path_available(model_path):
             raise FileNotFoundError(f"Model file not found:\n{model_path}")
 
         imgsz, resolved_imgsz = self._resolve_model_imgsz_value(version, imgsz_value)
@@ -3306,7 +3771,7 @@ class AnnotatorApp:
             from inference import PyTorchYOLOModel
 
             model = PyTorchYOLOModel(model_path, imgsz=imgsz)
-            model_type = "PyTorch"
+            model_type = "PyTorch pretrained" if self._is_managed_people_model_ref(model_path) else "PyTorch"
         elif model_path.lower().endswith(".tflite"):
             from inference import TFLiteModel
 
@@ -3329,7 +3794,7 @@ class AnnotatorApp:
             normalized = self._normalize_people_model_entry(entry)
             if normalized is None or not normalized["enabled"]:
                 continue
-            if not os.path.exists(normalized["path"]):
+            if not self._model_path_available(normalized["path"]):
                 missing_paths.append(normalized["path"])
                 continue
             active_entries.append(normalized)
@@ -3561,7 +4026,7 @@ class AnnotatorApp:
             if not model_path:
                 messagebox.showerror("Missing Model", "Select a model file first.")
                 return
-            if not os.path.exists(model_path):
+            if not self._model_path_available(model_path):
                 messagebox.showerror("Missing Model", f"Model file not found:\n{model_path}")
                 return
             try:
@@ -3758,12 +4223,41 @@ class AnnotatorApp:
         btn_row.pack(fill=X, pady=(14, 0))
         tb.Button(btn_row, text="Close", command=lambda: [save_settings(), dlg.destroy()], bootstyle="primary", width=12).pack(side=RIGHT)
 
-    def auto_annotate_people_current(self):
+    def auto_annotate_best_person_current(self):
+        target_class_id = self._require_person_label_class_id()
+        if target_class_id is None:
+            return
+        return self.auto_annotate_people_current(
+            model_entries=[self._best_people_model_entry()],
+            missing_paths=[],
+            target_class_id=target_class_id,
+            action_label="Best person",
+            no_models_title="Best Person Model",
+            no_models_message=(
+                f"The managed {BEST_PERSON_MODEL_LABEL} model could not be prepared."
+            ),
+            load_message=f"Loading {BEST_PERSON_MODEL_LABEL} person model...",
+        )
+
+    def auto_annotate_people_current(
+        self,
+        model_entries=None,
+        missing_paths=None,
+        target_class_id=None,
+        action_label="People",
+        no_models_title="No People Models",
+        no_models_message=None,
+        load_message="Loading people models...",
+    ):
         if not self.current_image:
             messagebox.showerror("No Image", "Load an image first.")
             return
 
-        model_entries, missing_paths = self._active_people_model_entries()
+        if model_entries is None:
+            model_entries, missing_paths = self._active_people_model_entries()
+        elif missing_paths is None:
+            missing_paths = []
+
         if missing_paths:
             self._warn_people_model_errors(
                 [f"Missing model file: {path}" for path in missing_paths],
@@ -3771,12 +4265,13 @@ class AnnotatorApp:
             )
         if not model_entries:
             messagebox.showerror(
-                "No People Models",
-                "No enabled people models are available.\n\nFix the saved model paths or add a new people model first.",
+                no_models_title,
+                no_models_message
+                or "No enabled people models are available.\n\nFix the saved model paths or add a new people model first.",
             )
             return
 
-        self.status_var.set("Loading people models...")
+        self.status_var.set(load_message)
         self.root.update_idletasks()
 
         people_runtimes, load_errors = self._load_people_model_runtimes(
@@ -3784,11 +4279,15 @@ class AnnotatorApp:
             cache=self.people_model_cache,
         )
         if not people_runtimes:
-            self._warn_people_model_errors(load_errors, "People Model Load Failed")
-            self.status_var.set("People auto-annotate failed: no models could be loaded")
+            self._warn_people_model_errors(load_errors, f"{action_label} Model Load Failed")
+            self.status_var.set(f"{action_label} auto-annotate failed: no models could be loaded")
             return
 
-        target_class_id = self._resolved_people_target_class_id()
+        target_class_id = (
+            self._resolved_people_target_class_id()
+            if target_class_id is None else
+            int(target_class_id)
+        )
         confidence_threshold = self.class_confidence_thresholds.get(
             target_class_id,
             self.default_confidence_threshold,
@@ -3814,14 +4313,14 @@ class AnnotatorApp:
             self.save_annotations()
         self.redraw()
 
-        msg = f"People auto-annotate: added {added}"
+        msg = f"{action_label} auto-annotate: added {added}"
         if result["candidate_count"] > 0 and not self.people_allow_overlap:
             msg += f" (skipped {result['skipped_overlap']} overlaps)"
         self.status_var.set(msg)
 
         combined_errors = list(load_errors) + list(result["errors"])
         if combined_errors:
-            self._warn_people_model_errors(combined_errors, "People Auto-Annotate Warnings")
+            self._warn_people_model_errors(combined_errors, f"{action_label} Auto-Annotate Warnings")
 
     def load_model(self):
         f = filedialog.askopenfilename(
@@ -5046,8 +5545,12 @@ UI
   [ / ]       Shrink or grow the center-stamp size
   Ctrl+Click  Multi-select annotations
   Y           Repeat selected annotations & next
+  J           Copy all annotations & next (Solo Class copies selected class only)
+  Copy Zone   Draw Zone limits J to boxes whose center is inside the zone
   E           Toggle Edit mode (resize boxes / move polygon points)
   T           Toggle Draw Only mode
+  F           Toggle Solo Class mode
+  m           Toggle Review Mode
   B           Click 4 pallet corners, save a rotated fit guide, then auto-adjust boards/stringers
   Alt+B       4-point all mode from the current filtered image onward
   Shift+B     Draw 2 pallet edges as a fallback guide
@@ -5068,6 +5571,7 @@ UI
 ⚙ OTHER
   S           Save annotations
   Q           Quick auto-annotate (all classes, ignores saved AOI)
+  P           Best person auto-annotate (maps to your Person class)
   F           Toggle show only selected class
   Fill Boxes  Toggle filled highlight overlay in the toolbar
   H           Show this help
@@ -7430,6 +7934,488 @@ UI
                 msg += "; no close source-box pairs were detected"
         self.status_var.set(msg)
 
+    def _zero_shot_segment_presets_by_label(self):
+        return {preset["label"]: preset for preset in ZERO_SHOT_SEGMENT_MODEL_PRESETS}
+
+    def _normalize_zero_shot_segment_model_label(self, value):
+        label = str(value or "").strip()
+        if label in ZERO_SHOT_SEGMENT_MODEL_LABELS:
+            return label
+        lowered = label.lower()
+        for preset_label in ZERO_SHOT_SEGMENT_MODEL_LABELS:
+            if preset_label.lower() == lowered:
+                return preset_label
+        return DEFAULT_ZERO_SHOT_SEGMENT_MODEL_LABEL
+
+    def _zero_shot_segment_preset(self, label=None):
+        normalized_label = self._normalize_zero_shot_segment_model_label(
+            self.zero_shot_segment_model_var.get() if label is None else label
+        )
+        return dict(self._zero_shot_segment_presets_by_label()[normalized_label])
+
+    def on_zero_shot_segment_model_changed(self, event=None):
+        self.zero_shot_segment_model_var.set(self._normalize_zero_shot_segment_model_label(self.zero_shot_segment_model_var.get()))
+        self._refresh_zero_shot_segment_ui()
+        self.save_config()
+
+    def on_zero_shot_segment_option_changed(self):
+        self._refresh_zero_shot_segment_ui()
+        self.save_config()
+
+    def _refresh_zero_shot_segment_ui(self):
+        if not hasattr(self, "zero_shot_segment_summary_var") or self.zero_shot_segment_summary_var is None:
+            return
+        preset = self._zero_shot_segment_preset()
+        if preset.get("needs_aoi") and hasattr(self, "zero_shot_segment_use_aoi_var"):
+            self.zero_shot_segment_use_aoi_var.set(True)
+
+        aoi_ready = len(self._aoi_polygon_for_use()) >= 3 if hasattr(self, "_aoi_polygon_for_use") else False
+        aoi_text = "AOI ready" if aoi_ready else "draw AOI for area mode"
+        if not self.zero_shot_segment_use_aoi_var.get() and not preset.get("needs_aoi"):
+            aoi_text = "AOI off"
+
+        self.zero_shot_segment_summary_var.set(
+            f"{preset.get('summary', '')}\nModel: {preset['model']} | {aoi_text}"
+        )
+        if self.zero_shot_segment_model_combo is not None:
+            self.zero_shot_segment_model_combo.config(values=ZERO_SHOT_SEGMENT_MODEL_LABELS)
+
+    def use_selected_class_as_zero_shot_prompt(self):
+        if self.classes and 0 <= self.selected_class_id < len(self.classes):
+            self.zero_shot_segment_prompt_var.set(str(self.classes[self.selected_class_id]).strip())
+            self.status_var.set(f"Prompt set to class: {self.classes[self.selected_class_id]}")
+            self.save_config()
+
+    def _zero_shot_prompt_list(self):
+        raw_prompt = str(self.zero_shot_segment_prompt_var.get() or "").strip()
+        prompts = [part.strip() for part in re.split(r"[,;]", raw_prompt) if part.strip()]
+        if prompts:
+            return prompts
+        if self.classes and 0 <= self.selected_class_id < len(self.classes):
+            return [str(self.classes[self.selected_class_id]).strip()]
+        return []
+
+    def _zero_shot_target_class_id(self, prompts):
+        prompt = str(prompts[0] if prompts else "").strip().lower()
+        prompt_key = self._normalize_class_name_key(prompt)
+        if prompt_key:
+            for idx, name in enumerate(self.classes):
+                name_key = self._normalize_class_name_key(name)
+                if name_key == prompt_key or name_key.rstrip("s") == prompt_key.rstrip("s"):
+                    return idx
+        if self.classes and 0 <= self.selected_class_id < len(self.classes):
+            return int(self.selected_class_id)
+        return 0
+
+    def _zero_shot_confidence_threshold(self):
+        confidence = self._normalize_decimal_string(
+            self.zero_shot_segment_confidence_var.get(),
+            fallback="0.25",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        self.zero_shot_segment_confidence_var.set(confidence)
+        return float(confidence)
+
+    def _zero_shot_max_polygon_points(self):
+        max_points = self._normalize_int_value(
+            self.zero_shot_segment_max_points_var.get(),
+            fallback=240,
+            minimum=12,
+            maximum=2000,
+        )
+        self.zero_shot_segment_max_points_var.set(str(max_points))
+        return max_points
+
+    def _zero_shot_aoi_bbox_prompts(self, aoi_polygon_points):
+        points = self._sanitize_polygon_points(aoi_polygon_points)
+        if len(points) < 3:
+            return []
+        left, top, right, bottom = self._polygon_bounds(points)
+        return [[left, top, right, bottom]]
+
+    def _parse_zero_shot_imgsz(self, value):
+        raw = str(value or "Auto").strip()
+        if raw.lower() == "auto":
+            return None
+        try:
+            return max(32, int(float(raw)))
+        except (TypeError, ValueError):
+            return None
+
+    def _zero_shot_model_path_overrides(self):
+        raw = getattr(self, "zero_shot_segment_model_paths", {})
+        return raw if isinstance(raw, dict) else {}
+
+    def _resolve_zero_shot_model_name(self, preset):
+        label = preset["label"]
+        model_name = self._zero_shot_model_path_overrides().get(label, preset["model"])
+        if preset.get("backend") == "sam3" and not os.path.exists(model_name):
+            chosen = filedialog.askopenfilename(
+                title="Select sam3.pt",
+                filetypes=[("PyTorch Models", "*.pt"), ("All Files", "*.*")],
+                parent=self.root,
+            )
+            if not chosen:
+                raise FileNotFoundError("SAM 3 requires a local sam3.pt model file.")
+            self.zero_shot_segment_model_paths[label] = chosen
+            self.save_config()
+            model_name = chosen
+        return model_name
+
+    def _get_zero_shot_segment_runtime(self, preset):
+        model_name = self._resolve_zero_shot_model_name(preset)
+        imgsz = self._parse_zero_shot_imgsz(preset.get("imgsz", "Auto"))
+        cache_key = (
+            preset.get("backend", "yoloe"),
+            os.path.normcase(os.path.normpath(str(model_name))),
+            imgsz,
+        )
+        if cache_key not in self.zero_shot_segment_model_cache:
+            from inference import UltralyticsPromptSegmentModel
+
+            self.zero_shot_segment_model_cache[cache_key] = UltralyticsPromptSegmentModel(
+                model_name,
+                backend=preset.get("backend", "yoloe"),
+                imgsz=imgsz,
+            )
+        return self.zero_shot_segment_model_cache[cache_key]
+
+    def _zero_shot_segment_run_settings(self, require_images=True):
+        if require_images and not self.image_paths and not self.current_image:
+            self.status_var.set("Load images before running prompt segmentation")
+            return None
+
+        preset = self._zero_shot_segment_preset()
+        prompts = self._zero_shot_prompt_list()
+        if preset.get("backend") in {"yoloe", "sam3"} and not prompts:
+            messagebox.showerror("Prompt Required", "Type what to segment, for example: pallet", parent=self.root)
+            return None
+
+        use_aoi = bool(self.zero_shot_segment_use_aoi_var.get() or preset.get("needs_aoi"))
+        aoi_polygon_points = self._aoi_polygon_for_use() if use_aoi else []
+        if use_aoi and len(aoi_polygon_points) < 3:
+            messagebox.showerror(
+                "AOI Area Required",
+                "Draw an AOI area before running this model with area limiting.",
+                parent=self.root,
+            )
+            return None
+
+        if not prompts and self.classes and 0 <= self.selected_class_id < len(self.classes):
+            prompts = [str(self.classes[self.selected_class_id]).strip()]
+
+        target_class_id = self._zero_shot_target_class_id(prompts)
+        return {
+            "preset": preset,
+            "prompts": prompts,
+            "target_class_id": target_class_id,
+            "confidence_threshold": self._zero_shot_confidence_threshold(),
+            "max_points": self._zero_shot_max_polygon_points(),
+            "use_aoi": use_aoi,
+            "aoi_polygon_points": [list(point) for point in aoi_polygon_points],
+            "bbox_prompts": self._zero_shot_aoi_bbox_prompts(aoi_polygon_points) if use_aoi else [],
+            "replace_existing": bool(self.zero_shot_segment_replace_existing_var.get()),
+        }
+
+    def _class_label_for_id(self, class_id):
+        if self.classes and 0 <= int(class_id) < len(self.classes):
+            return self.classes[int(class_id)]
+        return str(class_id)
+
+    def _collect_zero_shot_segment_annotations_for_image(
+        self,
+        image_arr,
+        existing_annotations,
+        runtime,
+        settings,
+    ):
+        records = runtime.predict_segments(
+            image_arr,
+            prompts=settings["prompts"],
+            confidence_threshold=settings["confidence_threshold"],
+            iou_threshold=self.iou_threshold,
+            bboxes=settings["bbox_prompts"],
+            max_points=settings["max_points"],
+        )
+
+        working = self._copy_annotations(existing_annotations)
+        target_class_id = int(settings["target_class_id"])
+        new_annotations = []
+        skipped_aoi = 0
+        skipped_dupes = 0
+        fallback_boxes = 0
+
+        for record in records:
+            if float(record.get("score", 1.0)) < float(settings["confidence_threshold"]):
+                continue
+            points = record.get("points", [])
+            ann = self._make_polygon_annotation(target_class_id, points)
+            if ann is None:
+                continue
+            if not record.get("from_mask", True):
+                fallback_boxes += 1
+            if settings["use_aoi"]:
+                ann, was_skipped = self._filter_auto_annotation_candidate_by_aoi(
+                    ann,
+                    enforced_class_ids={target_class_id},
+                    polygon_points=settings["aoi_polygon_points"],
+                )
+                if was_skipped or ann is None:
+                    skipped_aoi += 1
+                    continue
+            if not settings["replace_existing"] and self._is_duplicate_or_overlapping(ann, working + new_annotations):
+                skipped_dupes += 1
+                continue
+            new_annotations.append(ann)
+
+        return {
+            "candidate_count": len(records),
+            "new_annotations": new_annotations,
+            "skipped_aoi": skipped_aoi,
+            "skipped_dupes": skipped_dupes,
+            "fallback_boxes": fallback_boxes,
+        }
+
+    def _merge_zero_shot_segment_annotations(self, existing_annotations, new_annotations, settings):
+        if settings["replace_existing"]:
+            target_class_id = int(settings["target_class_id"])
+            merged = [
+                self._copy_annotation(ann)
+                for ann in existing_annotations
+                if int(ann[0]) != target_class_id
+            ]
+            replaced_count = len(existing_annotations) - len(merged)
+            merged.extend(self._copy_annotation(ann) for ann in new_annotations)
+            return merged, replaced_count
+
+        merged = self._copy_annotations(existing_annotations)
+        merged.extend(self._copy_annotation(ann) for ann in new_annotations)
+        return merged, 0
+
+    def _zero_shot_status_message(self, prefix, result, settings, replaced_count=0):
+        target_label = self._class_label_for_id(settings["target_class_id"])
+        msg = f"{prefix}: added {len(result['new_annotations'])} {target_label} segment(s)"
+        if settings["replace_existing"]:
+            msg += f", replaced {replaced_count}"
+        if result.get("skipped_dupes", 0):
+            msg += f", skipped {result['skipped_dupes']} duplicates"
+        if result.get("skipped_aoi", 0):
+            msg += f", AOI skipped {result['skipped_aoi']}"
+        if result.get("fallback_boxes", 0):
+            msg += f", {result['fallback_boxes']} box-shaped"
+        return msg
+
+    def auto_segment_prompt_current(self):
+        if not self.current_image:
+            self.status_var.set("Load an image before prompt segmentation")
+            return
+
+        settings = self._zero_shot_segment_run_settings(require_images=True)
+        if settings is None:
+            return
+
+        self._ensure_segment_dataset_mode("prompt segmentation")
+        self.save_config()
+
+        try:
+            runtime = self._get_zero_shot_segment_runtime(settings["preset"])
+            self._push_annotation_undo()
+            result = self._collect_zero_shot_segment_annotations_for_image(
+                np.array(self.current_image),
+                self.annotations,
+                runtime,
+                settings,
+            )
+            merged, replaced_count = self._merge_zero_shot_segment_annotations(
+                self.annotations,
+                result["new_annotations"],
+                settings,
+            )
+
+            if self._annotation_list_differs(self.annotations, merged):
+                self.annotations = merged
+                self.annotations_dirty = True
+                self.save_annotations()
+            self.redraw()
+            self.status_var.set(self._zero_shot_status_message("Prompt segment", result, settings, replaced_count))
+        except Exception as exc:
+            messagebox.showerror("Prompt Segment Failed", str(exc), parent=self.root)
+            self.status_var.set(f"Prompt segment failed: {exc}")
+
+    def auto_segment_prompt_dataset(self):
+        if not self.image_paths:
+            self.status_var.set("Load a workspace before prompt segmenting all images")
+            return
+
+        settings = self._zero_shot_segment_run_settings(require_images=True)
+        if settings is None:
+            return
+
+        self._ensure_segment_dataset_mode("prompt segmentation batch")
+        self.save_config()
+        if self.current_image and self.current_file_path and self.annotations_dirty:
+            self.save_annotations(force=True)
+
+        try:
+            runtime = self._get_zero_shot_segment_runtime(settings["preset"])
+        except Exception as exc:
+            messagebox.showerror("Prompt Segment Model Failed", str(exc), parent=self.root)
+            self.status_var.set(f"Prompt segment model failed: {exc}")
+            return
+
+        image_paths = list(self.image_paths)
+        top = tb.Toplevel(self.root)
+        top.title("Prompt Segmenting...")
+        top.geometry("500x165")
+        top.transient(self.root)
+        top.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        pb = tb.Progressbar(top, maximum=len(image_paths))
+        pb.pack(fill=X, padx=20, pady=(20, 6))
+        lbl_status = tb.Label(top, text="Starting prompt segmentation...", font=("Consolas", 9))
+        lbl_status.pack(pady=2)
+        lbl_speed = tb.Label(top, text="", font=("Arial", 8), foreground="#888")
+        lbl_speed.pack(pady=0)
+
+        cancel_flag = {"cancelled": False}
+
+        def on_cancel_batch():
+            cancel_flag["cancelled"] = True
+            cancel_btn.config(state="disabled", text="Cancelling...")
+
+        cancel_btn = tb.Button(top, text="Cancel", command=on_cancel_batch, bootstyle="danger-outline", width=14)
+        cancel_btn.pack(pady=8)
+
+        progress = {
+            "i": 0,
+            "added": 0,
+            "changed": 0,
+            "replaced": 0,
+            "skipped_dupes": 0,
+            "skipped_aoi": 0,
+            "fallback_boxes": 0,
+            "errors": [],
+            "done": False,
+            "start_time": time.time(),
+        }
+
+        def worker():
+            added = 0
+            changed = 0
+            replaced = 0
+            skipped_dupes = 0
+            skipped_aoi = 0
+            fallback_boxes = 0
+            errors = []
+
+            for idx, img_path in enumerate(image_paths):
+                if cancel_flag["cancelled"]:
+                    break
+                try:
+                    existing_anns, lbl_path = self._load_annotations_for_image_path(img_path)
+                    img_bgr = cv2.imread(img_path)
+                    if img_bgr is None:
+                        pil_img = Image.open(img_path)
+                        img_arr = np.array(pil_img)
+                    else:
+                        img_arr = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+                    result = self._collect_zero_shot_segment_annotations_for_image(
+                        img_arr,
+                        existing_anns,
+                        runtime,
+                        settings,
+                    )
+                    merged, replaced_count = self._merge_zero_shot_segment_annotations(
+                        existing_anns,
+                        result["new_annotations"],
+                        settings,
+                    )
+                    if self._annotation_list_differs(existing_anns, merged):
+                        self._write_annotations_atomically(lbl_path, merged, LABEL_FORMAT_SEGMENT)
+                        changed += 1
+                        added += len(result["new_annotations"])
+                        replaced += replaced_count
+                    skipped_dupes += result["skipped_dupes"]
+                    skipped_aoi += result["skipped_aoi"]
+                    fallback_boxes += result["fallback_boxes"]
+                except Exception as exc:
+                    errors.append(f"{os.path.basename(img_path)}: {exc}")
+
+                progress["i"] = idx + 1
+                progress["added"] = added
+                progress["changed"] = changed
+                progress["replaced"] = replaced
+                progress["skipped_dupes"] = skipped_dupes
+                progress["skipped_aoi"] = skipped_aoi
+                progress["fallback_boxes"] = fallback_boxes
+                progress["errors"] = errors[-12:]
+
+            progress["added"] = added
+            progress["changed"] = changed
+            progress["replaced"] = replaced
+            progress["skipped_dupes"] = skipped_dupes
+            progress["skipped_aoi"] = skipped_aoi
+            progress["fallback_boxes"] = fallback_boxes
+            progress["errors"] = errors[-12:]
+            progress["done"] = True
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        def poll_progress():
+            i = progress["i"]
+            total = len(image_paths)
+            pb["value"] = i
+            lbl_status.config(
+                text=(
+                    f"Processed {i}/{total} | added {progress['added']} "
+                    f"| changed {progress['changed']}"
+                )
+            )
+
+            elapsed = time.time() - progress["start_time"]
+            if i > 0 and elapsed > 0:
+                ips = i / elapsed
+                remaining = (total - i) / ips if ips > 0 else 0
+                mins, secs = divmod(int(remaining), 60)
+                lbl_speed.config(text=f"{ips:.1f} img/s | ETA {mins:02d}:{secs:02d}")
+
+            if progress["done"]:
+                top.destroy()
+                current_path = self.current_file_path
+                preferred_index = self.current_index
+                self._clear_loaded_image_state(clear_canvas=True, reset_view=False, clear_file_selection=False)
+                self._rebuild_after_image_list_change(
+                    preferred_filtered_index=preferred_index,
+                    preferred_path=current_path,
+                )
+
+                msg = (
+                    f"Prompt segment batch: added {progress['added']} segment(s) "
+                    f"across {progress['changed']} image(s)"
+                )
+                if settings["replace_existing"]:
+                    msg += f", replaced {progress['replaced']}"
+                if progress["skipped_dupes"]:
+                    msg += f", skipped {progress['skipped_dupes']} duplicates"
+                if progress["skipped_aoi"]:
+                    msg += f", AOI skipped {progress['skipped_aoi']}"
+                if progress["fallback_boxes"]:
+                    msg += f", {progress['fallback_boxes']} box-shaped"
+                if cancel_flag["cancelled"]:
+                    msg += f" (cancelled at {progress['i']}/{total})"
+                self.status_var.set(msg)
+
+                if progress["errors"]:
+                    self._warn_people_model_errors(progress["errors"], "Prompt Segment Warnings")
+                return
+
+            top.after(100, poll_progress)
+
+        poll_progress()
+
     def apply_board_clip_to_current(self, e=None):
         if not self.current_image:
             self.status_var.set("Load an image before running pallet fit")
@@ -9118,6 +10104,27 @@ UI
             self.status_var.set("Showing all classes")
         self.redraw()
 
+    def _review_mode_is_enabled(self):
+        return bool(
+            hasattr(self, "review_mode_enabled")
+            and self.review_mode_enabled is not None
+            and self.review_mode_enabled.get()
+        )
+
+    def _toggle_review_mode(self):
+        self.review_mode_enabled.set(not self.review_mode_enabled.get())
+        self._on_review_mode_changed()
+        return "break"
+
+    def _on_review_mode_changed(self):
+        enabled = self._review_mode_is_enabled()
+        if hasattr(self, "status_var") and self.status_var is not None:
+            self.status_var.set("Review Mode enabled" if enabled else "Review Mode disabled")
+        self._update_review_counts_panel()
+        if self.current_image:
+            self.redraw()
+        self.save_config()
+
     def _is_two_click_box_mode(self):
         return self.box_input_mode.get() == BOX_INPUT_TWO_CLICK
 
@@ -9588,6 +10595,12 @@ UI
     def _aoi_polygon_for_use(self):
         return self._sanitize_polygon_points(self.aoi_polygon_points)
 
+    def _copy_zone_polygon_for_use(self):
+        return self._sanitize_polygon_points(getattr(self, "copy_zone_polygon_points", []))
+
+    def _copy_zone_active(self):
+        return len(self._copy_zone_polygon_for_use()) >= 3
+
     def _is_aoi_dialog_open(self):
         return bool(self.aoi_dialog and self.aoi_dialog.winfo_exists())
 
@@ -9608,14 +10621,24 @@ UI
         if self.current_image:
             self._refresh_aoi_overlay()
 
-    def _annotation_center_in_aoi(self, ann, polygon_points=None):
-        polygon_points = self._sanitize_polygon_points(
-            self._aoi_polygon_for_use() if polygon_points is None else polygon_points
-        )
+    def _annotation_center_in_polygon(self, ann, polygon_points):
+        polygon_points = self._sanitize_polygon_points(polygon_points)
         if len(polygon_points) < 3:
             return True
         center = (float(ann[1]), float(ann[2]))
         return self._point_in_polygon(center, polygon_points)
+
+    def _annotation_center_in_aoi(self, ann, polygon_points=None):
+        polygon_points = self._sanitize_polygon_points(
+            self._aoi_polygon_for_use() if polygon_points is None else polygon_points
+        )
+        return self._annotation_center_in_polygon(ann, polygon_points)
+
+    def _annotation_center_in_copy_zone(self, ann, polygon_points=None):
+        polygon_points = self._sanitize_polygon_points(
+            self._copy_zone_polygon_for_use() if polygon_points is None else polygon_points
+        )
+        return self._annotation_center_in_polygon(ann, polygon_points)
 
     def _split_annotations_by_aoi(self, annotations, enforced_class_ids=None, polygon_points=None):
         polygon_points = self._sanitize_polygon_points(
@@ -9714,6 +10737,8 @@ UI
             return
         if self.board_clip_draw_mode is not None:
             self._cancel_board_clip_guide_draw("Board clip drawing cancelled so you can draw the AOI.")
+        if self.copy_zone_draw_active:
+            self._cancel_copy_zone_draw("Copy Zone drawing cancelled so you can draw the AOI.")
         self._cancel_pending_segment(redraw=False)
         self._cancel_box_input_preview()
         self.drag_mode = None
@@ -9751,6 +10776,7 @@ UI
         self.aoi_preview_cursor = None
         self._save_dataset_settings()
         self._refresh_aoi_dialog_state()
+        self._refresh_zero_shot_segment_ui()
         self._refresh_aoi_overlay()
         self.status_var.set(f"AOI saved with {len(self.aoi_polygon_points)} points. Use Enforce All Images when ready.")
 
@@ -9774,9 +10800,160 @@ UI
             self.aoi_draw_active = False
         self._save_dataset_settings()
         self._refresh_aoi_dialog_state()
+        self._refresh_zero_shot_segment_ui()
         if self.current_image:
             self._refresh_aoi_overlay()
         self.status_var.set("AOI cleared.")
+
+    def _on_copy_zone_visibility_changed(self):
+        self.save_config()
+        if self.current_image:
+            self.redraw()
+
+    def start_copy_zone_draw(self):
+        if not self.current_image:
+            self.status_var.set("Load an image before drawing a copy zone.")
+            return
+        if self.board_clip_draw_mode is not None:
+            self._cancel_board_clip_guide_draw("Board clip drawing cancelled so you can draw the copy zone.")
+        if self.aoi_draw_active:
+            self._cancel_aoi_polygon_draw("AOI drawing cancelled so you can draw the copy zone.")
+        self._cancel_pending_segment(redraw=False)
+        self._cancel_box_input_preview()
+        self.drag_mode = None
+        self.active_annotation_index = -1
+        self.edit_selected_index = -1
+        self.active_vertex_index = None
+        self.copy_zone_draw_active = True
+        self.copy_zone_pending_points = []
+        self.copy_zone_preview_cursor = None
+        self.copy_zone_visible.set(True)
+        self.save_config()
+        self.redraw()
+        self.canvas.focus_set()
+        self.status_var.set("Copy Zone draw mode: click polygon points. Enter/C or right-click closes after 3 points.")
+
+    def _cancel_copy_zone_draw(self, message=None):
+        self.copy_zone_draw_active = False
+        self.copy_zone_pending_points = []
+        self.copy_zone_preview_cursor = None
+        if self.current_image:
+            self._refresh_copy_zone_overlay()
+        if message:
+            self.status_var.set(message)
+
+    def finish_pending_copy_zone(self, event=None):
+        if not self.copy_zone_draw_active:
+            return
+        polygon_points = self._sanitize_polygon_points(self.copy_zone_pending_points)
+        if len(polygon_points) < 3:
+            self.status_var.set("Need at least 3 points to close the copy zone.")
+            return
+        self.copy_zone_polygon_points = polygon_points
+        self.copy_zone_draw_active = False
+        self.copy_zone_pending_points = []
+        self.copy_zone_preview_cursor = None
+        self.copy_zone_visible.set(True)
+        self._save_dataset_settings()
+        self.save_config()
+        self._refresh_copy_zone_overlay()
+        self.status_var.set(f"Copy Zone saved with {len(self.copy_zone_polygon_points)} points. J will copy only boxes centered inside it.")
+
+    def undo_pending_copy_zone_point(self, event=None):
+        if not self.copy_zone_draw_active or not self.copy_zone_pending_points:
+            return
+        self.copy_zone_pending_points.pop()
+        if not self.copy_zone_pending_points:
+            self.copy_zone_preview_cursor = None
+            self.status_var.set("Copy Zone draft cleared.")
+        else:
+            self.status_var.set(f"Copy Zone point removed ({len(self.copy_zone_pending_points)} point(s) remain).")
+        self._refresh_copy_zone_overlay()
+
+    def clear_copy_zone(self):
+        self.copy_zone_polygon_points = []
+        if self.copy_zone_draw_active:
+            self.copy_zone_pending_points = []
+            self.copy_zone_preview_cursor = None
+            self.copy_zone_draw_active = False
+        self._save_dataset_settings()
+        if self.current_image:
+            self._refresh_copy_zone_overlay()
+        self.status_var.set("Copy Zone cleared. J will copy by class scope only.")
+
+    def _should_draw_copy_zone_overlay(self):
+        if not self.current_image:
+            return False
+        if self.copy_zone_draw_active:
+            return True
+        return bool(self.copy_zone_visible.get() and self._copy_zone_active())
+
+    def _copy_zone_points_to_canvas(self, points):
+        return [
+            (
+                point[0] * self.current_image.width * self.scale + self.offset_x,
+                point[1] * self.current_image.height * self.scale + self.offset_y,
+            )
+            for point in self._sanitize_polygon_points(points)
+        ]
+
+    def _draw_copy_zone_overlay(self):
+        if not self.current_image or not self._should_draw_copy_zone_overlay():
+            return
+
+        saved_canvas = self._copy_zone_points_to_canvas(self.copy_zone_polygon_points)
+        if len(saved_canvas) >= 3:
+            flat_points = [coord for point in saved_canvas for coord in point]
+            self.canvas.create_line(
+                *flat_points,
+                *saved_canvas[0],
+                fill="#FFD400",
+                width=2,
+                dash=(7, 3),
+                tags="copy_zone_overlay",
+            )
+            for idx, (px, py) in enumerate(saved_canvas):
+                self.canvas.create_oval(px - 4, py - 4, px + 4, py + 4, fill="#FFD400", outline="#1E1E1E", width=1, tags="copy_zone_overlay")
+                if idx == 0:
+                    self.canvas.create_text(px + 10, py - 12, text="COPY ZONE", fill="#FFD400", font=("Arial", 9, "bold"), tags="copy_zone_overlay")
+
+        if self.copy_zone_draw_active and self.copy_zone_pending_points:
+            pending_canvas = self._copy_zone_points_to_canvas(self.copy_zone_pending_points)
+            preview_points = list(pending_canvas)
+            if self.copy_zone_preview_cursor is not None:
+                preview_points.append(self.copy_zone_preview_cursor)
+            flat_preview = [coord for point in preview_points for coord in point]
+            if len(flat_preview) >= 4:
+                self.canvas.create_line(*flat_preview, fill="#FFE66D", width=2, dash=(5, 3), tags="copy_zone_overlay")
+            for idx, (px, py) in enumerate(pending_canvas):
+                fill = "#FFE66D" if idx == 0 else "#FFFFFF"
+                outline = "#B8860B" if idx == 0 else "#FF6600"
+                self.canvas.create_oval(px - 5, py - 5, px + 5, py + 5, fill=fill, outline=outline, width=2, tags="copy_zone_overlay")
+                self.canvas.create_text(px + 12, py - 12, text=str(idx + 1), fill="#FFE66D", font=("Arial", 9, "bold"), tags="copy_zone_overlay")
+            if len(pending_canvas) >= 3:
+                first_x, first_y = pending_canvas[0]
+                self.canvas.create_oval(
+                    first_x - 16,
+                    first_y - 16,
+                    first_x + 16,
+                    first_y + 16,
+                    outline="#FFE66D",
+                    dash=(3, 3),
+                    width=1,
+                    tags="copy_zone_overlay",
+                )
+                self.canvas.create_text(first_x + 18, first_y + 14, text="close", fill="#FFE66D", anchor=NW, font=("Arial", 9, "bold"), tags="copy_zone_overlay")
+
+        self.canvas.tag_raise("copy_zone_overlay")
+
+    def _refresh_copy_zone_overlay(self):
+        if not self.current_image:
+            return
+        self.canvas.delete("copy_zone_overlay")
+        if self._should_draw_copy_zone_overlay():
+            self._draw_copy_zone_overlay()
+        if self.crosshair_lines:
+            self.canvas.tag_raise("crosshair")
 
     def _draw_aoi_overlay(self):
         if not self.current_image or not self._should_draw_aoi_overlay():
@@ -10083,6 +11260,9 @@ UI
             self.redraw()
 
     def finish_pending_segment(self, event=None):
+        if self.copy_zone_draw_active:
+            self.finish_pending_copy_zone(event=event)
+            return
         if self.aoi_draw_active:
             self.finish_pending_aoi_polygon(event=event)
             return
@@ -10106,6 +11286,9 @@ UI
         self.status_var.set(f"Segmentation saved with {point_count} points for class {self.selected_class_id}")
 
     def undo_pending_segment_point(self, event=None):
+        if self.copy_zone_draw_active:
+            self.undo_pending_copy_zone_point(event=event)
+            return
         if self.aoi_draw_active:
             self.undo_pending_aoi_point(event=event)
             return
@@ -10505,6 +11688,154 @@ UI
         self.redraw()
         self.status_var.set(f"Repeated box (class {self.selected_class_id}) - R again or move box")
     
+    def _show_only_selected_class_enabled(self):
+        value = getattr(self, "show_only_selected_class", None)
+        try:
+            return bool(value.get())
+        except Exception:
+            return bool(value)
+
+    def _selected_class_scope_label(self, class_id=None):
+        try:
+            class_id = int(self.selected_class_id if class_id is None else class_id)
+        except (TypeError, ValueError):
+            class_id = 0
+
+        classes = getattr(self, "classes", []) or []
+        if 0 <= class_id < len(classes):
+            return f"class {class_id} ({classes[class_id]})"
+        return f"class {class_id}"
+
+    def _copy_current_repeat_scope(self):
+        annotations = getattr(self, "annotations", []) or []
+
+        if self._show_only_selected_class_enabled():
+            try:
+                selected_class_id = int(getattr(self, "selected_class_id", 0))
+            except (TypeError, ValueError):
+                selected_class_id = 0
+
+            scoped_annotations = []
+            for ann in annotations:
+                try:
+                    if int(ann[0]) == selected_class_id:
+                        scoped_annotations.append(ann)
+                except (TypeError, ValueError, IndexError):
+                    continue
+            scope_label = self._selected_class_scope_label(selected_class_id)
+        else:
+            scoped_annotations = list(annotations)
+            scope_label = "all classes"
+
+        zone_skipped = 0
+        copy_zone_points = self._copy_zone_polygon_for_use()
+        if len(copy_zone_points) >= 3:
+            before_zone_count = len(scoped_annotations)
+            scoped_annotations = [
+                ann for ann in scoped_annotations
+                if self._annotation_center_in_copy_zone(ann, polygon_points=copy_zone_points)
+            ]
+            zone_skipped = before_zone_count - len(scoped_annotations)
+            scope_label = f"{scope_label}, copy zone"
+
+        return self._copy_annotations(scoped_annotations), scope_label, zone_skipped
+
+    def _clamp_repeated_annotation(self, ann, min_size=0.001):
+        if self._is_polygon_annotation(ann):
+            return self._clamp_annotation(ann, min_size=min_size)
+
+        cid, cx, cy, w, h = ann[:5]
+        w = max(min_size, min(1.0, abs(float(w))))
+        h = max(min_size, min(1.0, abs(float(h))))
+        cx = max(w / 2, min(1.0 - w / 2, float(cx)))
+        cy = max(h / 2, min(1.0 - h / 2, float(cy)))
+        return [int(cid), cx, cy, w, h]
+
+    def _paste_repeat_annotations(self, source_annotations):
+        pasted = 0
+        removed = 0
+
+        if not self.current_image or not source_annotations:
+            return pasted, removed
+
+        candidates = [
+            self._clamp_repeated_annotation(self._copy_annotation(new_ann))
+            for new_ann in source_annotations
+        ]
+        if not candidates:
+            return pasted, removed
+
+        self._push_annotation_undo()
+        original_annotations = list(self.annotations)
+        remove_indices = set()
+
+        for candidate_ann in candidates:
+            candidate_class_id = int(candidate_ann[0])
+            new_box = (candidate_ann[1], candidate_ann[2], candidate_ann[3], candidate_ann[4])
+            for i, existing in enumerate(original_annotations):
+                try:
+                    same_class = int(existing[0]) == candidate_class_id
+                except (TypeError, ValueError, IndexError):
+                    same_class = False
+                if same_class:
+                    existing_box = (existing[1], existing[2], existing[3], existing[4])
+                    if self._boxes_overlap(new_box, existing_box, threshold=0.3):
+                        remove_indices.add(i)
+
+        for i in sorted(remove_indices, reverse=True):
+            del self.annotations[i]
+            removed += 1
+
+        for candidate_ann in candidates:
+            self.annotations.append(candidate_ann)
+            pasted += 1
+
+        if pasted > 0 or removed > 0:
+            self.annotations_dirty = True
+            self.save_annotations()
+            self.redraw()
+
+        return pasted, removed
+
+    def copy_current_scope_and_next(self, e=None):
+        """Copy all current annotations, or the selected class in Solo Class mode, to the next image."""
+        if not self.current_image:
+            self.next_image()
+            return
+
+        self.repeat_clipboard, scope_label, zone_skipped = self._copy_current_repeat_scope()
+        copied_count = len(self.repeat_clipboard)
+
+        self.next_image()
+
+        pasted, removed = self._paste_repeat_annotations(self.repeat_clipboard)
+
+        if copied_count > 0 and pasted > 0:
+            noun = "annotation" if copied_count == 1 else "annotations"
+            msg = f"Copied {copied_count} {noun} ({scope_label}) to next image"
+            if removed > 0:
+                msg += f" (replaced {removed})"
+            if zone_skipped > 0:
+                msg += f"; zone skipped {zone_skipped}"
+            self.status_var.set(msg)
+        elif copied_count > 0:
+            noun = "annotation" if copied_count == 1 else "annotations"
+            msg = f"Copied {copied_count} {noun} ({scope_label}), but nothing was pasted"
+            if zone_skipped > 0:
+                msg += f"; zone skipped {zone_skipped}"
+            self.status_var.set(msg)
+        else:
+            msg = f"No annotations to copy ({scope_label}); moved to next image"
+            if zone_skipped > 0:
+                msg += f"; zone skipped {zone_skipped}"
+            self.status_var.set(msg)
+
+        if hasattr(self, "canvas") and self.canvas is not None:
+            try:
+                self.canvas.focus_set()
+            except Exception:
+                pass
+
     def repeat_and_next(self, e=None):
         """Copy selected annotations to clipboard, go to next image, then paste (Y key).
         
@@ -10537,34 +11868,7 @@ UI
         self.next_image()
         
         # Step 3: Paste clipboard if it has content
-        pasted = 0
-        removed = 0
-        if self.repeat_clipboard:
-            # Save state for undo BEFORE pasting
-            self._push_annotation_undo()
-            for new_ann in self.repeat_clipboard:
-                candidate_ann = self._clamp_annotation(self._copy_annotation(new_ann))
-
-                # Find and remove any overlapping annotations of the same class
-                new_box = (candidate_ann[1], candidate_ann[2], candidate_ann[3], candidate_ann[4])
-                to_remove = []
-                for i, existing in enumerate(self.annotations):
-                    if existing[0] == candidate_ann[0]:  # Same class
-                        existing_box = (existing[1], existing[2], existing[3], existing[4])
-                        if self._boxes_overlap(new_box, existing_box, threshold=0.3):
-                            to_remove.append(i)
-                
-                # Remove overlapping (in reverse order to maintain indices)
-                for i in reversed(to_remove):
-                    del self.annotations[i]
-                    removed += 1
-                
-                # Add the new annotation
-                self.annotations.append(candidate_ann)
-                pasted += 1
-            
-            self.save_annotations()
-            self.redraw()
+        pasted, removed = self._paste_repeat_annotations(self.repeat_clipboard)
         
         # Status message
         if copied_count > 0 and pasted > 0:
@@ -10804,6 +12108,7 @@ UI
             or self.first_click_point
             or self.pending_segment_points
             or self.aoi_draw_active
+            or self.copy_zone_draw_active
             or self.board_clip_draw_mode is not None
             or self.pan_active
         )
@@ -11067,6 +12372,141 @@ UI
         
         self.stats_current_classes_var.set("\n".join(breakdown_parts))
 
+    def _annotation_class_id(self, ann):
+        try:
+            return int(float(ann[0]))
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def _class_display_name(self, cid):
+        if cid is not None and 0 <= cid < len(self.classes):
+            return self.classes[cid]
+        return str(cid) if cid is not None else "Unknown"
+
+    def _annotation_is_visible_in_current_scope(self, ann):
+        if not getattr(self, "show_only_selected_class", None) or not self.show_only_selected_class.get():
+            return True
+        return self._annotation_class_id(ann) == self.selected_class_id
+
+    def _get_visible_annotation_counts(self):
+        """Return counts for annotations currently visible on the canvas."""
+        counts = {}
+        for ann in getattr(self, "annotations", []):
+            if not self._annotation_is_visible_in_current_scope(ann):
+                continue
+            cid = self._annotation_class_id(ann)
+            counts[cid] = counts.get(cid, 0) + 1
+        return sum(counts.values()), counts
+
+    def _review_count_rows(self):
+        total, class_counts = self._get_visible_annotation_counts()
+        rows = []
+        if self.show_only_selected_class.get():
+            selected_cid = self.selected_class_id
+            rows.append((selected_cid, class_counts.get(selected_cid, 0)))
+        else:
+            rows.extend((cid, class_counts[cid]) for cid in sorted(class_counts, key=lambda item: item if item is not None else -1))
+        return total, rows
+
+    def _clear_review_counts_panel(self):
+        if not hasattr(self, "review_counts_inner") or self.review_counts_inner is None:
+            return
+        for child in self.review_counts_inner.winfo_children():
+            child.destroy()
+
+    def _refresh_review_counts_panel_visibility(self):
+        if not hasattr(self, "review_counts_panel") or self.review_counts_panel is None:
+            return
+
+        if self._review_mode_is_enabled():
+            target_width = max(320, int(round(380 * self.ui_scale)))
+            gap = max(6, int(round(8 * self.ui_scale)))
+            try:
+                self.canvas_container.update_idletasks()
+            except tk.TclError:
+                pass
+            container_height = max(1, self.canvas_container.winfo_height())
+            canvas_left = self.canvas.winfo_x() if hasattr(self, "canvas") and self.canvas is not None else 0
+            image_left = canvas_left + max(0, int(round(getattr(self, "offset_x", 0))))
+            available_left = max(0, image_left - gap)
+            min_width = max(190, int(round(220 * self.ui_scale)))
+            width = target_width
+            x = max(0, image_left - gap - width)
+            if available_left >= min_width:
+                width = min(target_width, available_left)
+                x = image_left - gap - width
+            elif image_left > gap:
+                width = max(120, available_left)
+                x = max(0, image_left - gap - width)
+            self.review_counts_panel.configure(width=width, height=container_height)
+            self.review_counts_panel.place(x=x, y=0, width=width, height=container_height)
+            self.review_counts_panel.lift()
+        elif self.review_counts_panel.winfo_manager():
+            self.review_counts_panel.place_forget()
+
+    def _update_review_counts_panel(self):
+        if not hasattr(self, "review_counts_panel") or self.review_counts_panel is None:
+            return
+
+        self._refresh_review_counts_panel_visibility()
+        self._clear_review_counts_panel()
+        if not self._review_mode_is_enabled():
+            return
+
+        total, rows = self._review_count_rows()
+        panel_width = max(120, self.review_counts_panel.winfo_width() - max(36, int(round(44 * self.ui_scale))))
+        total_font = ("Arial", max(22, int(round(28 * self.ui_scale))), "bold")
+        label_font = ("Arial", max(24, int(round(30 * self.ui_scale))), "bold")
+        number_font = ("Arial", max(72, int(round(92 * self.ui_scale))), "bold")
+        empty_font = ("Arial", max(22, int(round(28 * self.ui_scale))), "bold")
+
+        tk.Label(
+            self.review_counts_inner,
+            text=f"Total: {total}",
+            bg="#111111",
+            fg="#FFFFFF",
+            font=total_font,
+            anchor="w",
+            justify=LEFT,
+        ).pack(fill=X, anchor=W, pady=(0, max(18, int(round(28 * self.ui_scale)))))
+
+        if rows:
+            for cid, count in rows:
+                color = self.class_colors.get(cid, "#FFFFFF")
+                label = self._class_display_name(cid)
+                row_frame = tk.Frame(self.review_counts_inner, bg="#111111")
+                row_frame.pack(fill=X, anchor=W, pady=(0, max(22, int(round(34 * self.ui_scale)))))
+                tk.Label(
+                    row_frame,
+                    text=f"{label}:",
+                    bg="#111111",
+                    fg=color,
+                    font=label_font,
+                    anchor="w",
+                    justify=LEFT,
+                    wraplength=panel_width,
+                ).pack(fill=X, anchor=W)
+                tk.Label(
+                    row_frame,
+                    text=str(count),
+                    bg="#111111",
+                    fg=color,
+                    font=number_font,
+                    anchor="w",
+                    justify=LEFT,
+                ).pack(fill=X, anchor=W, pady=(0, 0))
+        else:
+            tk.Label(
+                self.review_counts_inner,
+                text="No annotations",
+                bg="#111111",
+                fg="#D8D8D8",
+                font=empty_font,
+                anchor="w",
+                justify=LEFT,
+                wraplength=panel_width,
+            ).pack(fill=X, anchor=W)
+
     def _get_display_photo_image(self, width, height):
         cache_key = (id(self.current_image), int(width), int(height))
         if self.photo_cache_key == cache_key and self.photo_cache_image is not None:
@@ -11113,10 +12553,8 @@ UI
         # Draw Annotations
         if not hide_annotations_for_edge_mode:
             for i, ann in enumerate(self.annotations):
-                # Filter by selected class if toggle is enabled
-                if self.show_only_selected_class.get():
-                    if ann[0] != self.selected_class_id:
-                        continue  # Skip annotations that don't match selected class
+                if not self._annotation_is_visible_in_current_scope(ann):
+                    continue
                 self.draw_annotation(i, ann)
 
         self._draw_pending_segment_preview()
@@ -11124,7 +12562,9 @@ UI
         self._draw_board_clip_guides()
         self._draw_board_clip_mode_overlay()
         self._draw_aoi_overlay()
+        self._draw_copy_zone_overlay()
         self._refresh_box_input_overlay()
+        self._update_review_counts_panel()
             
         # Ensure Crosshair stays on top if it exists
         if self.crosshair_lines:
@@ -11155,30 +12595,42 @@ UI
         sy2 = y2_px * self.scale + self.offset_y
         
         color = self.class_colors.get(cid, "#FFFFFF")
+        review_mode = self._review_mode_is_enabled()
         
         # Determine outline width/style (highlight if selected or moving)
-        width = 2
+        width = 5 if review_mode else 2
         dash = None
         is_selected = index in self.selected_annotations
         
         if index == self.active_annotation_index:
-             width = 3
+             width = 6 if review_mode else 3
              color = "#FFFF00"  # Yellow for actively being dragged
         elif is_selected:
-             width = 3
+             width = 6 if review_mode else 3
              color = self.SELECTED_COLOR  # Cyan for multi-selected
-        
+        display_color = color
+         
         is_polygon = self._is_polygon_annotation(ann)
         fill_color = ""
         stipple = ""
         if self.annotation_fill_enabled.get():
-            fill_color = color
+            fill_color = display_color
             stipple = "gray25"
         if is_polygon:
             canvas_points = self._canvas_polygon_points(ann)
             flat_points = [coord for point in canvas_points for coord in point]
+            if review_mode:
+                for halo_color, halo_width in (("#000000", width + 6), ("#FFFFFF", width + 3)):
+                    self.canvas.create_polygon(
+                        *flat_points,
+                        outline=halo_color,
+                        fill="",
+                        width=halo_width,
+                        dash=dash,
+                        tags=f"ann_{index}",
+                    )
             polygon_kwargs = {
-                "outline": color,
+                "outline": display_color,
                 "fill": fill_color,
                 "width": width,
                 "dash": dash,
@@ -11188,8 +12640,21 @@ UI
                 polygon_kwargs["stipple"] = stipple
             self.canvas.create_polygon(*flat_points, **polygon_kwargs)
         else:
+            if review_mode:
+                for halo_color, halo_width in (("#000000", width + 6), ("#FFFFFF", width + 3)):
+                    self.canvas.create_rectangle(
+                        sx1,
+                        sy1,
+                        sx2,
+                        sy2,
+                        outline=halo_color,
+                        fill="",
+                        width=halo_width,
+                        dash=dash,
+                        tags=f"ann_{index}",
+                    )
             rectangle_kwargs = {
-                "outline": color,
+                "outline": display_color,
                 "fill": fill_color,
                 "width": width,
                 "dash": dash,
@@ -11206,8 +12671,37 @@ UI
         if is_selected:
             label = "✓ " + label  # Add checkmark to indicate selection
         
-        self.canvas.create_text(sx1, sy1-10, text=label, fill=color, anchor=SW, font=("Arial", 11, "bold"))
-        
+        label_font = ("Arial", 15, "bold") if review_mode else ("Arial", 11, "bold")
+        label_y = sy1 - 10
+        text_id = self.canvas.create_text(
+            sx1,
+            label_y,
+            text=label,
+            fill=display_color,
+            anchor=SW,
+            font=label_font,
+            tags=f"ann_{index}",
+        )
+        if review_mode:
+            bbox = self.canvas.bbox(text_id)
+            if bbox and bbox[1] < 2:
+                self.canvas.move(text_id, 0, 2 - bbox[1])
+                bbox = self.canvas.bbox(text_id)
+            if bbox:
+                pad_x = 5
+                pad_y = 3
+                bg_id = self.canvas.create_rectangle(
+                    bbox[0] - pad_x,
+                    bbox[1] - pad_y,
+                    bbox[2] + pad_x,
+                    bbox[3] + pad_y,
+                    fill="#111111",
+                    outline=display_color,
+                    width=1,
+                    tags=f"ann_{index}",
+                )
+                self.canvas.tag_lower(bg_id, text_id)
+         
         # Draw resize handles on the selected-for-editing annotation
         if self.edit_mode.get() and not self.draw_only_mode.get():
             is_edit_selected = (index == self.edit_selected_index)
@@ -11665,6 +13159,10 @@ UI
             self._cancel_aoi_polygon_draw("AOI drawing cancelled.")
             return
 
+        if self.copy_zone_draw_active:
+            self._cancel_copy_zone_draw("Copy Zone drawing cancelled.")
+            return
+
         if self.pending_segment_points:
             self._cancel_pending_segment(redraw=True)
             self.status_var.set("Segmentation draft cancelled")
@@ -11733,6 +13231,18 @@ UI
 
     def on_mouse_down(self, event):
         if not self.current_image: return
+
+        if self.copy_zone_draw_active:
+            if self.copy_zone_pending_points and self._is_close_to_polygon_start(event.x, event.y, self.copy_zone_pending_points) and len(self.copy_zone_pending_points) >= 3:
+                self.finish_pending_copy_zone()
+            else:
+                self.copy_zone_pending_points.append(self._canvas_to_norm_point(event.x, event.y))
+                self.copy_zone_preview_cursor = (event.x, event.y)
+                self._refresh_copy_zone_overlay()
+                self.status_var.set(
+                    f"Copy Zone point {len(self.copy_zone_pending_points)} added. Keep clicking or press Enter/C to close."
+                )
+            return
 
         if self.aoi_draw_active:
             if self.aoi_pending_points and self._is_close_to_polygon_start(event.x, event.y, self.aoi_pending_points) and len(self.aoi_pending_points) >= 3:
@@ -12060,6 +13570,9 @@ UI
     def on_mouse_move(self, event):
         """Ultra-responsive crosshair update - optimized for 240fps+."""
         self.last_mouse_canvas = (event.x, event.y)
+        if self.copy_zone_draw_active:
+            self.copy_zone_preview_cursor = (event.x, event.y)
+            self._refresh_copy_zone_overlay()
         if self.aoi_draw_active:
             self.aoi_preview_cursor = (event.x, event.y)
             self._refresh_aoi_overlay()
@@ -12341,6 +13854,12 @@ UI
             )
 
     def on_right_click(self, event):
+        if self.copy_zone_draw_active:
+            if len(self.copy_zone_pending_points) >= 3:
+                self.finish_pending_copy_zone()
+            else:
+                self._cancel_copy_zone_draw("Copy Zone drawing cancelled.")
+            return
         if self.aoi_draw_active:
             if len(self.aoi_pending_points) >= 3:
                 self.finish_pending_aoi_polygon()
@@ -13598,12 +15117,41 @@ UI
         dlg.protocol("WM_DELETE_WINDOW", close_dialog)
         self._refresh_board_clip_dialog_state()
 
-    def auto_annotate_people_all(self):
+    def auto_annotate_best_person_all(self):
+        target_class_id = self._require_person_label_class_id()
+        if target_class_id is None:
+            return
+        return self.auto_annotate_people_all(
+            model_entries=[self._best_people_model_entry()],
+            missing_paths=[],
+            target_class_id=target_class_id,
+            action_label="Best person",
+            no_models_title="Best Person Model",
+            no_models_message=(
+                f"The managed {BEST_PERSON_MODEL_LABEL} model could not be prepared."
+            ),
+            load_message=f"Loading {BEST_PERSON_MODEL_LABEL}...",
+        )
+
+    def auto_annotate_people_all(
+        self,
+        model_entries=None,
+        missing_paths=None,
+        target_class_id=None,
+        action_label="People",
+        no_models_title="No People Models",
+        no_models_message=None,
+        load_message="Loading people models...",
+    ):
         if not self.image_paths:
             messagebox.showerror("No Images", "Load a workspace or image folder first.")
             return
 
-        model_entries, missing_paths = self._active_people_model_entries()
+        if model_entries is None:
+            model_entries, missing_paths = self._active_people_model_entries()
+        elif missing_paths is None:
+            missing_paths = []
+
         if missing_paths:
             self._warn_people_model_errors(
                 [f"Missing model file: {path}" for path in missing_paths],
@@ -13611,8 +15159,9 @@ UI
             )
         if not model_entries:
             messagebox.showerror(
-                "No People Models",
-                "No enabled people models are available.\n\nFix the saved model paths or add a new people model first.",
+                no_models_title,
+                no_models_message
+                or "No enabled people models are available.\n\nFix the saved model paths or add a new people model first.",
             )
             return
 
@@ -13620,7 +15169,11 @@ UI
             self.save_annotations(force=True)
 
         image_paths = list(self.image_paths)
-        target_class_id = self._resolved_people_target_class_id()
+        target_class_id = (
+            self._resolved_people_target_class_id()
+            if target_class_id is None else
+            int(target_class_id)
+        )
         target_confidence = self.class_confidence_thresholds.get(
             target_class_id,
             self.default_confidence_threshold,
@@ -13631,14 +15184,14 @@ UI
         save_format_mode_snapshot = self.save_format_mode.get()
 
         top = tb.Toplevel(self.root)
-        top.title("People Auto Annotating...")
+        top.title(f"{action_label} Auto Annotating...")
         top.geometry("500x170")
         top.transient(self.root)
         top.protocol("WM_DELETE_WINDOW", lambda: None)
 
         pb = tb.Progressbar(top, maximum=len(image_paths))
         pb.pack(fill=X, padx=20, pady=(20, 6))
-        lbl_status = tb.Label(top, text="Loading people models...", font=("Consolas", 9))
+        lbl_status = tb.Label(top, text=load_message, font=("Consolas", 9))
         lbl_status.pack(pady=2)
         lbl_speed = tb.Label(top, text="", font=("Arial", 8), foreground="#888")
         lbl_speed.pack(pady=0)
@@ -13680,7 +15233,7 @@ UI
             for error in load_errors:
                 add_error(error)
             if not people_runtimes:
-                progress["error"] = "No enabled people models could be loaded."
+                progress["error"] = f"No {action_label.lower()} models could be loaded."
                 progress["done"] = True
                 return
 
@@ -13756,7 +15309,7 @@ UI
             lbl_status.config(
                 text=(
                     f"Processed {processed}/{total}  |  "
-                    f"added {progress['cnt']} people boxes"
+                    f"added {progress['cnt']} person boxes"
                 )
             )
 
@@ -13772,18 +15325,18 @@ UI
                 top.destroy()
 
                 if progress["error"]:
-                    messagebox.showerror("People Auto-Annotate Failed", progress["error"])
-                    self.status_var.set("People auto-annotate failed")
+                    messagebox.showerror(f"{action_label} Auto-Annotate Failed", progress["error"])
+                    self.status_var.set(f"{action_label} auto-annotate failed")
                     return
 
-                msg = f"People batch done: added {progress['cnt']} boxes"
+                msg = f"{action_label} batch done: added {progress['cnt']} boxes"
                 if progress["candidate_count"] > 0 and not allow_overlap:
                     msg += f", skipped {progress['skipped_overlap']} overlaps"
                 if progress["unchanged_images"] > 0:
                     msg += f", {progress['unchanged_images']} images unchanged"
                 if cancel_flag["cancelled"]:
                     msg = (
-                        f"People batch cancelled: added {progress['cnt']} boxes "
+                        f"{action_label} batch cancelled: added {progress['cnt']} boxes "
                         f"({progress['i']}/{total} processed)"
                     )
                 current_path = self.current_file_path
@@ -13799,7 +15352,7 @@ UI
                 if progress["model_errors"]:
                     self._warn_people_model_errors(
                         progress["model_errors"],
-                        "People Auto-Annotate Warnings",
+                        f"{action_label} Auto-Annotate Warnings",
                     )
                 return
 

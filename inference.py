@@ -2,6 +2,7 @@ import numpy as np
 import cv2
 import os
 import sys
+import tempfile
 
 _tflite_import_errors = []
 _TFLITE_BACKEND = ""
@@ -359,3 +360,394 @@ class PyTorchYOLOModel:
                     scores_list.append(float(confidences[i]))
         
         return boxes_list, classes_list, scores_list
+
+
+def _ensure_rgb_numpy(image):
+    """Return an RGB numpy image for Ultralytics runtimes."""
+    if not isinstance(image, np.ndarray):
+        image = np.array(image)
+
+    if len(image.shape) == 3 and image.shape[2] == 4:
+        image = image[:, :, :3]
+    elif len(image.shape) == 2:
+        image = np.stack([image, image, image], axis=-1)
+
+    return np.ascontiguousarray(image)
+
+
+def _to_numpy(value):
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        return value.numpy()
+    return np.array(value)
+
+
+def _sanitize_segment_points(points):
+    cleaned = []
+    for point in points or []:
+        if len(point) < 2:
+            continue
+        x = max(0.0, min(1.0, float(point[0])))
+        y = max(0.0, min(1.0, float(point[1])))
+        if cleaned and abs(cleaned[-1][0] - x) < 1e-6 and abs(cleaned[-1][1] - y) < 1e-6:
+            continue
+        cleaned.append([x, y])
+
+    if (
+        len(cleaned) > 1
+        and abs(cleaned[0][0] - cleaned[-1][0]) < 1e-6
+        and abs(cleaned[0][1] - cleaned[-1][1]) < 1e-6
+    ):
+        cleaned.pop()
+    return cleaned
+
+
+def _normalized_box_to_polygon(box):
+    cx, cy, w, h = [float(value) for value in box]
+    left = max(0.0, min(1.0, cx - w / 2))
+    top = max(0.0, min(1.0, cy - h / 2))
+    right = max(0.0, min(1.0, cx + w / 2))
+    bottom = max(0.0, min(1.0, cy + h / 2))
+    return [[left, top], [right, top], [right, bottom], [left, bottom]]
+
+
+def _points_to_box(points):
+    xs = [float(point[0]) for point in points]
+    ys = [float(point[1]) for point in points]
+    left, right = min(xs), max(xs)
+    top, bottom = min(ys), max(ys)
+    return [
+        (left + right) / 2,
+        (top + bottom) / 2,
+        max(0.0, right - left),
+        max(0.0, bottom - top),
+    ]
+
+
+def _simplify_segment_points(points, image_shape, epsilon_ratio=0.002, max_points=240):
+    points = _sanitize_segment_points(points)
+    if len(points) < 3:
+        return []
+
+    height, width = image_shape[:2]
+    contour = np.array(
+        [[point[0] * width, point[1] * height] for point in points],
+        dtype=np.float32,
+    ).reshape(-1, 1, 2)
+    perimeter = float(cv2.arcLength(contour, True))
+    if perimeter <= 0:
+        return points
+
+    epsilon = max(0.75, perimeter * float(epsilon_ratio))
+    simplified = cv2.approxPolyDP(contour, epsilon, True)
+
+    while len(simplified) > max_points and epsilon < perimeter * 0.08:
+        epsilon *= 1.4
+        simplified = cv2.approxPolyDP(contour, epsilon, True)
+
+    normalized = [
+        [float(point[0][0]) / width, float(point[0][1]) / height]
+        for point in simplified
+    ]
+    cleaned = _sanitize_segment_points(normalized)
+    return cleaned if len(cleaned) >= 3 else points
+
+
+def _mask_to_segment_points(mask, image_shape):
+    height, width = image_shape[:2]
+    mask = np.asarray(mask)
+    if mask.ndim > 2:
+        mask = mask.squeeze()
+    if mask.shape[:2] != (height, width):
+        mask = cv2.resize(mask.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+
+    mask_u8 = (mask > 0.5).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+
+    contour = max(contours, key=cv2.contourArea)
+    points = [
+        [float(point[0][0]) / width, float(point[0][1]) / height]
+        for point in contour
+    ]
+    return _simplify_segment_points(points, image_shape)
+
+
+def _extract_result_box_records(result, image_shape):
+    boxes_obj = getattr(result, "boxes", None)
+    if boxes_obj is None or len(boxes_obj) == 0:
+        return []
+
+    xyxy = _to_numpy(getattr(boxes_obj, "xyxy", None))
+    classes = _to_numpy(getattr(boxes_obj, "cls", None))
+    scores = _to_numpy(getattr(boxes_obj, "conf", None))
+    if xyxy is None:
+        return []
+
+    height, width = image_shape[:2]
+    records = []
+    for idx, coords in enumerate(xyxy):
+        x1, y1, x2, y2 = [float(value) for value in coords[:4]]
+        box_width = max(0.0, x2 - x1)
+        box_height = max(0.0, y2 - y1)
+        records.append(
+            {
+                "bbox": [
+                    (x1 + box_width / 2) / width,
+                    (y1 + box_height / 2) / height,
+                    box_width / width,
+                    box_height / height,
+                ],
+                "class_index": int(classes[idx]) if classes is not None and idx < len(classes) else 0,
+                "score": float(scores[idx]) if scores is not None and idx < len(scores) else 1.0,
+            }
+        )
+    return records
+
+
+def extract_ultralytics_segments(results, image_shape, prompts=None, max_points=240):
+    """
+    Convert Ultralytics segmentation results into normalized polygon records.
+
+    Returns dictionaries with:
+      points, bbox, class_index, score, prompt, from_mask
+    """
+    if results is None:
+        return []
+    if not isinstance(results, (list, tuple)):
+        results = [results]
+    if not results:
+        return []
+
+    prompts = list(prompts or [])
+    records = []
+    for result in results:
+        box_records = _extract_result_box_records(result, image_shape)
+        masks_obj = getattr(result, "masks", None)
+        polygons = []
+
+        if masks_obj is not None:
+            xyn = getattr(masks_obj, "xyn", None)
+            if xyn is not None:
+                for poly in xyn:
+                    arr = _to_numpy(poly)
+                    if arr is None:
+                        continue
+                    polygons.append(_simplify_segment_points(arr[:, :2].tolist(), image_shape, max_points=max_points))
+
+            if not polygons:
+                data = _to_numpy(getattr(masks_obj, "data", None))
+                if data is not None:
+                    if data.ndim == 2:
+                        data = np.expand_dims(data, axis=0)
+                    for mask in data:
+                        polygons.append(_mask_to_segment_points(mask, image_shape))
+
+        count = max(len(polygons), len(box_records))
+        for idx in range(count):
+            box_record = box_records[idx] if idx < len(box_records) else None
+            points = polygons[idx] if idx < len(polygons) else []
+            from_mask = len(points) >= 3
+
+            if not points and box_record is not None:
+                points = _normalized_box_to_polygon(box_record["bbox"])
+
+            points = _sanitize_segment_points(points)
+            if len(points) < 3:
+                continue
+
+            bbox = box_record["bbox"] if box_record is not None else _points_to_box(points)
+            class_index = box_record["class_index"] if box_record is not None else 0
+            score = box_record["score"] if box_record is not None else 1.0
+            records.append(
+                {
+                    "points": points,
+                    "bbox": bbox,
+                    "class_index": int(class_index),
+                    "score": float(score),
+                    "prompt": prompts[int(class_index)] if 0 <= int(class_index) < len(prompts) else None,
+                    "from_mask": from_mask,
+                }
+            )
+
+    return records
+
+
+class UltralyticsPromptSegmentModel:
+    """
+    Runtime wrapper for zero-shot/promptable Ultralytics segmentation models.
+
+    Supported backends:
+      - yoloe: text-prompted open-vocabulary instance segmentation
+      - sam3: SAM 3 concept segmentation with text prompts or exemplar boxes
+      - sam_visual: SAM/SAM2/SAM3 visual prompting from boxes/points
+    """
+
+    def __init__(self, model_name, backend="yoloe", imgsz=None, half=False):
+        self.model_name = str(model_name or "").strip()
+        self.backend = str(backend or "yoloe").strip().lower()
+        self.imgsz = imgsz
+        self.half = bool(half)
+        self._class_prompts = None
+
+        if not self.model_name:
+            raise ValueError("A model name or path is required.")
+
+        if self.backend == "yoloe":
+            try:
+                from ultralytics import YOLOE
+            except ImportError:
+                raise ImportError(
+                    "Ultralytics YOLOE is not installed. Install the optional .pt backend with:\n"
+                    "  python -m pip install -r requirements-pt.txt"
+                )
+            self.model = YOLOE(self.model_name)
+            self.predictor = None
+        elif self.backend == "sam3":
+            try:
+                from ultralytics.models.sam import SAM3SemanticPredictor
+            except ImportError as exc:
+                raise ImportError(
+                    "SAM 3 concept segmentation needs ultralytics with SAM3SemanticPredictor.\n"
+                    "Install or upgrade the optional .pt backend:\n"
+                    "  python -m pip install -U ultralytics"
+                ) from exc
+            if not os.path.exists(self.model_name):
+                raise FileNotFoundError(
+                    f"SAM 3 weights were not found: {self.model_name}\n"
+                    "Download sam3.pt after receiving model access, then choose its path in this app."
+                )
+            overrides = {
+                "conf": 0.25,
+                "task": "segment",
+                "mode": "predict",
+                "model": self.model_name,
+                "half": self.half,
+                "verbose": False,
+                "save": False,
+            }
+            if self.imgsz is not None:
+                overrides["imgsz"] = self.imgsz
+            self.predictor = SAM3SemanticPredictor(overrides=overrides)
+            self.model = None
+        elif self.backend == "sam_visual":
+            try:
+                from ultralytics import SAM
+            except ImportError:
+                raise ImportError(
+                    "Ultralytics SAM is not installed. Install the optional .pt backend with:\n"
+                    "  python -m pip install -r requirements-pt.txt"
+                )
+            self.model = SAM(self.model_name)
+            self.predictor = None
+        else:
+            raise ValueError(f"Unsupported prompt segmentation backend: {self.backend}")
+
+    def _prediction_kwargs(self, confidence_threshold, iou_threshold):
+        kwargs = {
+            "conf": float(confidence_threshold),
+            "verbose": False,
+        }
+        if iou_threshold is not None:
+            kwargs["iou"] = float(iou_threshold)
+        if self.imgsz is not None:
+            kwargs["imgsz"] = self.imgsz
+        return kwargs
+
+    def _ensure_yoloe_prompts(self, prompts):
+        prompts = [str(prompt).strip() for prompt in prompts or [] if str(prompt).strip()]
+        if not prompts:
+            raise ValueError("Enter at least one text prompt for YOLOE.")
+        prompt_key = tuple(prompts)
+        if self._class_prompts != prompt_key:
+            self.model.set_classes(prompts)
+            self._class_prompts = prompt_key
+        return prompts
+
+    def _bboxes_to_pixels(self, bboxes, image_shape):
+        if not bboxes:
+            return None
+        height, width = image_shape[:2]
+        pixel_boxes = []
+        for box in bboxes:
+            if len(box) != 4:
+                continue
+            left, top, right, bottom = [float(value) for value in box]
+            if max(abs(left), abs(top), abs(right), abs(bottom)) <= 1.5:
+                left, right = left * width, right * width
+                top, bottom = top * height, bottom * height
+            pixel_boxes.append([left, top, right, bottom])
+        return pixel_boxes or None
+
+    def _set_sam3_image(self, image_arr):
+        try:
+            self.predictor.set_image(image_arr)
+            return
+        except Exception:
+            pass
+
+        temp_path = None
+        try:
+            fd, temp_path = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            cv2.imwrite(temp_path, cv2.cvtColor(image_arr, cv2.COLOR_RGB2BGR))
+            self.predictor.set_image(temp_path)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+    def predict_segments(
+        self,
+        image,
+        prompts=None,
+        confidence_threshold=0.25,
+        iou_threshold=0.50,
+        bboxes=None,
+        max_points=240,
+    ):
+        image_arr = _ensure_rgb_numpy(image)
+
+        if self.backend == "yoloe":
+            prompts = self._ensure_yoloe_prompts(prompts)
+            results = self.model.predict(
+                image_arr,
+                **self._prediction_kwargs(confidence_threshold, iou_threshold),
+            )
+            return extract_ultralytics_segments(results, image_arr.shape, prompts=prompts, max_points=max_points)
+
+        if self.backend == "sam3":
+            prompt_list = [str(prompt).strip() for prompt in prompts or [] if str(prompt).strip()]
+            pixel_bboxes = self._bboxes_to_pixels(bboxes, image_arr.shape)
+            if not prompt_list and not pixel_bboxes:
+                raise ValueError("SAM 3 needs a text prompt or at least one AOI/exemplar box.")
+            self._set_sam3_image(image_arr)
+            kwargs = {}
+            if prompt_list:
+                kwargs["text"] = prompt_list
+            if pixel_bboxes:
+                kwargs["bboxes"] = pixel_bboxes
+            results = self.predictor(**kwargs)
+            return extract_ultralytics_segments(results, image_arr.shape, prompts=prompt_list, max_points=max_points)
+
+        if self.backend == "sam_visual":
+            pixel_bboxes = self._bboxes_to_pixels(bboxes, image_arr.shape)
+            if not pixel_bboxes:
+                raise ValueError("SAM visual prompt models need an AOI area to segment.")
+            sam_bboxes = pixel_bboxes[0] if len(pixel_bboxes) == 1 else pixel_bboxes
+            results = self.model.predict(
+                source=image_arr,
+                bboxes=sam_bboxes,
+                **self._prediction_kwargs(confidence_threshold, iou_threshold),
+            )
+            return extract_ultralytics_segments(results, image_arr.shape, prompts=prompts, max_points=max_points)
+
+        raise ValueError(f"Unsupported prompt segmentation backend: {self.backend}")
